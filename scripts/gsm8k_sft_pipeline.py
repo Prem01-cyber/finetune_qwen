@@ -165,7 +165,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         save_total_limit=3,
         bf16=args.bf16 and torch.cuda.is_available(),
         fp16=args.fp16 and torch.cuda.is_available() and not args.bf16,
-        max_seq_length=args.max_seq_length,
+        max_length=args.max_seq_length,
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type="cosine",
         report_to="none",
