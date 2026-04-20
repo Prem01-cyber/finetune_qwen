@@ -32,10 +32,14 @@ Usage
       --question "ignored" \
       --generate-question
 
-  # JSON output mode
+  # JSON mode: saves under reports/ by default, optional custom path
   python scripts/full_solve_verify_pipeline.py \
       --adapter checkpoints/gsm8k_sft \
       --json
+
+  python scripts/full_solve_verify_pipeline.py \
+      --adapter checkpoints/gsm8k_sft \
+      --json --output runs/my_run.json
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import datetime
 import random
 import sys
 from dataclasses import asdict, dataclass
@@ -456,13 +461,21 @@ def main():
     parser.add_argument(
         "--json",
         action="store_true",
-        help="Output full result as JSON",
+        help=(
+            "Write full result as JSON to a file (default: reports/full_solve_verify_<timestamp>.json) "
+            "and print the path. Use --output to set the path explicitly."
+        ),
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="Save result to JSON file",
+        help="JSON output path (used with --json; overrides default under reports/)",
+    )
+    parser.add_argument(
+        "--print-json",
+        action="store_true",
+        help="With --json, also print the full JSON to stdout (default: off, file only)",
     )
 
     args = parser.parse_args()
@@ -493,21 +506,32 @@ def main():
         greedy=args.greedy,
     )
 
-    # Output
+    # Output: --json or --output persists JSON to disk; --json without --output uses reports/ts.json
     if args.json or args.output:
         result_dict = asdict(result)
-        if args.json:
-            print("\n" + "=" * 70)
-            print("JSON OUTPUT")
-            print("=" * 70)
-            print(json.dumps(result_dict, indent=2, ensure_ascii=False))
+        json_text = json.dumps(result_dict, indent=2, ensure_ascii=False)
 
-        if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(
-                json.dumps(result_dict, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-            print(f"\nResult saved to {args.output}")
+        if args.output is not None:
+            out_path: Path = args.output
+        elif args.json:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = ROOT / "reports" / f"full_solve_verify_{ts}.json"
+        else:
+            out_path = None
+
+        if out_path is not None:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json_text, encoding="utf-8")
+            print("\n" + "=" * 70)
+            print("JSON SAVED")
+            print("=" * 70)
+            print(f"Written to: {out_path.resolve()}")
+
+        if args.print_json:
+            print("\n" + "=" * 70)
+            print("JSON OUTPUT (stdout)")
+            print("=" * 70)
+            print(json_text)
 
     print("\n" + "=" * 70)
     print("PIPELINE COMPLETE")
