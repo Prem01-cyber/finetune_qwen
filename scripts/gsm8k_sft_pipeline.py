@@ -24,9 +24,18 @@ Examples
   python scripts/gsm8k_sft_pipeline.py all --output-dir checkpoints/gsm8k_sft
 
 Dependencies: torch, transformers, peft, datasets, accelerate, bitsandbytes, trl, sympy
+
+Tip: if downloads fail with XET / "Background writer channel closed", export ``HF_HUB_DISABLE_XET=1``
+before running (this script sets it by default unless already set).
 """
 
 from __future__ import annotations
+
+import os
+
+# hf-xet can error or segfault on interrupted/large shards; classic HTTP download is more robust.
+if "HF_HUB_DISABLE_XET" not in os.environ:
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 import argparse
 import json
