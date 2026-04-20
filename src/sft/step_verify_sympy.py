@@ -20,7 +20,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any, List, Optional
 
-from sympy import simplify
+from sympy import Expr, simplify, sympify
 from sympy.parsing.sympy_parser import (
     implicit_multiplication_application,
     parse_expr,
@@ -102,6 +102,26 @@ def _try_parse(s: str):
     return None
 
 
+def _coerce_expr_for_subtraction(obj: Any, segment: str) -> Optional[Expr]:
+    """
+    ``parse_expr`` may return a Python ``tuple`` from comma-separated subexpressions
+    (Tuple semantics). Subtraction is only defined for single SymPy ``Expr`` values.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, Expr):
+        return obj
+    if isinstance(obj, (tuple, list)):
+        return None
+    try:
+        s = sympify(obj)
+        if isinstance(s, Expr):
+            return s
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return None
+
+
 def _strip_leading_nonmath(s: str) -> str:
     """Prefer substring from first digit to avoid English words as symbols; else full string."""
     return prefer_arithmetic_tail(s)
@@ -111,13 +131,19 @@ def _verify_chain(parts: List[str]) -> tuple[str, str]:
     """Return (status, detail) where status is ok | fail | skipped."""
     if len(parts) < 2:
         return "skipped", "need at least two sides for '='"
-    exprs = []
+    exprs: List[Expr] = []
     for i, p in enumerate(parts):
         p2 = _strip_leading_nonmath(p)
         e = _try_parse(p2)
         if e is None:
             return "skipped", f"could not parse segment {i}: {p!r}"
-        exprs.append(e)
+        coerced = _coerce_expr_for_subtraction(e, p2)
+        if coerced is None:
+            return (
+                "skipped",
+                f"segment {i} is not a single SymPy expression (got {type(e).__name__}): {p!r}",
+            )
+        exprs.append(coerced)
     for i in range(len(exprs) - 1):
         diff = simplify(exprs[i] - exprs[i + 1])
         if diff != 0:
