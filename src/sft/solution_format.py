@@ -12,6 +12,8 @@ from typing import List, Optional
 
 from sympy.parsing.sympy_parser import parse_expr
 
+from src.sft.sympy_normalize import normalize_for_parse_expr
+
 
 STEP_RE = re.compile(r"^Step\s+(\d+)\s*:", re.IGNORECASE | re.MULTILINE)
 FINAL_RE = re.compile(r"(?im)^Final\s*Answer\s*:\s*([^\n]+?)\s*$")
@@ -65,13 +67,12 @@ def _sympy_can_parse_fragment(s: str) -> bool:
     s = s.strip()
     if not s:
         return False
-    s = s.replace("^", "**")
+    # Normalize using shared normalizer (handles ^, currency, etc.)
+    s = normalize_for_parse_expr(s)
     # Take first line or expression-ish segment after last '='
     chunk = s
     if "=" in s and "==" not in s:
         chunk = s.split("=")[-1].strip()
-    # Strip currency and stray symbols for parse trial
-    chunk = re.sub(r"[$€£]", "", chunk)
     chunk = chunk.split()[0] if chunk.split() else chunk
     try:
         parse_expr(chunk)
@@ -117,7 +118,7 @@ def validate_sympy_solution_format(
     sympy_final = False
     if final_raw:
         try:
-            parse_expr(final_raw.replace("^", "**"))
+            parse_expr(normalize_for_parse_expr(final_raw))
             sympy_final = True
         except Exception:
             errors.append(f"final answer does not parse as SymPy expr: {final_raw!r}")
