@@ -21,6 +21,7 @@ from pathlib import Path
 
 import torch
 import wandb
+from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Add project root to path
@@ -91,20 +92,62 @@ def initialize_models(config: PPOTrainingConfig):
     Returns:
         policy, value, tokenizer
     """
-    logger.info(f"Loading base model: {config.base_model}")
+    model_path = Path(config.base_model)
+    
+    # Check if this is an adapter or full model
+    is_adapter = (model_path / "adapter_config.json").exists()
+    
+    if is_adapter:
+        logger.info(f"Detected LoRA adapter at: {config.base_model}")
+        
+        # Load base model name from metadata
+        meta_file = model_path / "pipeline_meta.json"
+        if meta_file.exists():
+            with open(meta_file) as f:
+                meta = json.load(f)
+                base_model_name = meta.get("base_model", "Qwen/Qwen2.5-Math-7B-Instruct")
+        else:
+            base_model_name = "Qwen/Qwen2.5-Math-7B-Instruct"
+        
+        logger.info(f"Loading base model: {base_model_name}")
+        
+        # Load tokenizer from adapter (has correct chat template)
+        tokenizer = AutoTokenizer.from_pretrained(config.base_model)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Load base model
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+        
+        # Apply adapter to create policy
+        logger.info(f"Applying adapter from: {config.base_model}")
+        policy = PeftModel.from_pretrained(base_model, config.base_model)
+        policy = policy.merge_and_unload()  # Merge adapter weights into base model
+        
+        # ValueHead uses base model (not adapter)
+        value = ValueHead(base_model_name)
+        value = value.to(policy.device)
+        
+    else:
+        # Full model path
+        logger.info(f"Loading full model: {config.base_model}")
+        
+        tokenizer = AutoTokenizer.from_pretrained(config.base_model)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    tokenizer = AutoTokenizer.from_pretrained(config.base_model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        policy = AutoModelForCausalLM.from_pretrained(
+            config.base_model,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
 
-    policy = AutoModelForCausalLM.from_pretrained(
-        config.base_model,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
-
-    value = ValueHead(config.base_model)
-    value = value.to(policy.device)
+        value = ValueHead(config.base_model)
+        value = value.to(policy.device)
 
     logger.info(f"Policy loaded on device: {policy.device}")
     logger.info("Value network initialized")
