@@ -286,5 +286,110 @@ def main() -> None:
         print(f"Wrote detailed report to {args.output_json}")
 
 
+def evaluate_gsm8k(
+    model: Any,
+    tokenizer: Any,
+    data_path: str = "data/sft/gsm8k_test.jsonl",
+    max_samples: int = 500,
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+) -> dict:
+    """
+    Evaluate *model* on a GSM8K-formatted JSONL file.
+
+    Called by ``scripts/run_ppo_training.py`` at each eval step.
+
+    Args:
+        model          : AutoModelForCausalLM (already loaded, on correct device).
+        tokenizer      : Matching AutoTokenizer.
+        data_path      : Path to JSONL with {question, answer} rows.
+                         Falls back to the HuggingFace hub split when not found.
+        max_samples    : Evaluation cap (for speed during training).
+        max_new_tokens : Generation budget per problem.
+        temperature    : Sampling temperature (0 → greedy).
+        top_p          : Nucleus sampling p.
+
+    Returns:
+        dict with keys: accuracy, correct, total, exact_match_rate
+    """
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
+
+    greedy = temperature == 0.0
+    rows: list[dict] = []
+
+    p = Path(data_path)
+    if p.is_file():
+        with p.open(encoding="utf-8") as fh:
+            for line in fh:
+                if max_samples > 0 and len(rows) >= max_samples:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if "question" in obj and "answer" in obj:
+                    _, final = parse_gsm8k_answer(obj["answer"])
+                    rows.append({"question": obj["question"].strip(), "gold_final": final})
+                elif "messages" in obj:
+                    user = next(
+                        (m["content"] for m in obj["messages"] if m.get("role") == "user"), ""
+                    ).strip()
+                    asst = next(
+                        (m["content"] for m in obj["messages"] if m.get("role") == "assistant"), ""
+                    )
+                    gold = extract_final_answer_numeric_str(asst) or ""
+                    user = re.sub(r"^Solve the following problem\..*?Problem:\n", "", user, flags=re.S)
+                    rows.append({"question": user.strip(), "gold_final": gold.strip()})
+    else:
+        _logger.warning(
+            f"evaluate_gsm8k: {data_path} not found; loading openai/gsm8k from Hub."
+        )
+        try:
+            ds = load_dataset("openai/gsm8k", "main", split="test")
+            if max_samples > 0:
+                ds = ds.select(range(min(max_samples, len(ds))))
+            for row in ds:
+                _, final = parse_gsm8k_answer(row["answer"])
+                rows.append({"question": row["question"].strip(), "gold_final": final})
+        except Exception as exc:
+            _logger.error(f"Could not load GSM8K: {exc}")
+            return {"accuracy": 0.0, "correct": 0, "total": 0, "exact_match_rate": 0.0}
+
+    if not rows:
+        return {"accuracy": 0.0, "correct": 0, "total": 0, "exact_match_rate": 0.0}
+
+    correct = 0
+    total = len(rows)
+
+    for i, row in enumerate(rows):
+        try:
+            pred_text = _generate(
+                model=model,
+                tokenizer=tokenizer,
+                problem=row["question"],
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                greedy=greedy,
+            )
+            pred_final = extract_final_answer_numeric_str(pred_text) or ""
+            gold_final = row["gold_final"]
+            match = _equiv_expr(pred_final, gold_final)
+            if match:
+                correct += 1
+        except Exception as exc:
+            _logger.debug(f"Sample {i} error: {exc}")
+
+    accuracy = correct / total if total > 0 else 0.0
+    return {
+        "accuracy": accuracy,
+        "correct": correct,
+        "total": total,
+        "exact_match_rate": accuracy,
+    }
+
+
 if __name__ == "__main__":
     main()
