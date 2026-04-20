@@ -39,6 +39,7 @@ if "HF_HUB_DISABLE_XET" not in os.environ:
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -86,6 +87,25 @@ def _rewrite_jsonl_strip_scratchpads(jsonl_path: Path) -> None:
             n += 1
     tmp.replace(jsonl_path)
     print(f"Stripped <<>> scratchpads in {n} records → {jsonl_path}")
+
+
+def _warmup_steps_from_ratio(
+    num_examples: int,
+    per_device_train_batch_size: int,
+    gradient_accumulation_steps: int,
+    num_train_epochs: float,
+    warmup_ratio: float,
+) -> int:
+    """Approximate HF Trainer optimizer steps; used to map legacy warmup_ratio → warmup_steps."""
+    if warmup_ratio <= 0:
+        return 0
+    num_batches = max(
+        1,
+        (num_examples + per_device_train_batch_size - 1) // per_device_train_batch_size,
+    )
+    num_update_steps_per_epoch = max(1, num_batches // gradient_accumulation_steps)
+    total_optimizer_steps = max(1, math.ceil(num_train_epochs * num_update_steps_per_epoch))
+    return min(total_optimizer_steps, int(total_optimizer_steps * warmup_ratio))
 
 
 def cmd_train(args: argparse.Namespace) -> None:
@@ -154,6 +174,17 @@ def cmd_train(args: argparse.Namespace) -> None:
             add_generation_prompt=False,
         )
 
+    if args.warmup_steps is not None:
+        warmup_steps = max(0, args.warmup_steps)
+    else:
+        warmup_steps = _warmup_steps_from_ratio(
+            len(ds),
+            args.batch_size,
+            args.grad_accum,
+            args.epochs,
+            args.warmup_ratio,
+        )
+
     sft_args = SFTConfig(
         output_dir=str(out_dir),
         num_train_epochs=args.epochs,
@@ -166,7 +197,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         bf16=args.bf16 and torch.cuda.is_available(),
         fp16=args.fp16 and torch.cuda.is_available() and not args.bf16,
         max_length=args.max_seq_length,
-        warmup_ratio=args.warmup_ratio,
+        warmup_steps=warmup_steps,
         lr_scheduler_type="cosine",
         report_to="none",
         gradient_checkpointing=True,
@@ -296,6 +327,7 @@ def cmd_all(args: argparse.Namespace) -> None:
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
         warmup_ratio=args.warmup_ratio,
+        warmup_steps=args.warmup_steps,
         bf16=args.bf16,
         fp16=args.fp16,
         bnb_compute_dtype=args.bnb_compute_dtype,
@@ -351,7 +383,18 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--max-seq-length", type=int, default=2048)
     tr.add_argument("--save-steps", type=int, default=200)
     tr.add_argument("--logging-steps", type=int, default=10)
-    tr.add_argument("--warmup-ratio", type=float, default=0.03)
+    tr.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.03,
+        help="Used only if --warmup-steps is not set; converted to warmup_steps.",
+    )
+    tr.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="LR warmup steps; if set, overrides --warmup-ratio.",
+    )
     tr.add_argument("--bf16", action="store_true", default=True)
     tr.add_argument("--no-bf16", dest="bf16", action="store_false")
     tr.add_argument("--fp16", action="store_true")
@@ -394,7 +437,18 @@ def build_parser() -> argparse.ArgumentParser:
     al.add_argument("--max-seq-length", type=int, default=2048)
     al.add_argument("--save-steps", type=int, default=200)
     al.add_argument("--logging-steps", type=int, default=10)
-    al.add_argument("--warmup-ratio", type=float, default=0.03)
+    al.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.03,
+        help="Used only if --warmup-steps is not set; converted to warmup_steps.",
+    )
+    al.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="LR warmup steps; if set, overrides --warmup-ratio.",
+    )
     al.add_argument("--bf16", action="store_true", default=True)
     al.add_argument("--no-bf16", dest="bf16", action="store_false")
     al.add_argument("--fp16", action="store_true")

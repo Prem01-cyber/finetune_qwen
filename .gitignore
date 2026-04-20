@@ -1,0 +1,20 @@
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training outputs
+checkpoints/
+
+# Evaluation outputs
+reports/
+
+# Core dumps from interrupted native processes
+core
+core.*
