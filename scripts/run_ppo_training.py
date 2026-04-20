@@ -121,6 +121,7 @@ def initialize_models(config: PPOTrainingConfig):
             base_model_name,
             torch_dtype=torch.bfloat16,
             device_map="auto",
+            trust_remote_code=True,
         )
         
         # Apply adapter to create policy
@@ -197,7 +198,7 @@ def save_iteration_results(
 def evaluate_policy(
     policy,
     tokenizer,
-    eval_data_path: str = "data/sft/gsm8k_test.jsonl",
+    eval_data_path: str = "data/sft/dual_task_val.jsonl",
 ) -> dict:
     """
     Evaluate policy on GSM8K test set.
