@@ -240,6 +240,7 @@ def main():
     parser.add_argument("--rollouts-per-iter", type=int, default=100)
     parser.add_argument("--eval-data-path", type=str, default="data/sft/dual_task_val.jsonl")
     parser.add_argument("--gsm8k-reference-data", type=str, default="data/sft/gsm8k_sft.jsonl")
+    parser.add_argument("--skip-initial-eval", action="store_true")
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
 
@@ -291,9 +292,14 @@ def main():
         target_kl=config.target_kl,
     )
 
-    logger.info("\n%s\nINITIAL EVALUATION (Iteration 0)\n%s", "=" * 80, "=" * 80)
-    initial_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
-    best_accuracy = float(initial_eval["accuracy"])
+    if args.skip_initial_eval:
+        logger.info("\n%s\nSKIPPING INITIAL EVALUATION (use --skip-initial-eval)\n%s", "=" * 80, "=" * 80)
+        initial_eval = {"accuracy": 0.0}
+        best_accuracy = 0.0
+    else:
+        logger.info("\n%s\nINITIAL EVALUATION (Iteration 0)\n%s", "=" * 80, "=" * 80)
+        initial_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
+        best_accuracy = float(initial_eval["accuracy"])
 
     for iteration in range(1, config.num_iterations + 1):
         logger.info("\n%s\nITERATION %d/%d\n%s", "=" * 80, iteration, config.num_iterations, "=" * 80)
