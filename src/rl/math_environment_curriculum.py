@@ -255,6 +255,13 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             curriculum_state_snapshot=self.curriculum_manager.get_curriculum_stats(),
         )
         metadata_dict = asdict(metadata)
+        # Flatten for quality filter silver tier (not a TrajectoryMetadata field)
+        metadata_dict["sympy_score"] = float(
+            reward_result["solution_metrics"].get("sympy_score", 0.0)
+        )
+
+        # Must attach metadata before novelty check: check_novelty reads trajectory.metadata["generated_question"].
+        trajectory.metadata = metadata_dict
 
         # Admission gate for recursive replay memory.
         is_candidate, reason = self.quality_filter.meets_replay_criteria(metadata_dict)
@@ -279,7 +286,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 )
             else:
                 metadata_dict["replay_added"] = False
-                logger.debug(
+                logger.info(
                     f"✗ Buffer reject (novelty): tier={reason}, "
                     f"reward={terminal_reward:.3f}, novelty={novelty_score:.3f} < {self.quality_filter.novelty_threshold}"
                 )
@@ -287,7 +294,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             metadata_dict["replay_novelty"] = 0.0
             metadata_dict["replay_added"] = False
             metadata_dict["replay_reject_reason"] = reason
-            logger.debug(
+            logger.info(
                 f"✗ Buffer reject (quality): reason={reason}, "
                 f"reward={terminal_reward:.3f}, "
                 f"sympy={metadata_dict.get('sympy_verified')}, "
@@ -296,6 +303,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 f"topic_match={metadata_dict.get('topic_match_score', 0):.3f}"
             )
 
+        # Refresh pointer in case metadata_dict was mutated above
         trajectory.metadata = metadata_dict
 
         logger.info(

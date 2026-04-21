@@ -51,7 +51,7 @@ class CurriculumTrainingConfig:
     max_solution_tokens = 500
     temperature = 0.7
     top_p = 0.9
-    consensus_temperature = 0.7
+    consensus_temperature = 0.5  # Lowered from 0.7 for higher consensus rate
 
     num_iterations = 10
     eval_every = 1
