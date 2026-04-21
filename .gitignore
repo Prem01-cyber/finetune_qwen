@@ -15,6 +15,7 @@ archives/
 
 # Evaluation outputs
 reports/
+report
 
 # Core dumps from interrupted native processes
 core
