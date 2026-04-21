@@ -59,6 +59,7 @@ nvidia-nvshmem-cu13==3.4.5
 nvidia-nvtx==13.0.85
 packaging==26.1
 pandas==3.0.2
+plotly==6.4.0
 parso==0.8.6
 peft==0.19.1
 pexpect==4.9.0

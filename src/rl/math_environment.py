@@ -364,11 +364,23 @@ class MathEnvironment:
 
         terminal_reward = reward_result["combined_score"]
 
-        logger.info(
-            f"Trajectory reward: {terminal_reward:.3f} "
-            f"(Q: {reward_result['question_metrics']['overall_score']:.3f}, "
-            f"S: {reward_result['solution_metrics']['overall_score']:.3f})"
-        )
+        # Log with consensus breakdown if available
+        sol_metrics = reward_result['solution_metrics']
+        if 'consensus_score' in sol_metrics and 'sympy_score' in sol_metrics:
+            # Consensus mode: show SymPy, Consensus, Format breakdown
+            logger.info(
+                f"Trajectory reward: {terminal_reward:.3f} "
+                f"(SymPy: {sol_metrics.get('sympy_score', 0):.3f}, "
+                f"Consensus: {sol_metrics.get('consensus_score', 0):.3f}, "
+                f"Format: {sol_metrics.get('format_compliance', 0):.3f})"
+            )
+        else:
+            # Standard mode: show Q, S breakdown
+            logger.info(
+                f"Trajectory reward: {terminal_reward:.3f} "
+                f"(Q: {reward_result['question_metrics']['overall_score']:.3f}, "
+                f"S: {reward_result['solution_metrics']['overall_score']:.3f})"
+            )
 
         # ===== PHASE 4: ASSIGN REWARDS =====
         # Sparse rewards: only terminal state gets reward

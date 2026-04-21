@@ -141,6 +141,48 @@ python scripts/visualize_results.py \
 | | Format (Step N: … Final Answer:) | 20% |
 | | Efficiency (concise step count) | 20% |
 
+## Curriculum-Driven Extension
+
+The codebase now includes a refined curriculum pipeline for dual-task PPO:
+
+- `src/rl/question_classifier.py`:
+  - Multi-signal topic detection (keywords + pattern hints + solution operations)
+  - Post-solution difficulty estimation
+- `src/rl/curriculum_manager.py`:
+  - Goldilocks topic scheduling (target success range 0.4-0.7)
+  - Adaptive exploration schedule by iteration stage
+  - Retention testing with exponential backoff
+  - Safe checkpoint save/load for curriculum state
+- `src/rl/question_quality_evaluator.py`:
+  - Topic match, difficulty match, clarity, solvability, novelty scoring
+  - Sliding-window novelty tracking
+- `src/rl/math_environment_curriculum.py`:
+  - Curriculum-guided instruction sampling
+  - Dual reward composition: `0.3 * question + 0.7 * solution`
+- `scripts/run_ppo_training_curriculum.py`:
+  - End-to-end PPO training entrypoint using curriculum environment
+  - Curriculum metric aggregation + W&B logging
+- `scripts/visualize_curriculum_results.py`:
+  - Topic success curves, difficulty tracking, heatmaps, reward breakdowns
+  - Optional Sankey transition plot (with Plotly)
+
+### Run Curriculum Training
+
+```bash
+python scripts/run_ppo_training_curriculum.py \
+  --base-model checkpoints/dual_task_v1 \
+  --output-dir checkpoints/ppo_training_curriculum \
+  --num-iterations 10 \
+  --rollouts-per-iter 100
+```
+
+### Visualize Curriculum Results
+
+```bash
+python scripts/visualize_curriculum_results.py \
+  --training-dir checkpoints/ppo_training_curriculum
+```
+
 ## OpenEnv Integration
 
 ```python

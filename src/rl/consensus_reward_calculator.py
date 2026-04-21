@@ -182,10 +182,11 @@ class ConsensusRewardCalculator:
             w_format * format_score
         )
         
-        logger.debug(
-            f"Reward breakdown: combined={combined_score:.3f}, "
-            f"sympy={sympy_score:.3f}, consensus={consensus_score:.3f}, "
-            f"format={format_score:.3f}"
+        logger.info(
+            f"Consensus reward: combined={combined_score:.3f} = "
+            f"0.4×{sympy_score:.3f} + 0.4×{consensus_score:.3f} + 0.2×{format_score:.3f} | "
+            f"has_majority={consensus.get('has_majority', False)}, "
+            f"primary_matches={consensus.get('primary_matches_majority', False)}"
         )
         
         return {

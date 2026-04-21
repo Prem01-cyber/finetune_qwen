@@ -131,7 +131,12 @@ class TripleVerifier:
             solution = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
             solutions.append(solution)
         
-        logger.debug(f"Generated 3 solutions for question: {question[:50]}...")
+        # Log for debugging
+        answers = [self.extract_numeric_answer(sol) for sol in solutions]
+        logger.debug(
+            f"Triple verify: Generated 3 solutions → answers: {answers}, "
+            f"lengths: [{len(s) for s in solutions}]"
+        )
         
         return solutions
     
