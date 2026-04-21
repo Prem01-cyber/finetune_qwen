@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Dual-task SFT pipeline: train model on both question generation and solution tasks.
 
@@ -44,11 +43,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Task prefixes (must match create_dual_task_dataset.py)
 SOLVE_TASK_PREFIX = "### Task: Solve Problem\n"
 GENERATE_TASK_PREFIX = "### Task: Generate Question\n"
 
-# System prompts
 SOLVER_SYSTEM_PROMPT = (
     "You are a step-by-step math solver. "
     "Solve the given problem one step at a time. "
@@ -147,7 +144,6 @@ def cmd_train(args: argparse.Namespace) -> None:
     if args.max_samples and args.max_samples > 0:
         ds = ds.select(range(min(args.max_samples, len(ds))))
     
-    # Count task distribution
     task_counts = {"solve": 0, "generate": 0, "unknown": 0}
     for example in ds:
         task_type = example.get("task_type", "unknown")
@@ -209,7 +205,6 @@ def cmd_train(args: argparse.Namespace) -> None:
     trainer.save_model(str(out_dir))
     tokenizer.save_pretrained(str(out_dir))
 
-    # Save metadata indicating dual-task training
     with (out_dir / "pipeline_meta.json").open("w", encoding="utf-8") as f:
         json.dump(
             {
@@ -264,7 +259,6 @@ def cmd_infer(args: argparse.Namespace) -> None:
     model = PeftModel.from_pretrained(base, str(adapter))
     model.eval()
 
-    # Prepare prompt based on task type
     if args.task == "solve":
         system_prompt = SOLVER_SYSTEM_PROMPT
         user_content = (
@@ -312,7 +306,6 @@ def cmd_infer(args: argparse.Namespace) -> None:
     print(text)
     print("=" * 60)
 
-    # Format validation for solve task
     if args.task == "solve":
         print("\n--- Format Validation ---")
         from src.sft.solution_format import validate_sympy_solution_format
@@ -324,7 +317,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Dual-task SFT pipeline (train / infer)")
     sub = p.add_subparsers(dest="command", required=True)
 
-    # Train command
     tr = sub.add_parser("train", help="Train dual-task model on mixed dataset")
     tr.add_argument("--data", type=str, required=True, help="Dual-task training JSONL")
     tr.add_argument("--output-dir", type=str, required=True, help="Output directory for adapter")
@@ -353,7 +345,6 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--bnb-compute-dtype", type=str, default="bfloat16")
     tr.set_defaults(func=cmd_train)
 
-    # Infer command
     inf = sub.add_parser("infer", help="Generate with dual-task model")
     inf.add_argument("--adapter", type=str, required=True, help="Adapter directory")
     inf.add_argument(
@@ -395,7 +386,6 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     
-    # Validate task-specific arguments
     if args.command == "infer":
         if args.task == "solve" and not args.problem:
             raise SystemExit("Error: --problem is required when --task solve")

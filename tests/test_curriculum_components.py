@@ -10,9 +10,13 @@ from unittest.mock import Mock, patch
 import torch
 
 from src.rl.curriculum_manager import CurriculumManager
-from src.rl.math_environment_curriculum import CurriculumMathEnvironment
 from src.rl.question_classifier import QuestionClassifier
 from src.rl.question_quality_evaluator import QuestionQualityEvaluator
+
+try:
+    from src.rl.math_environment_curriculum import CurriculumMathEnvironment
+except ModuleNotFoundError:  # pragma: no cover
+    CurriculumMathEnvironment = None
 
 
 class TestQuestionClassifier(unittest.TestCase):
@@ -147,6 +151,7 @@ class TestQuestionQualityEvaluator(unittest.TestCase):
         self.assertEqual(solv["reason"], "syntactic_failure")
 
 
+@unittest.skipIf(CurriculumMathEnvironment is None, "transformers dependency not installed")
 class TestCurriculumMathEnvironment(unittest.TestCase):
     @patch("src.rl.math_environment_curriculum.CurriculumMathEnvironment.generate_with_logging")
     @patch("src.rl.triple_verifier.TripleVerifier.generate_three_solutions")

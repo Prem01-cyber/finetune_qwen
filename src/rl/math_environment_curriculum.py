@@ -5,6 +5,7 @@ Curriculum-aware math environment with dual reward signals.
 from __future__ import annotations
 
 import logging
+import random
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -12,9 +13,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.rl.consensus_reward_calculator import ConsensusRewardCalculator
 from src.rl.curriculum_manager import CurriculumManager
+from src.rl.expert_panel import SimulatedExpertPanel
 from src.rl.math_environment_consensus import ConsensusMathEnvironment
 from src.rl.mdp_components import Trajectory
+from src.rl.quality_filter import QualityFilter
 from src.rl.question_quality_evaluator import QuestionQualityEvaluator
+from src.rl.replay_buffer import GenerationalReplayBuffer
 from src.rl.value_network import ValueHead
 
 logger = logging.getLogger(__name__)
@@ -48,6 +52,13 @@ class TrajectoryMetadata:
     final_answer_ok: bool
     question_reward: float
     solution_reward: float
+    pre_expert_reward: float
+    expert_reward_modifier: float
+    expert_phase: str
+    expert_feedback: str
+    replay_candidate: bool
+    replay_novelty: float
+    replay_added: bool
     combined_reward: float
     reward_breakdown: Dict[str, object]
     topics_in_sweet_spot: List[str]
@@ -87,6 +98,11 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         self.curriculum_manager.load_checkpoint_safe()
         self.question_evaluator = QuestionQualityEvaluator(reference_questions=self.reference_questions)
         self.consensus_reward_calculator = ConsensusRewardCalculator(verifier=self.triple_verifier)
+        self.expert_panel = SimulatedExpertPanel()
+        self.replay_buffer = GenerationalReplayBuffer(max_size=500)
+        self.quality_filter = QualityFilter(novelty_threshold=0.7)
+        self.last_replay_ratio: float = 0.0
+        self.last_rollout_mix: Dict[str, int] = {"fresh": 0, "replay": 0}
 
     def sample_instruction(self) -> Tuple[str, str, float]:
         topic, difficulty = self.curriculum_manager.select_topic_and_difficulty()
@@ -115,7 +131,18 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         question_reward = float(question_result["overall_score"])
         solution_reward = float(solution_result["combined_score"])
-        combined_score = 0.3 * question_reward + 0.7 * solution_reward
+        base_combined_score = 0.3 * question_reward + 0.7 * solution_reward
+        expert_adjustment = self.expert_panel.apply_expert_preferences(
+            base_reward=base_combined_score,
+            question_metrics=question_result,
+            solution_metrics={
+                "correctness": solution_result["sympy_score"],
+                "consensus_score": solution_result["consensus_score"],
+                "format_compliance": solution_result["format_score"],
+            },
+            iteration=self.curriculum_manager.current_iteration,
+        )
+        combined_score = float(expert_adjustment["adjusted_reward"])
 
         solution_success = bool(consensus_info.get("has_majority", False)) and bool(
             consensus_info.get("primary_matches_majority", False)
@@ -130,6 +157,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         return {
             "combined_score": combined_score,
+            "base_combined_score": base_combined_score,
             "question_metrics": question_result,
             "solution_metrics": {
                 "overall_score": solution_reward,
@@ -147,6 +175,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 "detected_topic": question_result["detected_topic"],
                 "measured_difficulty": question_result["measured_difficulty"],
             },
+            "expert_metrics": expert_adjustment,
         }
 
     def rollout_trajectory(self) -> Trajectory:
@@ -212,13 +241,44 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             final_answer_ok=str(sympy.get("final_answer", "")) == "ok",
             question_reward=float(question_metrics["overall_score"]),
             solution_reward=float(reward_result["solution_metrics"]["overall_score"]),
+            pre_expert_reward=float(reward_result["base_combined_score"]),
+            expert_reward_modifier=float(reward_result["expert_metrics"]["reward_modifier"]),
+            expert_phase=str(reward_result["expert_metrics"]["phase"]),
+            expert_feedback=str(reward_result["expert_metrics"]["feedback"]),
+            replay_candidate=False,
+            replay_novelty=0.0,
+            replay_added=False,
             combined_reward=terminal_reward,
             reward_breakdown=reward_result,
             topics_in_sweet_spot=self.curriculum_manager.get_sweet_spot_topics(),
             current_focus_topics=self.curriculum_manager.get_current_focus(),
             curriculum_state_snapshot=self.curriculum_manager.get_curriculum_stats(),
         )
-        trajectory.metadata = asdict(metadata)
+        metadata_dict = asdict(metadata)
+
+        # Admission gate for recursive replay memory.
+        is_candidate, reason = self.quality_filter.meets_replay_criteria(metadata_dict)
+        metadata_dict["replay_candidate"] = is_candidate
+        if is_candidate:
+            novelty = self.quality_filter.check_novelty(trajectory, self.replay_buffer.buffer)
+            metadata_dict["replay_novelty"] = float(novelty)
+            if self.quality_filter.is_novel_enough(novelty):
+                quality_score = self.quality_filter.compute_quality_score(metadata_dict)
+                self.replay_buffer.add_trajectory(
+                    trajectory=trajectory,
+                    metadata=metadata_dict,
+                    iteration=self.curriculum_manager.current_iteration,
+                    quality_score=quality_score,
+                )
+                metadata_dict["replay_added"] = True
+            else:
+                metadata_dict["replay_added"] = False
+        else:
+            metadata_dict["replay_novelty"] = 0.0
+            metadata_dict["replay_added"] = False
+            metadata_dict["replay_reject_reason"] = reason
+
+        trajectory.metadata = metadata_dict
 
         logger.info(
             "Curriculum trajectory reward: %.3f (topic=%s target_diff=%.2f measured=%.2f)",
@@ -230,8 +290,57 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         return trajectory
 
+    def _get_adaptive_replay_ratio(self) -> float:
+        iteration = self.curriculum_manager.current_iteration
+        if iteration < 3:
+            return 0.0
+        if iteration < 5:
+            return 0.15
+
+        buffer_stats = self.replay_buffer.get_buffer_stats(current_iteration=iteration)
+        buffer_health = float(buffer_stats.get("buffer_health", 0.0))
+        if buffer_health >= 0.75:
+            return 0.3
+        if buffer_health >= 0.6:
+            return 0.25
+        return 0.2
+
     def collect_rollouts(self, num_trajectories: int, verbose: bool = True) -> List[Trajectory]:
-        trajectories = super().collect_rollouts(num_trajectories=num_trajectories, verbose=verbose)
+        replay_ratio = self._get_adaptive_replay_ratio()
+        num_replay = int(num_trajectories * replay_ratio)
+        num_replay = min(num_replay, len(self.replay_buffer))
+        num_fresh = max(0, num_trajectories - num_replay)
+
+        fresh_trajectories = [
+            self.rollout_trajectory()
+            for _ in range(num_fresh)
+        ]
+        replay_trajectories = self.replay_buffer.sample_replay_batch(num_replay, diversity_sample=True)
+        for trajectory in replay_trajectories:
+            trajectory.metadata["rollout_source"] = "replay"
+
+        for trajectory in fresh_trajectories:
+            trajectory.metadata["rollout_source"] = "fresh"
+
+        trajectories = fresh_trajectories + replay_trajectories
+        random.shuffle(trajectories)
+
+        self.last_replay_ratio = replay_ratio
+        self.last_rollout_mix = {"fresh": len(fresh_trajectories), "replay": len(replay_trajectories)}
+
+        if verbose:
+            buffer_stats = self.replay_buffer.get_buffer_stats(
+                current_iteration=self.curriculum_manager.current_iteration
+            )
+            logger.info(
+                "Rollout mix: %d fresh + %d replay (ratio=%.2f, buffer_size=%d, health=%.3f)",
+                len(fresh_trajectories),
+                len(replay_trajectories),
+                replay_ratio,
+                len(self.replay_buffer),
+                float(buffer_stats.get("buffer_health", 0.0)),
+            )
+
         self.curriculum_manager.increment_iteration()
         self.curriculum_manager.save_state(iteration=self.curriculum_manager.current_iteration, rollout=None)
         return trajectories

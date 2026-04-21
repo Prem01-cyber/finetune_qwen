@@ -166,6 +166,11 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
     question_rewards = []
     solution_rewards = []
     combined_rewards = []
+    pre_expert_rewards = []
+    expert_modifiers = []
+    expert_phase_counts: Dict[str, int] = {}
+    source_counts: Dict[str, int] = {}
+    replay_added_count = 0
 
     for trajectory in trajectories:
         meta = trajectory.metadata
@@ -182,6 +187,13 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
         question_rewards.append(float(meta["question_reward"]))
         solution_rewards.append(float(meta["solution_reward"]))
         combined_rewards.append(float(meta["combined_reward"]))
+        pre_expert_rewards.append(float(meta.get("pre_expert_reward", meta["combined_reward"])))
+        expert_modifiers.append(float(meta.get("expert_reward_modifier", 0.0)))
+        phase = str(meta.get("expert_phase", "unknown"))
+        expert_phase_counts[phase] = expert_phase_counts.get(phase, 0) + 1
+        source = str(meta.get("rollout_source", "fresh"))
+        source_counts[source] = source_counts.get(source, 0) + 1
+        replay_added_count += int(bool(meta.get("replay_added", False)))
 
     per_topic_success = {
         topic: (topic_successes.get(topic, 0) / max(1, count))
@@ -212,6 +224,27 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
         "avg_question_reward": float(sum(question_rewards) / max(1, len(question_rewards))),
         "avg_solution_reward": float(sum(solution_rewards) / max(1, len(solution_rewards))),
         "avg_combined_reward": float(sum(combined_rewards) / max(1, len(combined_rewards))),
+        "avg_pre_expert_reward": float(sum(pre_expert_rewards) / max(1, len(pre_expert_rewards))),
+        "avg_expert_modifier": float(sum(expert_modifiers) / max(1, len(expert_modifiers))),
+        "expert_phase_counts": expert_phase_counts,
+        "source_counts": source_counts,
+        "replay_added_count": replay_added_count,
+        "fresh_mean_reward": float(
+            sum(
+                float(t.metadata["combined_reward"])
+                for t in trajectories
+                if str(t.metadata.get("rollout_source", "fresh")) == "fresh"
+            )
+            / max(1, sum(1 for t in trajectories if str(t.metadata.get("rollout_source", "fresh")) == "fresh"))
+        ),
+        "replay_mean_reward": float(
+            sum(
+                float(t.metadata["combined_reward"])
+                for t in trajectories
+                if str(t.metadata.get("rollout_source", "fresh")) == "replay"
+            )
+            / max(1, sum(1 for t in trajectories if str(t.metadata.get("rollout_source", "fresh")) == "replay"))
+        ),
     }
 
 
@@ -303,6 +336,12 @@ def main():
 
     for iteration in range(1, config.num_iterations + 1):
         logger.info("\n%s\nITERATION %d/%d\n%s", "=" * 80, iteration, config.num_iterations, "=" * 80)
+        current_phase = math_env.expert_panel.get_current_expert(math_env.curriculum_manager.current_iteration)
+        logger.info(
+            "Active expert phase: %s (%s)",
+            current_phase.name,
+            current_phase.description,
+        )
         trajectories = math_env.collect_rollouts(
             num_trajectories=config.num_rollouts_per_iter,
             verbose=True,
@@ -319,6 +358,9 @@ def main():
 
         buffer_stats = rollout_buffer.get_stats()
         curriculum_stats = aggregate_curriculum_metrics(trajectories)
+        replay_stats = math_env.replay_buffer.get_buffer_stats(
+            current_iteration=math_env.curriculum_manager.current_iteration
+        )
         training_metrics = ppo_trainer.train_step(rollout_buffer)
 
         if iteration % config.eval_every == 0:
@@ -334,6 +376,9 @@ def main():
             "training": training_metrics,
             "eval": eval_results,
             "curriculum_state": math_env.curriculum_manager.get_curriculum_stats(),
+            "replay_buffer": replay_stats,
+            "rollout_mix": dict(math_env.last_rollout_mix),
+            "replay_ratio": math_env.last_replay_ratio,
         }
         save_iteration_results(iteration, trajectories, all_metrics, config)
 
@@ -356,6 +401,26 @@ def main():
                 "reward/question_component": curriculum_stats["avg_question_reward"],
                 "reward/solution_component": curriculum_stats["avg_solution_reward"],
                 "reward/combined": curriculum_stats["avg_combined_reward"],
+                "reward/pre_expert": curriculum_stats["avg_pre_expert_reward"],
+                "reward/expert_modifier": curriculum_stats["avg_expert_modifier"],
+                "reward/fresh_mean": curriculum_stats["fresh_mean_reward"],
+                "reward/replay_mean": curriculum_stats["replay_mean_reward"],
+                "expert/phase_counts/pedagogy": curriculum_stats["expert_phase_counts"].get("pedagogy", 0),
+                "expert/phase_counts/accuracy": curriculum_stats["expert_phase_counts"].get("accuracy", 0),
+                "expert/phase_counts/challenge": curriculum_stats["expert_phase_counts"].get("challenge", 0),
+                "replay/ratio": math_env.last_replay_ratio,
+                "replay/fresh_rollouts": math_env.last_rollout_mix.get("fresh", 0),
+                "replay/replayed_rollouts": math_env.last_rollout_mix.get("replay", 0),
+                "replay/new_admissions": curriculum_stats["replay_added_count"],
+                "replay/buffer_size": replay_stats.get("buffer_size", 0.0),
+                "replay/avg_quality": replay_stats.get("avg_quality", 0.0),
+                "replay/quality_variance": replay_stats.get("quality_variance", 0.0),
+                "replay/staleness": replay_stats.get("staleness", 0.0),
+                "replay/topic_entropy": replay_stats.get("topic_entropy", 0.0),
+                "replay/replay_success_rate": replay_stats.get("replay_success_rate", 0.0),
+                "replay/buffer_turnover_rate": replay_stats.get("buffer_turnover_rate", 0.0),
+                "replay/topics_in_buffer": replay_stats.get("topics_in_buffer", 0.0),
+                "replay/buffer_health": replay_stats.get("buffer_health", 0.0),
             }
             for topic, success in curriculum_stats["per_topic_success"].items():
                 wandb_metrics[f"curriculum/topic_success/{topic}"] = success
