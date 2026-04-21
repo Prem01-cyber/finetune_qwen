@@ -97,7 +97,7 @@ python scripts/dual_task_sft_pipeline.py train \
     --data data/sft/dual_task_train.jsonl \
     --output-dir checkpoints/dual_task_v1 \
     --epochs 2 \
-    --model Qwen/Qwen2.5-Math-7B-Instruct
+    --model Qwen/Qwen2.5-Math-1.5B-Instruct
 ```
 
 **Training time**: 6-12 hours on A100 (2 epochs, ~8.75k examples)

@@ -359,7 +359,7 @@ def main():
     parser.add_argument(
         "--base-model",
         type=str,
-        default="Qwen/Qwen2.5-Math-7B-Instruct"
+        default="Qwen/Qwen2.5-Math-1.5B-Instruct"
     )
     parser.add_argument(
         "--max-new-tokens",

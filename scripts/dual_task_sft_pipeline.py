@@ -328,7 +328,7 @@ def build_parser() -> argparse.ArgumentParser:
     tr = sub.add_parser("train", help="Train dual-task model on mixed dataset")
     tr.add_argument("--data", type=str, required=True, help="Dual-task training JSONL")
     tr.add_argument("--output-dir", type=str, required=True, help="Output directory for adapter")
-    tr.add_argument("--model", type=str, default="Qwen/Qwen2.5-Math-7B-Instruct", help="Base model")
+    tr.add_argument("--model", type=str, default="Qwen/Qwen2.5-Math-1.5B-Instruct", help="Base model")
     tr.add_argument("--epochs", type=float, default=2.0, help="Training epochs (default: 2.0 for dual-task)")
     tr.add_argument("--batch-size", type=int, default=1)
     tr.add_argument("--grad-accum", type=int, default=8)
@@ -359,7 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
     inf.add_argument(
         "--base-model",
         type=str,
-        default="Qwen/Qwen2.5-Math-7B-Instruct",
+        default="Qwen/Qwen2.5-Math-1.5B-Instruct",
         help="Base model (auto-detected from pipeline_meta.json if present)",
     )
     inf.add_argument(

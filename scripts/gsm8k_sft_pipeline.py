@@ -366,7 +366,7 @@ def build_parser() -> argparse.ArgumentParser:
     tr = sub.add_parser("train", help="QLoRA SFT on JSONL with messages field")
     tr.add_argument("--data", type=str, required=True, help="JSONL from prepare step")
     tr.add_argument("--output-dir", type=str, required=True)
-    tr.add_argument("--model", type=str, default="Qwen/Qwen2.5-Math-7B-Instruct")
+    tr.add_argument("--model", type=str, default="Qwen/Qwen2.5-Math-1.5B-Instruct")
     tr.add_argument("--epochs", type=float, default=1.0)
     tr.add_argument("--batch-size", type=int, default=1)
     tr.add_argument("--grad-accum", type=int, default=8)
@@ -406,7 +406,7 @@ def build_parser() -> argparse.ArgumentParser:
     inf.add_argument(
         "--base-model",
         type=str,
-        default="Qwen/Qwen2.5-Math-7B-Instruct",
+        default="Qwen/Qwen2.5-Math-1.5B-Instruct",
         help="Must match base used in training if no pipeline_meta.json",
     )
     inf.add_argument("--problem", type=str, required=True)
@@ -424,7 +424,7 @@ def build_parser() -> argparse.ArgumentParser:
     al.add_argument("--splits", nargs="+", default=["train", "test"])
     al.add_argument("--strip-scratchpads", action="store_true")
     al.add_argument("--output-dir", type=str, required=True)
-    al.add_argument("--model", type=str, default="Qwen/Qwen2.5-Math-7B-Instruct")
+    al.add_argument("--model", type=str, default="Qwen/Qwen2.5-Math-1.5B-Instruct")
     al.add_argument("--epochs", type=float, default=1.0)
     al.add_argument("--batch-size", type=int, default=1)
     al.add_argument("--grad-accum", type=int, default=8)

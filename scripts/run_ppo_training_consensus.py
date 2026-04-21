@@ -98,9 +98,9 @@ def initialize_models(config: ConsensusTrainingConfig):
         if meta_file.exists():
             with open(meta_file) as f:
                 meta = json.load(f)
-                base_model_name = meta.get("base_model", "Qwen/Qwen2.5-Math-7B-Instruct")
+                base_model_name = meta.get("base_model", "Qwen/Qwen2.5-Math-1.5B-Instruct")
         else:
-            base_model_name = "Qwen/Qwen2.5-Math-7B-Instruct"
+            base_model_name = "Qwen/Qwen2.5-Math-1.5B-Instruct"
         
         logger.info(f"Loading base model: {base_model_name}")
         

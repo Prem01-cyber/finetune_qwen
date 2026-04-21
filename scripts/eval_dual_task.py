@@ -431,7 +431,7 @@ def eval_question_generation(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate dual-task model")
     parser.add_argument("--adapter", type=str, required=True, help="Path to trained adapter")
-    parser.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-Math-7B-Instruct")
+    parser.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-Math-1.5B-Instruct")
     parser.add_argument("--bnb-compute-dtype", type=str, default="bfloat16")
     
     # Question generation eval

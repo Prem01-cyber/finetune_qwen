@@ -165,7 +165,7 @@ def _generate(
 def main() -> None:
     p = argparse.ArgumentParser(description="Batch eval for SFT adapter inference.")
     p.add_argument("--adapter", type=Path, required=True, help="Adapter directory from training step.")
-    p.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-Math-7B-Instruct")
+    p.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-Math-1.5B-Instruct")
     p.add_argument("--source", choices=("hf", "jsonl"), default="hf")
     p.add_argument("--dataset", type=str, default="openai/gsm8k")
     p.add_argument("--config", type=str, default="main")

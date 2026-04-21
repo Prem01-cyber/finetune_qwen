@@ -242,7 +242,7 @@ def main() -> None:
     p.add_argument(
         "--base-model",
         type=str,
-        default="Qwen/Qwen2.5-Math-7B-Instruct",
+        default="Qwen/Qwen2.5-Math-1.5B-Instruct",
         help="Base model id (overridden by pipeline_meta.json if present).",
     )
     p.add_argument("--num-samples", type=int, default=3, help="Number of Q+S pairs to generate.")
