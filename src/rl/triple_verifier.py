@@ -77,11 +77,25 @@ class TripleVerifier:
         Returns:
             List of 3 solution strings
         """
-        # Format prompt for solution generation
-        prompt = (
-            f"### Task: Solve Problem\n"
-            f"Problem: {question}\n"
-            f"Solution:"
+        # Format prompt using chat template (matches training format)
+        system_prompt = (
+            "You are a step-by-step math solver. "
+            "Solve the given problem one step at a time. "
+            "Each step must be on its own line, starting with 'Step N:'. "
+            "End with a line starting with 'Final Answer:'. "
+            "Write every mathematical expression in Python/SymPy syntax."
+        )
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"### Task: Solve Problem\nProblem: {question}\nSolution:"},
+        ]
+        
+        # Apply chat template
+        prompt = self.tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
         )
         
         # Create batch of 3 identical prompts
@@ -109,16 +123,12 @@ class TripleVerifier:
         
         # Decode each solution
         solutions = []
+        prompt_length = inputs["input_ids"].shape[1]
+        
         for i in range(3):
-            # Decode and remove the prompt
-            full_text = self.tokenizer.decode(outputs[i], skip_special_tokens=True)
-            
-            # Strip the prompt to get just the solution
-            if full_text.startswith(prompt):
-                solution = full_text[len(prompt):].strip()
-            else:
-                solution = full_text.strip()
-            
+            # Only decode the generated tokens (skip the prompt)
+            generated_ids = outputs[i][prompt_length:]
+            solution = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
             solutions.append(solution)
         
         logger.debug(f"Generated 3 solutions for question: {question[:50]}...")
