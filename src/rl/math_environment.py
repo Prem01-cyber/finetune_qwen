@@ -266,6 +266,8 @@ class MathEnvironment:
         # Strip initial prompt from output
         if generated_text.startswith(initial_prompt):
             generated_text = generated_text[len(initial_prompt):].strip()
+        
+        logger.debug(f"Generated text for phase {phase} (len={len(generated_text)}): {generated_text[:150]}...")
 
         return generated_text, transitions
 

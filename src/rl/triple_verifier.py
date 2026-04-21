@@ -286,6 +286,7 @@ class TripleVerifier:
         all_solutions = [primary_solution] + alternative_solutions[1:]
         
         # Run SymPy verification on primary solution
+        logger.debug(f"Verifying primary solution (len={len(primary_solution)}): {primary_solution[:200]}...")
         sympy_report = verify_solution_text(primary_solution)
         
         # Extract consensus information from all 3 solutions
