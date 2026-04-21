@@ -292,16 +292,29 @@ class MathEnvironment:
                 - question_metrics: Breakdown
                 - solution_metrics: Breakdown
         """
-        verification_result = verify_solution_text(solution)
-
+        # Call with correct parameter names
         reward_result = self.reward_calculator.calculate_reward(
-            question=question,
-            solution=solution,
-            verification=verification_result,
-            reference_questions=None,
+            generated_question=question,
+            generated_solution=solution,
         )
 
-        return reward_result
+        # Convert CombinedReward to dict format expected by the rest of the code
+        return {
+            "combined_score": reward_result.combined_score,
+            "question_metrics": {
+                "overall_score": reward_result.question_metrics.overall_score,
+                "solvability": reward_result.question_metrics.solvability_score,
+                "novelty": reward_result.question_metrics.novelty_score,
+                "difficulty": reward_result.question_metrics.difficulty_score,
+            },
+            "solution_metrics": {
+                "overall_score": reward_result.solution_metrics.overall_score,
+                "correctness": reward_result.solution_metrics.correctness_score,
+                "format_compliance": reward_result.solution_metrics.format_score,
+                "efficiency": reward_result.solution_metrics.efficiency_score,
+                "steps_total": reward_result.solution_metrics.steps_total,
+            },
+        }
 
     def rollout_trajectory(self) -> Trajectory:
         """
