@@ -41,16 +41,16 @@ class ConsensusTrainingConfig:
     # Model
     base_model = "checkpoints/dual_task_v1"  # Phase 1 dual-task model
 
-    # PPO hyperparameters
-    learning_rate = 1e-5
-    ppo_epochs = 4
-    batch_size = 32  # Standard batch size
+    # PPO hyperparameters (adjusted for smaller model and stability)
+    learning_rate = 5e-6  # Reduced from 1e-5 for smaller steps
+    ppo_epochs = 2        # Reduced from 4 to avoid early KL stopping
+    batch_size = 32       # Standard batch size
     clip_range = 0.2
     clip_range_vf = 0.2
     vf_coef = 0.5
     ent_coef = 0.01
     max_grad_norm = 1.0
-    target_kl = 0.01
+    target_kl = 0.03      # Increased from 0.01 to allow more policy change
 
     # GAE
     gamma = 1.0
