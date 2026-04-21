@@ -365,6 +365,16 @@ class CurriculumManager:
         
         normalized = {topic: value / total for topic, value in probs.items()}
         
+        # Apply topic probability floor to prevent mode collapse
+        MIN_TOPIC_PROB = 0.02  # Every topic gets at least 2% chance
+        for topic in normalized:
+            if normalized[topic] < MIN_TOPIC_PROB:
+                normalized[topic] = MIN_TOPIC_PROB
+        
+        # Re-normalize after applying floor
+        total = sum(normalized.values())
+        normalized = {topic: value / total for topic, value in normalized.items()}
+        
         # Log top 5 topics for debugging
         top_topics = sorted(normalized.items(), key=lambda x: x[1], reverse=True)[:5]
         logger.debug(f"Topic probabilities: {top_topics}")

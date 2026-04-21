@@ -100,7 +100,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         self.consensus_reward_calculator = ConsensusRewardCalculator(verifier=self.triple_verifier)
         self.expert_panel = SimulatedExpertPanel()
         self.replay_buffer = GenerationalReplayBuffer(max_size=500)
-        self.quality_filter = QualityFilter(novelty_threshold=0.7)
+        self.quality_filter = QualityFilter(novelty_threshold=0.5)  # Relaxed from 0.7
         self.last_replay_ratio: float = 0.0
         self.last_rollout_mix: Dict[str, int] = {"fresh": 0, "replay": 0}
 
@@ -259,10 +259,12 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         # Admission gate for recursive replay memory.
         is_candidate, reason = self.quality_filter.meets_replay_criteria(metadata_dict)
         metadata_dict["replay_candidate"] = is_candidate
+        novelty_score = 0.0
+        
         if is_candidate:
-            novelty = self.quality_filter.check_novelty(trajectory, self.replay_buffer.buffer)
-            metadata_dict["replay_novelty"] = float(novelty)
-            if self.quality_filter.is_novel_enough(novelty):
+            novelty_score = self.quality_filter.check_novelty(trajectory, self.replay_buffer.buffer)
+            metadata_dict["replay_novelty"] = float(novelty_score)
+            if self.quality_filter.is_novel_enough(novelty_score):
                 quality_score = self.quality_filter.compute_quality_score(metadata_dict)
                 self.replay_buffer.add_trajectory(
                     trajectory=trajectory,
@@ -271,12 +273,28 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                     quality_score=quality_score,
                 )
                 metadata_dict["replay_added"] = True
+                logger.info(
+                    f"✓ BUFFER ADMISSION: tier={reason}, "
+                    f"reward={terminal_reward:.3f}, novelty={novelty_score:.3f}, quality={quality_score:.3f}"
+                )
             else:
                 metadata_dict["replay_added"] = False
+                logger.debug(
+                    f"✗ Buffer reject (novelty): tier={reason}, "
+                    f"reward={terminal_reward:.3f}, novelty={novelty_score:.3f} < {self.quality_filter.novelty_threshold}"
+                )
         else:
             metadata_dict["replay_novelty"] = 0.0
             metadata_dict["replay_added"] = False
             metadata_dict["replay_reject_reason"] = reason
+            logger.debug(
+                f"✗ Buffer reject (quality): reason={reason}, "
+                f"reward={terminal_reward:.3f}, "
+                f"sympy={metadata_dict.get('sympy_verified')}, "
+                f"consensus={metadata_dict.get('consensus_achieved')}, "
+                f"primary_match={metadata_dict.get('primary_matches_majority')}, "
+                f"topic_match={metadata_dict.get('topic_match_score', 0):.3f}"
+            )
 
         trajectory.metadata = metadata_dict
 

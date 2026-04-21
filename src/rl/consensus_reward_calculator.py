@@ -186,7 +186,10 @@ class ConsensusRewardCalculator:
             f"Consensus reward: combined={combined_score:.3f} = "
             f"0.4×{sympy_score:.3f} + 0.4×{consensus_score:.3f} + 0.2×{format_score:.3f} | "
             f"has_majority={consensus.get('has_majority', False)}, "
-            f"primary_matches={consensus.get('primary_matches_majority', False)}"
+            f"primary_matches={consensus.get('primary_matches_majority', False)} | "
+            f"SymPy: {sympy_verification.get('steps_verified_ok', 0)}/{sympy_verification.get('steps_total', 0)} ok, "
+            f"{sympy_verification.get('steps_failed', 0)} failed, "
+            f"final_answer={sympy_verification.get('final_answer', 'missing')}"
         )
         
         return {

@@ -12,26 +12,67 @@ from src.rl.replay_buffer import StoredTrajectory
 
 
 class QualityFilter:
-    def __init__(self, novelty_threshold: float = 0.7) -> None:
+    def __init__(self, novelty_threshold: float = 0.5) -> None:
+        """
+        Initialize quality filter with relaxed novelty threshold.
+        
+        Args:
+            novelty_threshold: Minimum novelty score (0.5 = moderate diversity)
+        """
         self.novelty_threshold = novelty_threshold
 
     def meets_replay_criteria(self, metadata: Dict[str, object]) -> Tuple[bool, str]:
+        """
+        Three-tier quality filter for buffer admission.
+        
+        Tier 1 (Gold): High reward + both verification signals
+        Tier 2 (Silver): Very high reward + at least one strong signal
+        Tier 3 (Platinum): Near-perfect trajectories bypass filters
+        
+        Args:
+            metadata: Trajectory metadata dict
+            
+        Returns:
+            (is_eligible, reason_or_tier)
+        """
         combined_reward = float(metadata.get("combined_reward", 0.0))
+        
+        # Tier 3: Platinum standard - near-perfect trajectories always get in
+        if combined_reward >= 0.95:
+            return True, "platinum_standard"
+        
+        # Tier 1: Gold standard - high quality with both verification signals
+        if combined_reward >= 0.7:
+            has_consensus = (
+                bool(metadata.get("consensus_achieved", False)) and 
+                bool(metadata.get("primary_matches_majority", False))
+            )
+            sympy_clean = bool(metadata.get("sympy_verified", False))
+            
+            if has_consensus and sympy_clean:
+                if float(metadata.get("topic_match_score", 0.0)) >= 0.6:
+                    return True, "gold_standard"
+        
+        # Tier 2: Silver standard - very high reward with at least one strong signal
+        if combined_reward >= 0.75:
+            # Accept if EITHER perfect SymPy OR strong consensus
+            perfect_sympy = float(metadata.get("sympy_score", 0.0)) >= 0.95
+            strong_consensus = (
+                bool(metadata.get("consensus_achieved", False)) and
+                float(metadata.get("consensus_strength", 0.0)) >= 0.8
+            )
+            
+            if perfect_sympy or strong_consensus:
+                if float(metadata.get("topic_match_score", 0.0)) >= 0.6:
+                    return True, "silver_standard"
+        
+        # Failed all tiers
         if combined_reward < 0.7:
-            return False, "reward_threshold"
-
-        if not bool(metadata.get("sympy_verified", False)):
-            return False, "sympy_failed"
-
-        consensus = bool(metadata.get("consensus_achieved", False))
-        matches_majority = bool(metadata.get("primary_matches_majority", False))
-        if not (consensus and matches_majority):
-            return False, "consensus_failed"
-
-        if float(metadata.get("topic_match_score", 0.0)) < 0.6:
-            return False, "topic_mismatch"
-
-        return True, "passed"
+            return False, f"reward_too_low_{combined_reward:.2f}"
+        elif combined_reward < 0.75:
+            return False, "reward_below_silver_tier"
+        else:
+            return False, "no_strong_verification_signal"
 
     def compute_quality_score(self, metadata: Dict[str, object]) -> float:
         return max(

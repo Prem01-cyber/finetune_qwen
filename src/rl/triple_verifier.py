@@ -42,7 +42,7 @@ class TripleVerifier:
         self,
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
-        temperature: float = 0.7,
+        temperature: float = 0.5,
         top_p: float = 0.9,
         max_tokens: int = 500,
     ):
@@ -52,7 +52,7 @@ class TripleVerifier:
         Args:
             model: Language model for generation
             tokenizer: Tokenizer
-            temperature: Sampling temperature (>0 for diversity)
+            temperature: Sampling temperature (0.5 = moderate consensus, was 0.7)
             top_p: Nucleus sampling parameter
             max_tokens: Maximum tokens per solution
         """
