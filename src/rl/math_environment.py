@@ -174,6 +174,9 @@ class MathEnvironment:
         current_ids = self.tokenizer.encode(
             current_text, return_tensors="pt"
         ).to(self.device)
+        
+        # Track prompt length to strip it later
+        prompt_length = current_ids.shape[1]
 
         # Create initial state
         current_state = State(
@@ -277,14 +280,11 @@ class MathEnvironment:
                 transitions[-1].done = True
                 break
 
-        # Decode full generated text
+        # Decode only the newly generated tokens (skip the prompt)
+        generated_ids = current_ids[0][prompt_length:]
         generated_text = self.tokenizer.decode(
-            current_ids[0], skip_special_tokens=True
-        )
-
-        # Strip initial prompt from output
-        if generated_text.startswith(initial_prompt):
-            generated_text = generated_text[len(initial_prompt):].strip()
+            generated_ids, skip_special_tokens=True
+        ).strip()
         
         logger.debug(f"Generated text for phase {phase} (len={len(generated_text)}): {generated_text[:150]}...")
 
