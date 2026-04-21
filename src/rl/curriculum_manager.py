@@ -36,6 +36,7 @@ class TopicState:
     consecutive_failures: int = 0
     failure_count_total: int = 0
     history: List[Dict[str, float]] = field(default_factory=list)
+    current_iteration_attempts: int = 0  # Track attempts within current iteration
 
 
 class CurriculumManager:
@@ -137,6 +138,13 @@ class CurriculumManager:
         names = list(probs.keys())
         dist = np.array([probs[name] for name in names], dtype=np.float64)
         dist = dist / dist.sum()
+        
+        # Log topic distribution at start of each iteration (rollout 0, 10, 20, etc.)
+        total_attempts = sum(t.current_iteration_attempts for t in self.topics.values())
+        if total_attempts % 20 == 0:  # Every 20 rollouts
+            top_5 = sorted(probs.items(), key=lambda x: x[1], reverse=True)[:5]
+            logger.info(f"Topic probabilities (rollout {total_attempts}): {[(t, f'{p:.3f}') for t, p in top_5]}")
+        
         topic = str(np.random.choice(names, p=dist))
         difficulty = self._get_difficulty_for_topic(topic)
         self.current_focus_topics = [topic]
@@ -152,6 +160,7 @@ class CurriculumManager:
     ) -> None:
         state = self.topics[topic]
         state.total_attempts += 1
+        state.current_iteration_attempts += 1
         state.successes += int(solution_success)
         state.success_rate = state.successes / max(1, state.total_attempts)
         state.last_practiced = self.current_iteration
@@ -166,16 +175,20 @@ class CurriculumManager:
             state.failure_count_total += 1
 
         target = state.difficulty_target
-        if state.success_rate > self.SWEET_SPOT_MAX:
-            state.difficulty_target = min(0.95, target + 0.05)
-            if state.status != "mastered":
-                state.status = "mastered"
-                state.mastered_at_iteration = self.current_iteration
-        elif state.success_rate < self.SWEET_SPOT_MIN:
-            state.difficulty_target = max(0.15, target - 0.07)
-            state.status = "active"
-        else:
-            state.status = "active"
+        # Only adjust difficulty if we have sufficient data
+        if state.total_attempts >= 5:
+            if state.success_rate > self.SWEET_SPOT_MAX:
+                # Increase difficulty gradually
+                state.difficulty_target = min(0.95, target + 0.03)
+                if state.status != "mastered" and state.success_rate >= 0.75:
+                    state.status = "mastered"
+                    state.mastered_at_iteration = self.current_iteration
+            elif state.success_rate < self.SWEET_SPOT_MIN:
+                # Decrease difficulty more conservatively to avoid getting stuck too low
+                state.difficulty_target = max(0.2, target - 0.04)
+                state.status = "active"
+            else:
+                state.status = "active"
 
         if measured_difficulty is not None:
             state.difficulty_history.append(float(measured_difficulty))
@@ -200,6 +213,9 @@ class CurriculumManager:
 
     def increment_iteration(self) -> None:
         self.current_iteration += 1
+        # Reset within-iteration counters
+        for state in self.topics.values():
+            state.current_iteration_attempts = 0
         self._run_retention_tests_if_due()
 
     def generate_instruction(self, topic: str, target_difficulty: float) -> str:
@@ -285,42 +301,75 @@ class CurriculumManager:
         if self.current_iteration <= 3:
             weights = {"sweet": 0.0, "explore": 1.0, "retention": 0.0}
         elif self.current_iteration <= 10:
-            weights = {"sweet": 0.60, "explore": 0.25, "retention": 0.15}
+            weights = {"sweet": 0.50, "explore": 0.35, "retention": 0.15}
         else:
-            weights = {"sweet": 0.70, "explore": 0.15, "retention": 0.15}
+            weights = {"sweet": 0.60, "explore": 0.25, "retention": 0.15}
 
         if self._detect_plateau():
-            weights["explore"] = min(0.45, weights["explore"] + 0.2)
+            weights["explore"] = min(0.50, weights["explore"] + 0.2)
             weights["sweet"] = max(0.2, weights["sweet"] - 0.2)
 
-        probs: Dict[str, float] = {}
+        # Start with minimum allocation for ALL topics (5% split)
+        MIN_ALLOCATION = 0.05
+        probs: Dict[str, float] = {t.topic_name: MIN_ALLOCATION / len(all_states) for t in all_states}
+        remaining_mass = 1.0 - MIN_ALLOCATION
+        
+        bonus_probs: Dict[str, float] = {}
+        
+        # Allocate sweet spot budget with within-iteration diversity penalty
         if sweet_spot:
-            staleness = {t.topic_name: max(1, self.current_iteration - t.last_practiced) for t in sweet_spot}
-            total_stale = sum(staleness.values())
+            # Apply diversity penalty based on current iteration attempts
+            staleness = {}
             for t in sweet_spot:
-                probs[t.topic_name] = weights["sweet"] * (staleness[t.topic_name] / total_stale)
+                # Strong penalty for topics sampled many times in current iteration
+                if t.current_iteration_attempts == 0:
+                    # Not yet sampled this iteration - highest priority
+                    staleness[t.topic_name] = 10.0
+                elif t.current_iteration_attempts <= 3:
+                    # Sampled 1-3 times - moderate priority
+                    staleness[t.topic_name] = 5.0 / t.current_iteration_attempts
+                else:
+                    # Sampled 4+ times - heavily penalized
+                    staleness[t.topic_name] = 1.0 / (t.current_iteration_attempts ** 1.5)
+            
+            total_stale = sum(staleness.values())
+            if total_stale > 0:
+                for t in sweet_spot:
+                    bonus_probs[t.topic_name] = bonus_probs.get(t.topic_name, 0.0) + (
+                        remaining_mass * weights["sweet"] * (staleness[t.topic_name] / total_stale)
+                    )
 
-        explore_pool = untested if untested else self._get_boundary_topics()
+        # Allocate explore budget - ensure we always explore something
+        explore_pool = untested if untested else self._get_diverse_exploration_pool(sweet_spot)
         if explore_pool:
-            each = weights["explore"] / len(explore_pool)
+            each = remaining_mass * weights["explore"] / len(explore_pool)
             for t in explore_pool:
-                probs[t.topic_name] = probs.get(t.topic_name, 0.0) + each
+                bonus_probs[t.topic_name] = bonus_probs.get(t.topic_name, 0.0) + each
 
+        # Allocate retention budget
         retention_due = [t for t in mastered if self._schedule_retention_test(t) <= self.current_iteration]
         if retention_due:
-            each = weights["retention"] / len(retention_due)
+            each = remaining_mass * weights["retention"] / len(retention_due)
             for t in retention_due:
-                probs[t.topic_name] = probs.get(t.topic_name, 0.0) + each
+                bonus_probs[t.topic_name] = bonus_probs.get(t.topic_name, 0.0) + each
 
-        if not probs:
-            each = 1.0 / len(all_states)
-            return {t.topic_name: each for t in all_states}
-
+        # Add bonus to base minimum allocation
+        for topic, bonus in bonus_probs.items():
+            probs[topic] = probs.get(topic, 0.0) + bonus
+        
+        # Normalize to ensure sum = 1.0
         total = sum(probs.values())
         if total <= 0:
             each = 1.0 / len(all_states)
             return {t.topic_name: each for t in all_states}
-        return {topic: value / total for topic, value in probs.items()}
+        
+        normalized = {topic: value / total for topic, value in probs.items()}
+        
+        # Log top 5 topics for debugging
+        top_topics = sorted(normalized.items(), key=lambda x: x[1], reverse=True)[:5]
+        logger.debug(f"Topic probabilities: {top_topics}")
+        
+        return normalized
 
     def _get_boundary_topics(self) -> List[TopicState]:
         result = []
@@ -334,6 +383,56 @@ class CurriculumManager:
         if not result:
             result = sorted(self.topics.values(), key=lambda t: abs(t.success_rate - self.TARGET_SUCCESS))[:4]
         return result
+    
+    def _get_diverse_exploration_pool(self, exclude_sweet_spot: List[TopicState]) -> List[TopicState]:
+        """
+        Get topics for exploration that are NOT in sweet spot.
+        
+        Prioritizes:
+        1. Under-practiced topics (low attempt count)
+        2. Topics with potential (success rate 0.2-0.4 or 0.7-0.9)
+        3. Topics not recently attempted
+        
+        Args:
+            exclude_sweet_spot: Topics already in sweet spot to exclude
+        
+        Returns:
+            List of 3-5 topics for exploration
+        """
+        sweet_spot_names = {t.topic_name for t in exclude_sweet_spot}
+        candidates = [t for t in self.topics.values() if t.topic_name not in sweet_spot_names]
+        
+        if not candidates:
+            # Fallback if somehow all topics are in sweet spot
+            return list(self.topics.values())[:3]
+        
+        # Score each candidate
+        scored = []
+        for state in candidates:
+            # Factor 1: Under-practiced (inverse of attempts)
+            attempt_score = 1.0 / (1.0 + state.total_attempts / 10.0)
+            
+            # Factor 2: Near sweet spot boundaries (could improve into sweet spot)
+            if 0.2 <= state.success_rate < self.SWEET_SPOT_MIN:
+                potential_score = 2.0  # Just below sweet spot - high potential
+            elif self.SWEET_SPOT_MAX < state.success_rate <= 0.9:
+                potential_score = 1.5  # Just above sweet spot - could be challenged more
+            elif state.total_attempts == 0:
+                potential_score = 3.0  # Untested - highest priority
+            else:
+                potential_score = 0.5  # Far from sweet spot
+            
+            # Factor 3: Staleness (not practiced recently)
+            staleness_score = max(1, self.current_iteration - state.last_practiced) / 5.0
+            
+            # Combined score
+            total_score = attempt_score + potential_score + staleness_score
+            scored.append((state, total_score))
+        
+        # Return top 3-5 topics by score
+        scored.sort(key=lambda x: x[1], reverse=True)
+        num_explore = min(5, max(3, len(candidates) // 3))
+        return [state for state, _ in scored[:num_explore]]
 
     def _get_difficulty_for_topic(self, topic: str) -> float:
         state = self.topics[topic]
