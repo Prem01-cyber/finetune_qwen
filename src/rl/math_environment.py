@@ -111,15 +111,34 @@ class MathEnvironment:
     def format_solution_prompt(self, question: str) -> str:
         """
         Format prompt for solution generation phase.
+        
+        Uses chat template with system prompt to ensure proper formatting.
+        This matches the format used by TripleVerifier for consensus solutions.
 
         Returns:
-            s_0^solve = "### Task: Solve Problem\nProblem: <question>\n"
+            Formatted prompt with chat template
         """
-        return (
-            f"### Task: Solve Problem\n"
-            f"Problem: {question}\n"
-            f"Solution:"
+        system_prompt = (
+            "You are a step-by-step math solver. "
+            "Solve the given problem one step at a time. "
+            "Each step must be on its own line, starting with 'Step N:'. "
+            "End with a line starting with 'Final Answer:'. "
+            "Write every mathematical expression in Python/SymPy syntax."
         )
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"### Task: Solve Problem\nProblem: {question}\nSolution:"},
+        ]
+        
+        # Apply chat template (matches training format)
+        prompt = self.tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        return prompt
 
     def generate_with_logging(
         self,
