@@ -151,13 +151,13 @@ def test_format_compliance(model, tokenizer, num_samples: int = 20) -> Dict:
         # Validate format
         validation = validate_sympy_solution_format(solution)
         
-        if validation.format_ok:
+        if validation.ok:
             format_ok += 1
-        if validation.steps_found:
+        if validation.step_count > 0:
             has_steps += 1
-        if validation.final_answer_found:
+        if validation.has_final_line:
             has_final_answer += 1
-        if validation.all_steps_verified:
+        if validation.ok and validation.sympy_parseable_final:
             sympy_ok += 1
         
         result = {
@@ -165,17 +165,17 @@ def test_format_compliance(model, tokenizer, num_samples: int = 20) -> Dict:
             "prompt": prompt,
             "question": question,
             "solution": solution,
-            "format_ok": validation.format_ok,
-            "steps_found": validation.steps_found,
-            "final_answer_found": validation.final_answer_found,
-            "all_steps_verified": validation.all_steps_verified,
-            "num_steps": validation.steps_verified_ok,
+            "format_ok": validation.ok,
+            "steps_found": validation.step_count > 0,
+            "final_answer_found": validation.has_final_line,
+            "sympy_parseable": validation.sympy_parseable_final,
+            "num_steps": validation.step_count,
         }
         results.append(result)
         
         # Log to console
-        status = "✓" if validation.format_ok else "✗"
-        print(f"Sample {i+1:2d}/{num_samples}: {status} | Steps: {validation.steps_found} | Answer: {validation.final_answer_found} | SymPy: {validation.all_steps_verified}")
+        status = "✓" if validation.ok else "✗"
+        print(f"Sample {i+1:2d}/{num_samples}: {status} | Steps: {validation.step_count} | Answer: {validation.has_final_line} | SymPy: {validation.sympy_parseable_final}")
     
     summary = {
         "num_samples": num_samples,
