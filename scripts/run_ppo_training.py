@@ -334,9 +334,13 @@ def main():
             num_trajectories=config.num_rollouts_per_iter, verbose=True
         )
 
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id or 0
         rollout_buffer = RolloutBuffer(
             gamma=config.gamma,
             gae_lambda=config.gae_lambda,
+            pad_token_id=int(pad_id),
         )
 
         for traj in trajectories:

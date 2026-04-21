@@ -25,6 +25,7 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -163,6 +164,28 @@ class PPOTrainer:
 
         self.device = next(policy_model.parameters()).device
 
+    def _policy_logits_at_state(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Logits for the next-token distribution at the last non-pad position.
+
+        Returns:
+            logits_last: [batch, vocab_size] float32
+        """
+        out = self.policy(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        logits = out.logits.float()
+        last_idx = attention_mask.long().sum(dim=1) - 1
+        last_idx = last_idx.clamp(min=0)
+        b = torch.arange(logits.size(0), device=logits.device)
+        return logits[b, last_idx]
+
     # ------------------------------------------------------------------
     # Training step
     # ------------------------------------------------------------------
@@ -194,19 +217,23 @@ class PPOTrainer:
             for batch in rollout_buffer.get_batches(
                 batch_size=self.batch_size, shuffle=True
             ):
-                old_log_probs = batch["log_probs"].to(self.device)
-                old_values = batch["values"].to(self.device)
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                action_token_ids = batch["action_token_ids"].to(self.device)
+
+                old_log_probs = batch["old_log_probs"].to(self.device).detach()
+                old_values = batch["old_values"].to(self.device).detach()
                 advantages = batch["advantages"].to(self.device)
                 returns = batch["returns"].to(self.device)
-                old_entropies = batch["entropies"].to(self.device)
 
-                # --- policy loss ---
-                # Re-use stored log_probs as both old and new in this simplified
-                # implementation. A full implementation would re-forward each
-                # state through the current policy, but that requires storing
-                # input_ids in the buffer. Here we approximate with the ratio ≈ 1
-                # for the first epoch and rely on the clipping to limit updates.
-                new_log_probs = old_log_probs  # placeholder — see note above
+                # --- policy: re-forward π_θ(a|s) at rollout state ---
+                logits_last = self._policy_logits_at_state(input_ids, attention_mask)
+                log_probs = F.log_softmax(logits_last, dim=-1)
+                new_log_probs = log_probs[
+                    torch.arange(logits_last.size(0), device=logits_last.device),
+                    action_token_ids,
+                ]
+                entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
 
                 policy_loss, pg_info = self.loss_fn.compute_policy_loss(
                     new_log_probs, old_log_probs, advantages
@@ -220,15 +247,14 @@ class PPOTrainer:
                     early_stopped = True
                     break
 
-                # --- value loss ---
+                # --- value: re-forward V_φ(s) ---
+                new_values = self.value(input_ids, attention_mask).float().squeeze(-1)
                 value_loss = self.loss_fn.compute_value_loss(
-                    old_values, old_values, returns
+                    new_values, old_values, returns
                 )
 
-                # --- entropy ---
-                mean_entropy = old_entropies.mean()
+                mean_entropy = entropy.mean()
 
-                # --- total loss ---
                 total_loss = (
                     policy_loss
                     + self.loss_fn.vf_coef * value_loss
@@ -237,13 +263,10 @@ class PPOTrainer:
 
                 self.optimiser.zero_grad()
                 total_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.optimiser.param_groups[0]["params"]
-                    + self.optimiser.param_groups[1]["params"]
-                    if len(self.optimiser.param_groups) > 1
-                    else self.optimiser.param_groups[0]["params"],
-                    self.max_grad_norm,
-                )
+                _params: list[torch.nn.Parameter] = []
+                for g in self.optimiser.param_groups:
+                    _params.extend(g["params"])
+                nn.utils.clip_grad_norm_(_params, self.max_grad_norm)
                 self.optimiser.step()
 
                 stats["policy_loss"].append(policy_loss.item())

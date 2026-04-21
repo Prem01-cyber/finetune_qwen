@@ -29,6 +29,23 @@ from src.rl.mdp_components import Trajectory, Transition
 logger = logging.getLogger(__name__)
 
 
+def _pad_2d(
+    id_list: List[torch.Tensor],
+    mask_list: List[torch.Tensor],
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Right-pad token ids and masks to a common length (batch, max_len)."""
+    max_len = max(t.size(0) for t in id_list)
+    batch = len(id_list)
+    input_ids = torch.full((batch, max_len), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((batch, max_len), dtype=torch.long)
+    for i, (ids, m) in enumerate(zip(id_list, mask_list)):
+        L = ids.size(0)
+        input_ids[i, :L] = ids
+        attention_mask[i, :L] = m
+    return input_ids, attention_mask
+
+
 # ---------------------------------------------------------------------------
 # GAE Computer
 # ---------------------------------------------------------------------------
@@ -106,9 +123,15 @@ class RolloutBuffer:
         gae_lambda : GAE λ.
     """
 
-    def __init__(self, gamma: float = 1.0, gae_lambda: float = 0.95) -> None:
+    def __init__(
+        self,
+        gamma: float = 1.0,
+        gae_lambda: float = 0.95,
+        pad_token_id: int = 0,
+    ) -> None:
         self.gamma = gamma
         self.gae_lambda = gae_lambda
+        self.pad_token_id = pad_token_id
         self._gae = GAEComputer(gamma, gae_lambda)
 
         # Flat storage (populated by add_trajectory)
@@ -201,31 +224,44 @@ class RolloutBuffer:
         for start in range(0, n, batch_size):
             batch_idx = indices[start : start + batch_size]
 
-            log_probs = torch.tensor(
+            # Padded state tensors for re-forward through policy / value (variable length)
+            id_list = [
+                self._transitions[i].state.input_ids.long().cpu()
+                for i in batch_idx
+            ]
+            mask_list = [
+                self._transitions[i].state.attention_mask.long().cpu()
+                for i in batch_idx
+            ]
+            input_ids, attention_mask = _pad_2d(
+                id_list, mask_list, pad_id=self.pad_token_id
+            )
+
+            old_log_probs = torch.tensor(
                 [self._transitions[i].action.log_prob for i in batch_idx],
                 dtype=torch.float32,
             )
-            values = torch.tensor(
+            old_values = torch.tensor(
                 [self._transitions[i].value for i in batch_idx],
                 dtype=torch.float32,
             )
-            advantages = torch.tensor(
-                adv_arr[batch_idx], dtype=torch.float32
+            action_token_ids = torch.tensor(
+                [self._transitions[i].action.token_id for i in batch_idx],
+                dtype=torch.long,
             )
+            advantages = torch.tensor(adv_arr[batch_idx], dtype=torch.float32)
             returns = torch.tensor(
                 [self._returns[i] for i in batch_idx], dtype=torch.float32
             )
-            entropies = torch.tensor(
-                [self._transitions[i].action.entropy for i in batch_idx],
-                dtype=torch.float32,
-            )
 
             yield {
-                "log_probs": log_probs,
-                "values": values,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "action_token_ids": action_token_ids,
+                "old_log_probs": old_log_probs,
+                "old_values": old_values,
                 "advantages": advantages,
                 "returns": returns,
-                "entropies": entropies,
             }
 
     # ------------------------------------------------------------------

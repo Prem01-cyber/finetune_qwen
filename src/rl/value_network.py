@@ -106,10 +106,12 @@ class ValueHead(nn.Module):
             attention_mask=attention_mask,
         )
 
-        # Use the last non-padding token's hidden state as state representation
+        # Last *non-pad* token (right-padded batches: last valid index per row)
         last_hidden = outputs.last_hidden_state  # [B, T, H]
-        # Grab the representation at the final position
-        cls_hidden = last_hidden[:, -1, :].to(self.value_head[0].weight.dtype)
+        last_idx = attention_mask.long().sum(dim=1) - 1
+        last_idx = last_idx.clamp(min=0)
+        b = torch.arange(last_hidden.size(0), device=last_hidden.device)
+        cls_hidden = last_hidden[b, last_idx].to(self.value_head[0].weight.dtype)
 
         values = self.value_head(cls_hidden).squeeze(-1)  # [B]
         return values
