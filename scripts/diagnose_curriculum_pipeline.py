@@ -8,12 +8,14 @@ import argparse
 import json
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import wandb
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -76,6 +78,79 @@ class DiagnosticResult:
         return passed == total
 
 
+def log_to_wandb(
+    *,
+    result: "DiagnosticResult",
+    trajectories: list | None,
+    project: str = "math-diagnostics",
+    run_name: str | None = None,
+):
+    """Log diagnostic summary and checks to Weights & Biases."""
+    if run_name is None:
+        run_name = f"curriculum_diagnostic_{datetime.now():%Y%m%d_%H%M%S}"
+
+    wandb.init(
+        project=project,
+        name=run_name,
+        tags=["diagnostic", "curriculum", "pre-training"],
+    )
+
+    passed = sum(1 for c in result.checks if c["passed"])
+    total = len(result.checks)
+    failed = total - passed
+
+    payload = {
+        "diagnostic/checks_passed": passed,
+        "diagnostic/checks_total": total,
+        "diagnostic/checks_failed": failed,
+        "diagnostic/pass_rate": (passed / total) if total else 0.0,
+        "diagnostic/warnings_count": len(result.warnings),
+        "diagnostic/errors_count": len(result.errors),
+    }
+
+    if trajectories:
+        rewards = [float(t.metadata.get("combined_reward", 0.0)) for t in trajectories]
+        q_rewards = [float(t.metadata.get("question_reward", 0.0)) for t in trajectories]
+        s_rewards = [float(t.metadata.get("solution_reward", 0.0)) for t in trajectories]
+        steps_present = sum(1 for t in trajectories if int(t.metadata.get("steps_total", 0)) > 0)
+        sympy_verified = sum(1 for t in trajectories if bool(t.metadata.get("sympy_verified", False)))
+        consensus_achieved = sum(1 for t in trajectories if bool(t.metadata.get("consensus_achieved", False)))
+        n = len(trajectories)
+
+        payload.update(
+            {
+                "samples/count": n,
+                "rewards/combined_mean": sum(rewards) / n,
+                "rewards/question_mean": sum(q_rewards) / n,
+                "rewards/solution_mean": sum(s_rewards) / n,
+                "format/steps_present_rate": steps_present / n,
+                "verification/sympy_verified_rate": sympy_verified / n,
+                "verification/consensus_rate": consensus_achieved / n,
+            }
+        )
+
+    wandb.log(payload)
+
+    checks_table = wandb.Table(columns=["Check", "Passed", "Details"])
+    for check in result.checks:
+        checks_table.add_data(check["name"], check["passed"], check["details"])
+    wandb.log({"diagnostic/checks_table": checks_table})
+
+    if result.warnings:
+        warnings_table = wandb.Table(columns=["Warning"])
+        for warning in result.warnings:
+            warnings_table.add_data(warning)
+        wandb.log({"diagnostic/warnings_table": warnings_table})
+
+    if result.errors:
+        errors_table = wandb.Table(columns=["Error"])
+        for error in result.errors:
+            errors_table.add_data(error)
+        wandb.log({"diagnostic/errors_table": errors_table})
+
+    wandb.finish()
+
+
 def load_model_for_diagnostic(model_path: str):
     """Load model quickly for diagnostic (minimal config)."""
     model_path = Path(model_path)
@@ -122,9 +197,13 @@ def main():
     parser = argparse.ArgumentParser(description="Diagnose curriculum pipeline")
     parser.add_argument("--base-model", type=str, default="checkpoints/dual_task_v1")
     parser.add_argument("--num-test-trajectories", type=int, default=3)
+    parser.add_argument("--wandb-project", type=str, default="math-diagnostics")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
     args = parser.parse_args()
     
     result = DiagnosticResult()
+    trajectories = []
     
     print("\n" + "=" * 80)
     print("CURRICULUM PIPELINE DIAGNOSTIC")
@@ -256,10 +335,20 @@ def main():
                 result.add_check(
                     "Solution format (steps present)",
                     False,
-                    f"Only {has_steps}/{len(trajectories)} have steps"
+                    f"Only {has_steps}/{len(trajectories)} have steps - model not generating 'Step N:' format"
+                )
+                result.add_warning(
+                    "Model not following step-by-step format. Check if model was trained with proper format."
                 )
             
-            if sympy_working > 0:
+            # SymPy verification is only meaningful if there are steps
+            if has_steps == 0:
+                result.add_check(
+                    "SymPy verification",
+                    False,
+                    "Cannot verify - no steps detected in solutions"
+                )
+            elif sympy_working > 0:
                 result.add_check(
                     "SymPy verification",
                     True,
@@ -320,8 +409,10 @@ def main():
             print(f"Target Difficulty: {sample['target_difficulty']:.2f}")
             print(f"\nGenerated Question (first 150 chars):")
             print(f"  {sample['generated_question'][:150]}...")
-            print(f"\nGenerated Solution (first 200 chars):")
-            print(f"  {sample['generated_solution'][:200]}...")
+            print(f"\nGenerated Solution (FULL TEXT for format inspection):")
+            print("-" * 80)
+            print(sample['generated_solution'])
+            print("-" * 80)
             print(f"\nDetected Topic: {sample['detected_topic']}")
             print(f"Measured Difficulty: {sample['estimated_difficulty']:.2f}")
             print(f"\nVerification:")
@@ -329,6 +420,18 @@ def main():
             print(f"  Steps verified: {sample['steps_verified_ok']}")
             print(f"  Consensus achieved: {sample['consensus_achieved']}")
             print(f"  Primary matches majority: {sample['primary_matches_majority']}")
+            
+            # Check format compliance
+            import re
+            sol_text = sample['generated_solution']
+            has_step_pattern = bool(re.search(r'^\s*Step\s+\d+\s*:', sol_text, re.I | re.M))
+            has_final_pattern = bool(re.search(r'(?im)^Final\s*Answer\s*:', sol_text))
+            print(f"\nFormat Analysis:")
+            print(f"  Contains 'Step N:' pattern: {has_step_pattern}")
+            print(f"  Contains 'Final Answer:' pattern: {has_final_pattern}")
+            if not has_step_pattern:
+                print("  ⚠️  Solution does not follow expected 'Step N:' format!")
+            
             print(f"\nRewards:")
             print(f"  Question: {sample['question_reward']:.3f} (30% weight)")
             print(f"  Solution: {sample['solution_reward']:.3f} (70% weight)")
@@ -340,6 +443,13 @@ def main():
     
     # Final report
     all_passed = result.print_report()
+    if not args.no_wandb:
+        log_to_wandb(
+            result=result,
+            trajectories=trajectories,
+            project=args.wandb_project,
+            run_name=args.wandb_run_name,
+        )
     
     if not all_passed:
         print("\n⚠️  RECOMMENDATION: Fix errors before proceeding")
