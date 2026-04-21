@@ -120,6 +120,11 @@ def normalize_for_parse_expr(text: str) -> str:
     # Match comma only between digits in a numeric context
     s = re.sub(r"(?<=\d),(?=\d{3}\b)", "", s)
 
+    # Spoken "times" with ASCII letter x (grade-school / LLM): "4 x 90" must not
+    # become 4*x*90 in SymPy (x parsed as a symbol → false failures on chains).
+    # Only between digit and digit or digit and '('.
+    s = re.sub(r"(?<=\d)\s+[xX]\s+(?=\d|\()", "*", s)
+
     # Collapse multiple spaces/tabs to single space
     s = re.sub(r"[ \t]+", " ", s)
 
