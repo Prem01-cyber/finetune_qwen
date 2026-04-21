@@ -218,7 +218,7 @@ class RewardCalculator:
         if has_solution:
             # Check if solution has proper format
             format_result = validate_sympy_solution_format(solution)
-            solution_format_ok = format_result.valid
+            solution_format_ok = format_result.ok
             
             if solution_format_ok:
                 # Check arithmetic correctness
@@ -284,7 +284,7 @@ class RewardCalculator:
         """
         # Format compliance
         format_result = validate_sympy_solution_format(solution)
-        format_score = 1.0 if format_result.valid else 0.0
+        format_score = 1.0 if format_result.ok else 0.0
         
         # Correctness (arithmetic verification)
         verify_result = verify_solution_text(solution)
@@ -330,7 +330,7 @@ class RewardCalculator:
             overall_score=overall_score,
             steps_total=steps_total,
             steps_verified_ok=steps_verified_ok,
-            format_valid=format_result.valid,
+            format_valid=format_result.ok,
             final_answer_ok=final_answer_ok,
         )
     

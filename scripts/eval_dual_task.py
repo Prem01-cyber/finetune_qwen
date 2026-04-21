@@ -297,7 +297,7 @@ def eval_solution_generation(
         
         # Validate format
         format_result = validate_sympy_solution_format(output)
-        if format_result.valid:
+        if format_result.ok:
             n_format_ok += 1
         
         # Count steps
@@ -309,7 +309,7 @@ def eval_solution_generation(
             gold_final=gold_final,
             pred_final=pred_final,
             exact_match=exact_match,
-            format_ok=format_result.valid,
+            format_ok=format_result.ok,
             step_count=step_count,
             output_text=output,
         ))
