@@ -94,7 +94,7 @@ trl==1.2.0
 typer==0.24.1
 typing-extensions==4.15.0
 urllib3==2.6.3
-wandb==0.18.7
+wandb
 wcwidth==0.6.0
 xxhash==3.6.0
 yarl==1.23.0
