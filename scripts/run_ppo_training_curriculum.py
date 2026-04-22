@@ -34,6 +34,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class TeeStream:
+    """Write stream output to both terminal and a log file."""
+
+    def __init__(self, primary, secondary):
+        self.primary = primary
+        self.secondary = secondary
+
+    def write(self, data: str) -> int:
+        self.primary.write(data)
+        self.secondary.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.primary.flush()
+        self.secondary.flush()
+
+
 class CurriculumTrainingConfig:
     base_model = "checkpoints/dual_task_v1"
     learning_rate = 1e-6  # Reduced from 5e-6 for more conservative updates on specialized model
@@ -350,70 +367,78 @@ def main():
         config=vars(config),
         log_detailed=True,
     )
+    console_log_path = Path(logger_csv.log_path) / "console_output.log"
+    console_log_file = console_log_path.open("a", encoding="utf-8", buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeStream(original_stdout, console_log_file)
+    sys.stderr = TeeStream(original_stderr, console_log_file)
+    logger.info("Full console output is being captured at %s", console_log_path)
 
-    policy, value, tokenizer = initialize_models(config)
-    reference_questions = load_reference_questions(config.gsm8k_reference_data)
-
-    math_env = CurriculumMathEnvironment(
-        policy_model=policy,
-        value_model=value,
-        tokenizer=tokenizer,
-        reference_questions=reference_questions,
-        curriculum_checkpoint_dir=config.curriculum_checkpoint_dir,
-        max_question_tokens=config.max_question_tokens,
-        max_solution_tokens=config.max_solution_tokens,
-        temperature=config.temperature,
-        top_p=config.top_p,
-        consensus_temperature=config.consensus_temperature,
-        use_vllm=config.use_vllm_rollouts,
-        vllm_tensor_parallel_size=config.vllm_tensor_parallel_size,
-        vllm_batch_size=config.rollout_batch_size,
-        vllm_gpu_memory_utilization=config.vllm_gpu_memory_utilization,
-        base_model_path=config.base_model,
-        parallel_worker_timeout_seconds=config.worker_timeout_seconds,
-    )
-    training_monitor = TrainingMonitor(
-        output_dir=config.output_dir,
-        disk_warning_gb=config.disk_warning_gb,
-    )
-    checkpoint_manager = CheckpointManager(
-        output_dir=config.output_dir,
-        keep_last_n=config.checkpoint_keep_last,
-        keep_every_n=config.checkpoint_keep_every,
-        compress_old_logs=config.compress_old_logs,
-    )
-
-    ppo_trainer = PPOTrainer(
-        policy_model=policy,
-        value_model=value,
-        tokenizer=tokenizer,
-        learning_rate=config.learning_rate,
-        ppo_epochs=config.ppo_epochs,
-        batch_size=config.batch_size,
-        clip_range=config.clip_range,
-        clip_range_vf=config.clip_range_vf,
-        vf_coef=config.vf_coef,
-        ent_coef=config.ent_coef,
-        max_grad_norm=config.max_grad_norm,
-        target_kl=config.target_kl,
-    )
-
-    if args.skip_initial_eval:
-        logger.info("\n%s\nSKIPPING INITIAL EVALUATION (use --skip-initial-eval)\n%s", "=" * 80, "=" * 80)
-        initial_eval = {"accuracy": 0.0}
-        best_accuracy = 0.0
-    else:
-        logger.info("\n%s\nINITIAL EVALUATION (Iteration 0)\n%s", "=" * 80, "=" * 80)
-        initial_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
-        best_accuracy = float(initial_eval["accuracy"])
-        
-        logger_csv.log({
-            "eval/accuracy": initial_eval["accuracy"],
-            "eval/correct": initial_eval.get("correct", 0),
-            "eval/total": initial_eval.get("total", 0),
-        }, step=0)
-
+    math_env = None
     try:
+        policy, value, tokenizer = initialize_models(config)
+        reference_questions = load_reference_questions(config.gsm8k_reference_data)
+
+        math_env = CurriculumMathEnvironment(
+            policy_model=policy,
+            value_model=value,
+            tokenizer=tokenizer,
+            reference_questions=reference_questions,
+            curriculum_checkpoint_dir=config.curriculum_checkpoint_dir,
+            max_question_tokens=config.max_question_tokens,
+            max_solution_tokens=config.max_solution_tokens,
+            temperature=config.temperature,
+            top_p=config.top_p,
+            consensus_temperature=config.consensus_temperature,
+            use_vllm=config.use_vllm_rollouts,
+            vllm_tensor_parallel_size=config.vllm_tensor_parallel_size,
+            vllm_batch_size=config.rollout_batch_size,
+            vllm_gpu_memory_utilization=config.vllm_gpu_memory_utilization,
+            base_model_path=config.base_model,
+            parallel_worker_timeout_seconds=config.worker_timeout_seconds,
+        )
+        training_monitor = TrainingMonitor(
+            output_dir=config.output_dir,
+            disk_warning_gb=config.disk_warning_gb,
+        )
+        checkpoint_manager = CheckpointManager(
+            output_dir=config.output_dir,
+            keep_last_n=config.checkpoint_keep_last,
+            keep_every_n=config.checkpoint_keep_every,
+            compress_old_logs=config.compress_old_logs,
+        )
+
+        ppo_trainer = PPOTrainer(
+            policy_model=policy,
+            value_model=value,
+            tokenizer=tokenizer,
+            learning_rate=config.learning_rate,
+            ppo_epochs=config.ppo_epochs,
+            batch_size=config.batch_size,
+            clip_range=config.clip_range,
+            clip_range_vf=config.clip_range_vf,
+            vf_coef=config.vf_coef,
+            ent_coef=config.ent_coef,
+            max_grad_norm=config.max_grad_norm,
+            target_kl=config.target_kl,
+        )
+
+        if args.skip_initial_eval:
+            logger.info("\n%s\nSKIPPING INITIAL EVALUATION (use --skip-initial-eval)\n%s", "=" * 80, "=" * 80)
+            initial_eval = {"accuracy": 0.0}
+            best_accuracy = 0.0
+        else:
+            logger.info("\n%s\nINITIAL EVALUATION (Iteration 0)\n%s", "=" * 80, "=" * 80)
+            initial_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
+            best_accuracy = float(initial_eval["accuracy"])
+
+            logger_csv.log({
+                "eval/accuracy": initial_eval["accuracy"],
+                "eval/correct": initial_eval.get("correct", 0),
+                "eval/total": initial_eval.get("total", 0),
+            }, step=0)
+
         for iteration in range(1, config.num_iterations + 1):
             iteration_start = time.perf_counter()
             logger.info("\n%s\nITERATION %d/%d\n%s", "=" * 80, iteration, config.num_iterations, "=" * 80)
@@ -582,27 +607,31 @@ def main():
                 csv_metrics["system/gpu_util_percent"] = avg_gpu_util
             
             logger_csv.log(csv_metrics, step=iteration)
-    finally:
-        math_env.shutdown_parallel_rollout_workers()
+        final_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
+        logger.info(
+            "Training complete. Initial acc: %.2f%% | Final acc: %.2f%% | Delta: %.2f%%",
+            initial_eval["accuracy"] * 100.0,
+            final_eval["accuracy"] * 100.0,
+            (final_eval["accuracy"] - initial_eval["accuracy"]) * 100.0,
+        )
 
-    final_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
-    logger.info(
-        "Training complete. Initial acc: %.2f%% | Final acc: %.2f%% | Delta: %.2f%%",
-        initial_eval["accuracy"] * 100.0,
-        final_eval["accuracy"] * 100.0,
-        (final_eval["accuracy"] - initial_eval["accuracy"]) * 100.0,
-    )
-    
-    # Save final summary
-    logger_csv.save_summary({
-        "initial_accuracy": initial_eval["accuracy"],
-        "final_accuracy": final_eval["accuracy"],
-        "improvement": final_eval["accuracy"] - initial_eval["accuracy"],
-        "best_accuracy": best_accuracy,
-        "total_iterations": config.num_iterations,
-    })
-    
-    logger_csv.finish()
+        # Save final summary
+        logger_csv.save_summary({
+            "initial_accuracy": initial_eval["accuracy"],
+            "final_accuracy": final_eval["accuracy"],
+            "improvement": final_eval["accuracy"] - initial_eval["accuracy"],
+            "best_accuracy": best_accuracy,
+            "total_iterations": config.num_iterations,
+            "console_output_path": str(console_log_path),
+        })
+
+        logger_csv.finish()
+    finally:
+        if math_env is not None:
+            math_env.shutdown_parallel_rollout_workers()
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        console_log_file.close()
 
 
 if __name__ == "__main__":

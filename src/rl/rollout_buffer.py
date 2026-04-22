@@ -24,7 +24,7 @@ from typing import Dict, Iterator, List, Tuple
 import numpy as np
 import torch
 
-from src.rl.mdp_components import Trajectory, Transition
+from src.rl.mdp_components import State, Trajectory, Transition
 
 logger = logging.getLogger(__name__)
 
@@ -150,10 +150,35 @@ class RolloutBuffer:
     def add_trajectory(self, trajectory: Trajectory) -> None:
         """
         Compute GAE for *trajectory* and append its transitions to the buffer.
+        
+        Clones tensors to detach from inference mode (fixes torch.compile CUDA graph issues).
         """
         advantages, returns = self._gae.compute_advantages_and_returns(trajectory)
 
-        self._transitions.extend(trajectory.transitions)
+        # Clone transitions to detach from inference mode
+        cloned_transitions = []
+        for trans in trajectory.transitions:
+            cloned_trans = Transition(
+                state=State(
+                    text=trans.state.text,
+                    input_ids=trans.state.input_ids.clone(),
+                    attention_mask=trans.state.attention_mask.clone(),
+                    phase=trans.state.phase,
+                ),
+                action=trans.action,  # No tensors in Action
+                reward=trans.reward,
+                next_state=State(
+                    text=trans.next_state.text,
+                    input_ids=trans.next_state.input_ids.clone(),
+                    attention_mask=trans.next_state.attention_mask.clone(),
+                    phase=trans.next_state.phase,
+                ),
+                value=trans.value,
+                done=trans.done,
+            )
+            cloned_transitions.append(cloned_trans)
+        
+        self._transitions.extend(cloned_transitions)
         self._advantages.extend(advantages)
         self._returns.extend(returns)
 
