@@ -17,7 +17,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts.eval_sft_inference import evaluate_gsm8k
+try:
+    from scripts.eval_sft_inference import evaluate_gsm8k
+except ModuleNotFoundError:
+    # Supports direct script execution: `python scripts/run_ppo_training_curriculum.py`
+    from eval_sft_inference import evaluate_gsm8k
 from src.rl.math_environment_curriculum import CurriculumMathEnvironment
 from src.rl.checkpoint_manager import CheckpointManager
 from src.rl.ppo_trainer import PPOTrainer
