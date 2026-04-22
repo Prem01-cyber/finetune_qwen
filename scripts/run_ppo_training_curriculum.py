@@ -139,7 +139,6 @@ def load_reference_questions(path: str) -> List[str]:
 def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = False):
     model_path = Path(config.base_model)
     is_adapter = (model_path / "adapter_config.json").exists()
-    model_device_map = None if use_deepspeed else "auto"
 
     if is_adapter:
         logger.info("Detected LoRA adapter at: %s", config.base_model)
@@ -161,16 +160,22 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
             if base_tokenizer.chat_template is not None:
                 tokenizer.chat_template = base_tokenizer.chat_template
 
+        # Always load with device_map="auto" first to avoid PEFT compatibility issues
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name,
             torch_dtype=torch.bfloat16,
-            device_map=model_device_map,
+            device_map="auto",
             trust_remote_code=True,
         )
         policy = PeftModel.from_pretrained(base_model, config.base_model)
         policy = policy.merge_and_unload()
+        
+        # For DeepSpeed, move merged model off GPU so DeepSpeed can manage placement
+        if use_deepspeed:
+            logger.info("Moving merged model to CPU for DeepSpeed initialization")
+            policy = policy.cpu()
 
-        value = ValueHead(base_model_name, model_device_map=model_device_map)
+        value = ValueHead(base_model_name, model_device_map=None if use_deepspeed else "auto")
     else:
         logger.info("Loading full model: %s", config.base_model)
         tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
@@ -179,10 +184,16 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
         policy = AutoModelForCausalLM.from_pretrained(
             config.base_model,
             torch_dtype=torch.bfloat16,
-            device_map=model_device_map,
+            device_map="auto" if not use_deepspeed else None,
             trust_remote_code=True,
         )
-        value = ValueHead(config.base_model, model_device_map=model_device_map)
+        
+        # For DeepSpeed, move model to CPU so DeepSpeed can manage placement
+        if use_deepspeed and policy.device.type != "cpu":
+            logger.info("Moving model to CPU for DeepSpeed initialization")
+            policy = policy.cpu()
+        
+        value = ValueHead(config.base_model, model_device_map=None if use_deepspeed else "auto")
 
     policy_device = getattr(policy, "device", "sharded")
     logger.info("Policy loaded on device: %s", policy_device)
