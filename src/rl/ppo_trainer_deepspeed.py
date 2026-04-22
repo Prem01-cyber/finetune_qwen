@@ -60,6 +60,12 @@ class PPOTrainerDeepSpeed:
         ds_cfg["train_batch_size"] = int(batch_size)
         ds_cfg["train_micro_batch_size_per_gpu"] = int(micro_batch)
         ds_cfg["gradient_accumulation_steps"] = 1
+        
+        # Set learning rate in optimizer config
+        if "optimizer" in ds_cfg and "params" in ds_cfg["optimizer"]:
+            ds_cfg["optimizer"]["params"]["lr"] = learning_rate
+        if "scheduler" in ds_cfg and "params" in ds_cfg["scheduler"]:
+            ds_cfg["scheduler"]["params"]["warmup_max_lr"] = learning_rate
 
         # Only wrap policy in DeepSpeed (it's 1.5B params)
         # Keep value network in standard PyTorch (it's tiny ~few MB)
