@@ -92,8 +92,9 @@ class PPOTrainerDeepSpeed:
     def _policy_logits_at_state(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        # Use the module directly, not the engine wrapper for forward pass
-        outputs = self.policy_engine.module(
+        # Must use the engine (not .module) so ZeRO-3 gathers sharded params
+        # and builds a proper computation graph for backward
+        outputs = self.policy_engine(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
