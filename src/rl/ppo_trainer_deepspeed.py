@@ -40,6 +40,7 @@ import copy
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, Iterable, List, Optional
 
 import deepspeed
@@ -281,11 +282,55 @@ class PPOTrainerDeepSpeed:
 
         self._last_checkpoint_meta: Dict[str, str] = {}
 
+        # --- Diagnostics -------------------------------------------------
+        # Parameter accounting.  Under ZeRO-3 every rank holds a shard, so
+        # ``numel()`` on a partitioned param is the *shard* size (ds_tensor);
+        # ``ds_numel`` is the unsharded global count.  We log both so you
+        # can see the memory savings ZeRO-3 actually delivered.
+        def _count_params(mod: torch.nn.Module) -> Dict[str, int]:
+            total_global = 0
+            total_local = 0
+            for p in mod.parameters():
+                g = int(getattr(p, "ds_numel", p.numel()))
+                l = int(p.numel())
+                total_global += g
+                total_local += l
+            return {"global": total_global, "local_shard": total_local}
+
+        pol = _count_params(self.policy)
+        val = _count_params(self.value)
+
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(self.device) / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved(self.device) / (1024 ** 3)
+            total = (
+                torch.cuda.get_device_properties(self.device).total_memory / (1024 ** 3)
+            )
+        else:
+            allocated = reserved = total = 0.0
+
         logger.info(
-            "[rank %d] DeepSpeed PPO trainer ready on %s",
+            "[rank %d] Policy params: %.3fB global | %.3fB on this rank (shard ratio %.1fx)",
             self._rank,
-            self.device,
+            pol["global"] / 1e9,
+            pol["local_shard"] / 1e9,
+            pol["global"] / max(1, pol["local_shard"]),
         )
+        logger.info(
+            "[rank %d] Value params:  %.3fB global | %.3fB on this rank",
+            self._rank, val["global"] / 1e9, val["local_shard"] / 1e9,
+        )
+        logger.info(
+            "[rank %d] GPU after DS init: allocated %.2fGB / reserved %.2fGB / total %.2fGB (%.1f%% used)",
+            self._rank, allocated, reserved, total,
+            (allocated / total * 100.0) if total else 0.0,
+        )
+        logger.info(
+            "[rank %d] DeepSpeed PPO trainer ready on %s (world_size=%d, micro_bs=%d)",
+            self._rank, self.device, self._world_size,
+            policy_cfg["train_micro_batch_size_per_gpu"],
+        )
+
 
     # ------------------------------------------------------------------
     # Forward helpers
@@ -347,12 +392,25 @@ class PPOTrainerDeepSpeed:
         early_stopped = False
         update_steps = 0
 
+        # Timing accumulators — reported once per train_step so you can see
+        # where the PPO update time is actually going (forward vs backward
+        # vs data transfer).
+        time_forward = 0.0
+        time_backward = 0.0
+        time_optimizer = 0.0
+        time_data = 0.0
+        grad_norms: List[float] = []
+
         # DeepSpeed expects *per-rank micro-batches* of size
         # train_batch_size // world_size.  We therefore draw mini-batches
         # from the rollout buffer at the micro-batch size and stride-shard
         # them across ranks so that each rank consumes a different slice
         # of every "global" batch — true data parallelism.
         micro_batch = max(1, self.batch_size // max(self._world_size, 1))
+
+        train_step_start = time.perf_counter()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
 
         for epoch in range(self.ppo_epochs):
             if early_stopped:
@@ -369,7 +427,8 @@ class PPOTrainerDeepSpeed:
             epoch_batches = epoch_batches[:usable]
             my_batches = select_rank_shard(epoch_batches)
 
-            for batch in my_batches:
+            for batch_idx, batch in enumerate(my_batches):
+                t0 = time.perf_counter()
                 input_ids = batch["input_ids"].to(self.device, non_blocking=True)
                 attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
                 action_token_ids = batch["action_token_ids"].to(self.device, non_blocking=True)
@@ -377,15 +436,18 @@ class PPOTrainerDeepSpeed:
                 old_values = batch["old_values"].to(self.device, non_blocking=True).detach()
                 advantages = batch["advantages"].to(self.device, non_blocking=True)
                 returns = batch["returns"].to(self.device, non_blocking=True)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
+                time_data += time.perf_counter() - t0
 
                 # ---- Policy forward -----------------------------------
+                t0 = time.perf_counter()
                 logits_last = self._policy_logits_at_state(input_ids, attention_mask)
                 log_probs = F.log_softmax(logits_last, dim=-1)
                 new_log_probs = log_probs[
                     torch.arange(logits_last.size(0), device=logits_last.device),
                     action_token_ids,
                 ]
-                # Entropy of the categorical distribution (stable form).
                 entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
 
                 ratio = torch.exp(new_log_probs - old_log_probs)
@@ -398,12 +460,14 @@ class PPOTrainerDeepSpeed:
                 clip_fraction = (
                     (torch.abs(ratio - 1.0) > self.clip_range).float().mean().detach()
                 )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
+                time_forward += time.perf_counter() - t0
 
                 # Early-stop has to be a *global* decision under DeepSpeed,
                 # otherwise rank A breaks out of the loop while rank B is
                 # still calling engine.backward() and waits forever for
-                # rank A's gradient reduction.  All ranks average their
-                # local KL and make the identical choice.
+                # rank A's gradient reduction.
                 global_kl = approx_kl.clone()
                 if self._world_size > 1 and torch.distributed.is_initialized():
                     torch.distributed.all_reduce(
@@ -413,19 +477,38 @@ class PPOTrainerDeepSpeed:
                 if global_kl.item() > 1.5 * self.target_kl:
                     if self._rank == 0:
                         logger.info(
-                            "Early stop at epoch %d: global approx_kl=%.4f",
-                            epoch,
-                            global_kl.item(),
+                            "Early stop at epoch %d batch %d: global approx_kl=%.4f > 1.5*%.4f",
+                            epoch, batch_idx, global_kl.item(), self.target_kl,
                         )
                     early_stopped = True
                     break
 
                 # ---- Policy update ------------------------------------
+                t0 = time.perf_counter()
                 policy_objective = policy_loss - self.ent_coef * entropy
                 self.policy_engine.backward(policy_objective)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
+                time_backward += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
                 self.policy_engine.step()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
+                time_optimizer += time.perf_counter() - t0
+
+                # DeepSpeed exposes the clipped gradient norm after step();
+                # logging it every few batches helps catch exploding / vanishing
+                # gradients without flooding the console.
+                try:
+                    gnorm = float(self.policy_engine.get_global_grad_norm() or 0.0)
+                    if gnorm > 0.0:
+                        grad_norms.append(gnorm)
+                except Exception:
+                    pass
 
                 # ---- Value forward + update ---------------------------
+                t0 = time.perf_counter()
                 new_values = self._value_estimates(input_ids, attention_mask).squeeze(-1)
                 vf_unclipped = (new_values - returns) ** 2
                 values_clipped = old_values + torch.clamp(
@@ -434,9 +517,16 @@ class PPOTrainerDeepSpeed:
                 vf_clipped = (values_clipped - returns) ** 2
                 value_loss = 0.5 * torch.max(vf_unclipped, vf_clipped).mean()
                 value_objective = self.vf_coef * value_loss
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
+                time_forward += time.perf_counter() - t0
 
+                t0 = time.perf_counter()
                 self.value_engine.backward(value_objective)
                 self.value_engine.step()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
+                time_backward += time.perf_counter() - t0
 
                 update_steps += 1
 
@@ -445,6 +535,15 @@ class PPOTrainerDeepSpeed:
                 stats["entropy"].append(float(entropy.detach().item()))
                 stats["approx_kl"].append(float(approx_kl.item()))
                 stats["clip_fraction"].append(float(clip_fraction.item()))
+
+                if self._rank == 0 and (batch_idx == 0 or (update_steps % 10 == 0)):
+                    logger.info(
+                        "  [epoch %d batch %d/%d] policy=%.4f value=%.4f entropy=%.4f "
+                        "kl=%.4f clip=%.3f",
+                        epoch, batch_idx + 1, len(my_batches),
+                        policy_loss.item(), value_loss.item(), entropy.item(),
+                        approx_kl.item(), clip_fraction.item(),
+                    )
 
         # Make every rank reach this point before we return.  Otherwise a
         # faster rank can start the next iteration while a slower rank is
@@ -458,11 +557,38 @@ class PPOTrainerDeepSpeed:
                 self.target_kl,
             )
 
+        total_seconds = time.perf_counter() - train_step_start
+        peak_mem_gb = (
+            torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
+            if torch.cuda.is_available() else 0.0
+        )
+        mean_grad_norm = (
+            sum(grad_norms) / len(grad_norms) if grad_norms else 0.0
+        )
+
+        if self._rank == 0:
+            logger.info(
+                "train_step summary: %d updates in %.1fs  |  "
+                "data=%.1fs fwd=%.1fs bwd=%.1fs opt=%.1fs  |  "
+                "peak_mem=%.2fGB  |  mean_grad_norm=%.3f  |  early_stop=%s",
+                update_steps, total_seconds,
+                time_data, time_forward, time_backward, time_optimizer,
+                peak_mem_gb, mean_grad_norm,
+                "yes" if early_stopped else "no",
+            )
+
         metrics = {
             key: float(sum(values) / max(len(values), 1))
             for key, values in stats.items()
         }
         metrics["update_steps"] = float(update_steps)
+        metrics["time_data_s"] = float(time_data)
+        metrics["time_forward_s"] = float(time_forward)
+        metrics["time_backward_s"] = float(time_backward)
+        metrics["time_optimizer_s"] = float(time_optimizer)
+        metrics["time_total_s"] = float(total_seconds)
+        metrics["peak_mem_gb"] = float(peak_mem_gb)
+        metrics["mean_grad_norm"] = float(mean_grad_norm)
         return metrics
 
     # ------------------------------------------------------------------

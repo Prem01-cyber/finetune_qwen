@@ -85,20 +85,36 @@ def _iter_module_parameters(modules: Sequence[torch.nn.Module]) -> List[torch.nn
 @contextlib.contextmanager
 def gather_params_for_generation(*modules: torch.nn.Module) -> Iterator[None]:
     """
-    Temporarily gather ZeRO-3-partitioned parameters so the wrapped modules
-    can be used for ``.generate()`` / normal forward passes on every rank.
+    Temporarily un-shard ZeRO-3 parameters for in-loop generation.
 
-    When ZeRO-3 is inactive (e.g. vanilla PyTorch training) this is a no-op.
+    Under ZeRO-3, ``deepspeed.initialize`` installs pre/post-forward hooks on
+    every submodule that all-gather params on entry and re-partition them on
+    exit.  That is fine for a single training forward, but it is a disaster
+    for rollouts:
+
+      * Rollouts call the model many times per trajectory (one forward per
+        generated token, plus consensus sampling).
+      * Different ranks produce different numbers of trajectories and hit
+        EOS at different token counts — the per-forward collectives from
+        each rank's hooks don't match up across ranks and the job silently
+        deadlocks.
+
+    The fix that DeepSpeed-Chat / TRL use: gather *all* trainable params
+    once, detach the per-submodule hooks for the whole generation block,
+    run rollouts hook-less, and then reinstall the hooks and re-partition
+    when the block exits.  Partitioning / gradient all-reduce is still
+    active during ``train_step`` — we only bypass it while generating.
+
+    No-op when ZeRO-3 is inactive (single-process / vanilla PyTorch).
     """
+    import collections
+
     params = _iter_module_parameters(modules)
     if not params:
         yield
         return
 
-    # Detect ZeRO-3 via DeepSpeed's parameter status attribute
-    partitioned = any(
-        getattr(p, "ds_status", None) is not None for p in params
-    )
+    partitioned = any(getattr(p, "ds_status", None) is not None for p in params)
     if not partitioned:
         yield
         return
@@ -109,8 +125,39 @@ def gather_params_for_generation(*modules: torch.nn.Module) -> Iterator[None]:
         yield
         return
 
-    with deepspeed.zero.GatheredParameters(params, modifier_rank=None, enabled=True):
-        yield
+    # Save and clear every forward hook DeepSpeed (or anyone else) registered
+    # on every submodule we're about to run.  We replace the OrderedDicts
+    # wholesale rather than mutating them, so nothing that holds a reference
+    # to the old dict is confused.
+    saved_hook_state: List[tuple] = []
+    for m in modules:
+        if m is None:
+            continue
+        for submod in m.modules():
+            saved_hook_state.append(
+                (
+                    submod,
+                    submod._forward_pre_hooks,
+                    submod._forward_hooks,
+                )
+            )
+            submod._forward_pre_hooks = collections.OrderedDict()
+            submod._forward_hooks = collections.OrderedDict()
+
+    try:
+        # Single collective: gather every param on every rank.  Stays
+        # gathered for the whole rollout because the post-forward hooks
+        # that would normally re-partition are now disabled.
+        with deepspeed.zero.GatheredParameters(
+            params, modifier_rank=None, enabled=True
+        ):
+            yield
+    finally:
+        # Restore the hooks so the next train_step's forward/backward go
+        # through ZeRO-3 properly.
+        for submod, pre_hooks, post_hooks in saved_hook_state:
+            submod._forward_pre_hooks = pre_hooks
+            submod._forward_hooks = post_hooks
 
 
 # ---------------------------------------------------------------------------

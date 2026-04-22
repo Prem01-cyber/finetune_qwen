@@ -659,17 +659,71 @@ def main():
                 "[rank %d] Generating %d/%d rollouts with gathered weights",
                 get_rank(), my_count, config.num_rollouts_per_iter,
             )
+
+            gather_start = time.perf_counter()
+            local_start = None
+            local_tokens = 0
             with gather_params_for_generation(policy, value):
-                local_trajs = math_env.collect_rollouts(
-                    num_trajectories=my_count, verbose=False
+                gather_seconds = time.perf_counter() - gather_start
+                logger.info(
+                    "[rank %d] Param gather + hook detach: %.2fs",
+                    get_rank(), gather_seconds,
                 )
+                local_start = time.perf_counter()
+                local_trajs = math_env.collect_rollouts(
+                    num_trajectories=my_count, verbose=True
+                )
+                local_tokens = sum(len(t) for t in local_trajs)
+
+            local_seconds = time.perf_counter() - local_start if local_start else 0.0
+            logger.info(
+                "[rank %d] Local rollouts done: %d trajs, %d tokens, %.1fs "
+                "(%.1f tok/s)",
+                get_rank(), len(local_trajs), local_tokens, local_seconds,
+                local_tokens / max(local_seconds, 1e-6),
+            )
 
             _move_trajectories_to_cpu(local_trajs)
+
+            # Surface cross-rank imbalance: if one rank finishes much faster
+            # than another we're wasting GPUs.  all-gather tuples of
+            # (rank, count, tokens, seconds) so rank 0 can print the spread.
+            per_rank_stats = all_gather_objects(
+                {
+                    "rank": get_rank(),
+                    "trajs": len(local_trajs),
+                    "tokens": local_tokens,
+                    "seconds": local_seconds,
+                }
+            )
 
             gathered_lists = all_gather_objects(local_trajs)
             combined: List = []
             for chunk in gathered_lists:
                 combined.extend(chunk)
+
+            if is_main_process() and len(per_rank_stats) > 1:
+                tokens = [s["tokens"] for s in per_rank_stats]
+                seconds = [s["seconds"] for s in per_rank_stats]
+                slowest = max(seconds)
+                fastest = min(seconds)
+                imbalance = (slowest - fastest) / max(slowest, 1e-6) * 100.0
+                logger.info(
+                    "Rollout per-rank stats: %s | slowest=%.1fs fastest=%.1fs "
+                    "imbalance=%.1f%% (idle GPU time)",
+                    ", ".join(
+                        f"rank{s['rank']}={s['trajs']}t/{s['tokens']}tok/{s['seconds']:.1f}s"
+                        for s in per_rank_stats
+                    ),
+                    slowest, fastest, imbalance,
+                )
+                if imbalance > 25.0:
+                    logger.warning(
+                        "Rank imbalance > 25%% — faster ranks idle while slowest "
+                        "rank finishes.  A larger rollouts-per-iter (or a "
+                        "single-GPU + vLLM rollout path) would amortise this."
+                    )
+
             logger.info(
                 "[rank %d] Gathered %d rollouts from %d ranks",
                 get_rank(), len(combined), get_world_size(),
@@ -823,14 +877,73 @@ def main():
                 gpu_metrics = training_monitor.log_gpu_utilization(
                     gpu_ids=list(range(torch.cuda.device_count()))
                 )
+                total_s = max(timing_metrics["total_seconds"], 1e-6)
+                rollout_pct = 100.0 * timing_metrics["rollout_seconds"] / total_s
+                train_pct = 100.0 * timing_metrics["train_seconds"] / total_s
+                eval_pct = 100.0 * timing_metrics["eval_seconds"] / total_s
+                save_pct = 100.0 * timing_metrics["save_seconds"] / total_s
                 logger.info(
-                    "Timing breakdown: rollout=%.1fs train=%.1fs eval=%.1fs save=%.1fs total=%.1fs",
-                    timing_metrics["rollout_seconds"],
-                    timing_metrics["train_seconds"],
-                    timing_metrics["eval_seconds"],
-                    timing_metrics["save_seconds"],
+                    "Timing breakdown: rollout=%.1fs (%.0f%%)  train=%.1fs (%.0f%%)  "
+                    "eval=%.1fs (%.0f%%)  save=%.1fs (%.0f%%)  total=%.1fs",
+                    timing_metrics["rollout_seconds"], rollout_pct,
+                    timing_metrics["train_seconds"], train_pct,
+                    timing_metrics["eval_seconds"], eval_pct,
+                    timing_metrics["save_seconds"], save_pct,
                     timing_metrics["total_seconds"],
                 )
+
+                # Decision-support: is DeepSpeed paying its way?
+                if args.use_deepspeed:
+                    world = max(get_world_size(), 1)
+                    tokens_this_iter = timing_metrics.get("num_rollouts", 0.0) * (
+                        config.max_question_tokens + config.max_solution_tokens
+                    )
+                    rollout_tok_per_s = tokens_this_iter / max(
+                        timing_metrics["rollout_seconds"], 1e-6
+                    )
+                    verdict_bits: List[str] = []
+                    if rollout_pct > 80.0:
+                        verdict_bits.append(
+                            "rollout-bound (>80%) — DeepSpeed speeds the PPO "
+                            "update but NOT generation; consider vLLM or a "
+                            "single-GPU rollout + ZeRO-2 training split"
+                        )
+                    if training_metrics.get("update_steps", 0) == 0:
+                        verdict_bits.append(
+                            "0 PPO updates — likely hitting early-stop KL; "
+                            "training is not actually learning"
+                        )
+                    if train_pct < 5.0 and rollout_pct > 90.0:
+                        verdict_bits.append(
+                            "DeepSpeed's speed-up on training is invisible here"
+                        )
+                    util_vals = [
+                        v for k, v in (gpu_metrics or {}).items()
+                        if k.endswith("_utilization")
+                    ]
+                    if util_vals and max(util_vals) - min(util_vals) > 30.0:
+                        verdict_bits.append(
+                            f"GPU util spread {max(util_vals):.0f}%/{min(util_vals):.0f}% "
+                            "— ranks imbalanced; DS scaling inefficient"
+                        )
+                    logger.info(
+                        "Deep-dive: world_size=%d, est %.0f tok/s rollout, "
+                        "PPO update peak=%s, grad_norm=%s",
+                        world, rollout_tok_per_s,
+                        training_metrics.get("peak_mem_gb", "n/a"),
+                        training_metrics.get("mean_grad_norm", "n/a"),
+                    )
+                    if verdict_bits:
+                        logger.warning(
+                            "DEEPSPEED VERDICT (iter %d): %s",
+                            iteration, "  ||  ".join(verdict_bits),
+                        )
+                    else:
+                        logger.info(
+                            "DEEPSPEED VERDICT (iter %d): healthy — training "
+                            "happening, ranks balanced, memory OK",
+                            iteration,
+                        )
 
                 all_metrics = {
                     "iteration": iteration,

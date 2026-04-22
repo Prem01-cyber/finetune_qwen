@@ -14,6 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Dict, List, Tuple, Optional
 import random
 import logging
+import time
 
 from src.rl.mdp_components import State, Action, Transition, Trajectory
 from src.rl.value_network import ValueHead
@@ -458,21 +459,38 @@ class MathEnvironment:
         Returns:
             List of complete trajectories
         """
-        trajectories = []
+        trajectories: List[Trajectory] = []
+        total_tokens = 0
+        start = time.perf_counter()
 
         for i in range(num_trajectories):
-            if verbose and (i + 1) % 10 == 0:
-                logger.info(f"Collected {i + 1}/{num_trajectories} trajectories")
-
+            traj_start = time.perf_counter()
             trajectory = self.rollout_trajectory()
+            traj_seconds = time.perf_counter() - traj_start
+            traj_tokens = len(trajectory)
+            total_tokens += traj_tokens
             trajectories.append(trajectory)
 
+            if verbose:
+                logger.info(
+                    "  Trajectory %d/%d: %d tokens in %.1fs (%.1f tok/s, reward=%.3f)",
+                    i + 1, num_trajectories, traj_tokens, traj_seconds,
+                    traj_tokens / max(traj_seconds, 1e-6), trajectory.total_reward,
+                )
+
+        if not trajectories:
+            return trajectories
+
+        elapsed = time.perf_counter() - start
         mean_reward = sum(t.total_reward for t in trajectories) / len(trajectories)
         mean_length = sum(len(t) for t in trajectories) / len(trajectories)
+        tokens_per_sec = total_tokens / max(elapsed, 1e-6)
 
         logger.info(
-            f"Rollout complete: {num_trajectories} trajectories, "
-            f"mean reward: {mean_reward:.3f}, mean length: {mean_length:.1f}"
+            "Rollout complete: %d trajectories, %d total tokens, %.1fs wall, "
+            "%.1f tok/s mean | reward=%.3f len=%.1f",
+            num_trajectories, total_tokens, elapsed,
+            tokens_per_sec, mean_reward, mean_length,
         )
 
         return trajectories
