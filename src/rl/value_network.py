@@ -63,18 +63,23 @@ class ValueHead(nn.Module):
         )
         h = hidden_size or config.hidden_size
 
+        # Always use low_cpu_mem_usage to avoid 90% GPU allocation
         load_kwargs = {
             "torch_dtype": torch.bfloat16,
-            "device_map": model_device_map,
+            "device_map": {"": "cpu"} if model_device_map == "auto" else model_device_map,
+            "low_cpu_mem_usage": True,
             "trust_remote_code": True,
         }
-        if max_memory is not None:
-            load_kwargs["max_memory"] = max_memory
         
         self.backbone = AutoModel.from_pretrained(
             base_model_path,
             **load_kwargs,
         )
+        
+        # Move to GPU if needed
+        if model_device_map == "auto":
+            logger.info("Moving ValueHead backbone to GPU")
+            self.backbone = self.backbone.to("cuda:0")
 
         if freeze_backbone:
             for param in self.backbone.parameters():

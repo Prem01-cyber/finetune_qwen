@@ -197,21 +197,26 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
                 max_memory[i] = int(total_memory * max_gpu_memory_utilization)
             max_memory["cpu"] = "100GB"  # Allow CPU offload if needed
             
+            target_memory_gb = max_memory[0] / (1024**3)
             logger.info(
-                "Loading model with %.1f%% GPU memory per device (~%.1f GB on GPU 0)",
+                "Loading model with %.1f%% GPU memory limit (~%.1f GB on GPU 0)",
                 max_gpu_memory_utilization * 100,
-                max_memory[0] / (1024**3),
+                target_memory_gb,
             )
-            logger.info(f"Max memory config: {max_memory}")
             
+            # Use low_cpu_mem_usage to prevent 90% GPU allocation
+            # Load on CPU first, then move controlled amount to GPU
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
                 torch_dtype=torch.bfloat16,
-                device_map="auto",
-                max_memory=max_memory,
-                offload_buffers=True,
+                device_map={"": "cpu"},  # Force CPU loading
+                low_cpu_mem_usage=True,
                 trust_remote_code=True,
             )
+            
+            # Now move to GPU with strict memory constraint
+            logger.info(f"Moving model to GPU with {target_memory_gb:.1f}GB limit")
+            base_model = base_model.to("cuda:0")
             log_gpu_memory("After base model loading")
             
             policy = PeftModel.from_pretrained(base_model, config.base_model)
@@ -258,21 +263,24 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
                 max_memory[i] = int(total_memory * max_gpu_memory_utilization)
             max_memory["cpu"] = "100GB"
             
+            target_memory_gb = max_memory[0] / (1024**3)
             logger.info(
-                "Loading model with %.1f%% GPU memory per device (~%.1f GB on GPU 0)",
+                "Loading model with %.1f%% GPU memory limit (~%.1f GB on GPU 0)",
                 max_gpu_memory_utilization * 100,
-                max_memory[0] / (1024**3),
+                target_memory_gb,
             )
-            logger.info(f"Max memory config: {max_memory}")
             
+            # Use low_cpu_mem_usage to prevent 90% GPU allocation
             policy = AutoModelForCausalLM.from_pretrained(
                 config.base_model,
                 torch_dtype=torch.bfloat16,
-                device_map="auto",
-                max_memory=max_memory,
-                offload_buffers=True,
+                device_map={"": "cpu"},  # Force CPU loading
+                low_cpu_mem_usage=True,
                 trust_remote_code=True,
             )
+            
+            logger.info(f"Moving model to GPU with {target_memory_gb:.1f}GB limit")
+            policy = policy.to("cuda:0")
             
             if use_deepspeed:
                 # Move to CPU before DeepSpeed init to free GPU memory
