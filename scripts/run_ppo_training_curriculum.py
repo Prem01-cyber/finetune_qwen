@@ -183,13 +183,16 @@ def initialize_models(config: CurriculumTrainingConfig):
 
     logger.info("Policy loaded on device: %s", policy.device)
     
-    if config.use_torch_compile:
+    # Disable torch.compile when using VLLM (inference tensors incompatible with CUDA graphs)
+    if config.use_torch_compile and not config.use_vllm_rollouts:
         try:
             logger.info("Compiling policy model with torch.compile (may take 2-3 min on first run)...")
             policy = torch.compile(policy, mode="reduce-overhead")
             logger.info("Policy model compiled successfully")
         except Exception as e:
             logger.warning("torch.compile failed: %s. Continuing without compilation.", e)
+    elif config.use_vllm_rollouts:
+        logger.info("Skipping torch.compile (incompatible with VLLM inference mode tensors)")
     
     return policy, value, tokenizer
 
