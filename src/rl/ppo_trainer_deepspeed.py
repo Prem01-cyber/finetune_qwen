@@ -171,9 +171,10 @@ class PPOTrainerDeepSpeed:
                 vf_loss_clipped = (values_clipped - returns) ** 2
                 value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
 
-                # Policy update (DeepSpeed)
+                # Policy update (DeepSpeed ZeRO-3 with offload)
                 policy_objective = policy_loss - self.ent_coef * entropy
-                self.policy_engine.backward(policy_objective)
+                # Use standard backward for ZeRO-3 offload (engine.backward not available)
+                policy_objective.backward()
                 self.policy_engine.step()
                 
                 # Value update (standard PyTorch)

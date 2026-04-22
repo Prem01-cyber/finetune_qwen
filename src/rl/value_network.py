@@ -52,6 +52,7 @@ class ValueHead(nn.Module):
         freeze_backbone: bool = True,
         hidden_size: Optional[int] = None,
         model_device_map: Optional[Any] = "auto",
+        max_memory: Optional[dict] = None,
     ) -> None:
         super().__init__()
 
@@ -62,11 +63,17 @@ class ValueHead(nn.Module):
         )
         h = hidden_size or config.hidden_size
 
+        load_kwargs = {
+            "torch_dtype": torch.bfloat16,
+            "device_map": model_device_map,
+            "trust_remote_code": True,
+        }
+        if max_memory is not None:
+            load_kwargs["max_memory"] = max_memory
+        
         self.backbone = AutoModel.from_pretrained(
             base_model_path,
-            torch_dtype=torch.bfloat16,
-            device_map=model_device_map,
-            trust_remote_code=True,
+            **load_kwargs,
         )
 
         if freeze_backbone:
