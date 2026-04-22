@@ -96,7 +96,11 @@ class CurriculumTrainingConfig:
     num_iterations = 10
     eval_every = 5
     save_every = 1
-    use_torch_compile = True
+    # torch.compile + HF .generate() with a growing KV cache is broken:
+    # reduce-overhead mode uses CUDA graphs that require fixed shapes, so
+    # each new-token forward either hangs in recompilation or OOMs trying
+    # to stash graphs.  Leave off unless you know what you're doing.
+    use_torch_compile = False
 
     output_dir = "checkpoints/ppo_training_curriculum"
     curriculum_checkpoint_dir = "checkpoints/ppo_training_curriculum/curriculum"
@@ -228,8 +232,14 @@ def initialize_models(config: CurriculumTrainingConfig):
 
     if config.use_torch_compile:
         try:
-            logger.info("Compiling policy with torch.compile (may take 2-3 min)")
-            policy = torch.compile(policy, mode="reduce-overhead")
+            logger.info(
+                "Compiling policy with torch.compile(mode='default')"
+                " — first forward may stall several minutes"
+            )
+            # NB: avoid mode='reduce-overhead' (CUDA graphs) here — HF
+            # .generate()'s growing KV cache changes shapes every step and
+            # triggers endless recompilation or an outright hang.
+            policy = torch.compile(policy, mode="default")
         except Exception as exc:  # pragma: no cover - best effort
             logger.warning("torch.compile failed: %s. Continuing without.", exc)
 
@@ -397,7 +407,12 @@ def main():
     parser.add_argument("--checkpoint-keep-last", type=int, default=2)
     parser.add_argument("--checkpoint-keep-every", type=int, default=100)
     parser.add_argument("--no-compress-old-logs", action="store_true")
-    parser.add_argument("--no-torch-compile", action="store_true")
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Opt-in to torch.compile on the policy (slow warm-up, often "
+        "broken with HF .generate(); off by default).",
+    )
     parser.add_argument(
         "--run-name", type=str, default=None, help="Optional run name for logging"
     )
@@ -416,8 +431,8 @@ def main():
     config.checkpoint_keep_last = max(1, int(args.checkpoint_keep_last))
     config.checkpoint_keep_every = max(1, int(args.checkpoint_keep_every))
     config.compress_old_logs = not args.no_compress_old_logs
-    if args.no_torch_compile:
-        config.use_torch_compile = False
+    if args.torch_compile:
+        config.use_torch_compile = True
 
     base_seed = 1234
     random.seed(base_seed)
