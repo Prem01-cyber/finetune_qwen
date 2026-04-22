@@ -63,7 +63,13 @@ class PPOTrainerDeepSpeed:
 
         # Only wrap policy in DeepSpeed (it's 1.5B params)
         # Keep value network in standard PyTorch (it's tiny ~few MB)
+        
+        # Ensure all policy parameters require gradients
+        for param in policy_model.parameters():
+            param.requires_grad = True
+        
         policy_params = [p for p in policy_model.parameters() if p.requires_grad]
+        logger.info(f"Policy model has {len(policy_params)} trainable parameters")
         
         logger.info("Initializing policy DeepSpeed engine (ZeRO-3)")
         self.policy_engine, self.policy_optimizer, _, _ = deepspeed.initialize(
@@ -176,9 +182,13 @@ class PPOTrainerDeepSpeed:
                 # Policy update (DeepSpeed ZeRO-3 with offload)
                 policy_objective = policy_loss - self.ent_coef * entropy
                 
-                # DeepSpeed engine handles gradient zeroing automatically
-                # Just do backward on the loss, then step the engine
-                policy_objective.backward()
+                # For ZeRO-3, use engine.backward() which handles param gathering
+                # If backward method doesn't exist, fall back to standard backward
+                if hasattr(self.policy_engine, 'backward'):
+                    self.policy_engine.backward(policy_objective)
+                else:
+                    policy_objective.backward()
+                
                 self.policy_engine.step()
                 
                 # Value update (standard PyTorch)
