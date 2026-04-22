@@ -106,6 +106,35 @@ def _make_value_ds_config(policy_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return value_cfg
 
 
+def _migrate_buffers_to_device(module: torch.nn.Module, device: torch.device) -> int:
+    """
+    Move all registered buffers on ``module`` (and every submodule) to
+    ``device``.
+
+    ZeRO-3 partitions *parameters* across ranks, but leaves registered buffers
+    (e.g. Qwen2's rotary ``inv_freq``, HF causal masks, RoPE scaling tables)
+    on whatever device they landed on during the pre-init CPU load.  On rank 1
+    that buffer then silently stays on ``cuda:0`` (or ``cpu``) while our inputs
+    are on ``cuda:1``, which blows up the first forward with::
+
+        RuntimeError: Expected all tensors to be on the same device,
+        but found at least two devices, cuda:0 and cuda:1
+
+    We walk ``_buffers`` directly (rather than ``.to(device)`` on the whole
+    module) so we don't accidentally touch ZeRO-3-partitioned parameters.
+    Returns the number of buffers that were relocated.
+    """
+    moved = 0
+    for submodule in module.modules():
+        for name, buf in list(submodule._buffers.items()):
+            if buf is None:
+                continue
+            if buf.device != device:
+                submodule._buffers[name] = buf.to(device)
+                moved += 1
+    return moved
+
+
 class PPOTrainerDeepSpeed:
     """PPO trainer that shards policy/value training with DeepSpeed ZeRO-3."""
 
@@ -153,6 +182,14 @@ class PPOTrainerDeepSpeed:
         self._world_size = world_size
         self._rank = get_rank()
 
+        # Pin *this* rank to its local GPU before deepspeed.initialize so
+        # that any tensors the engine materialises land on the correct
+        # device.  We also reuse this device to fix up non-partitioned
+        # buffers below.
+        if torch.cuda.is_available():
+            torch.cuda.set_device(get_local_rank())
+        self.device = current_cuda_device()
+
         # ------------------------------------------------------------------
         # Policy engine: every parameter is trainable (we merged the adapter
         # earlier).  ZeRO-3 shards params, grads and optimizer state.
@@ -171,6 +208,15 @@ class PPOTrainerDeepSpeed:
             model_parameters=[p for p in policy_model.parameters() if p.requires_grad],
             config=policy_cfg,
         )
+        # ZeRO-3 only partitions *parameters* across ranks; registered
+        # buffers stay where they were before initialise().  Without this
+        # relocation, Qwen2's rotary ``inv_freq`` (registered with
+        # persistent=False) collides with cuda:1 inputs on rank 1.
+        moved = _migrate_buffers_to_device(self.policy_engine.module, self.device)
+        if moved:
+            logger.info(
+                "[rank %d] Moved %d policy buffers to %s", self._rank, moved, self.device
+            )
 
         # ------------------------------------------------------------------
         # Value engine: backbone frozen, only MLP head trains.  Pass the head
@@ -195,17 +241,17 @@ class PPOTrainerDeepSpeed:
             model_parameters=trainable_value_params,
             config=value_cfg,
         )
+        moved = _migrate_buffers_to_device(self.value_engine.module, self.device)
+        if moved:
+            logger.info(
+                "[rank %d] Moved %d value buffers to %s", self._rank, moved, self.device
+            )
 
         # Expose .policy / .value so the rest of the codebase that reaches
         # inside the trainer can still find the raw nn.Module.
         self.policy: torch.nn.Module = self.policy_engine.module
         self.value: ValueHead = self.value_engine.module  # type: ignore[assignment]
 
-        # Canonical training device for this rank (not the possibly-offloaded
-        # parameter device).
-        if torch.cuda.is_available():
-            torch.cuda.set_device(get_local_rank())
-        self.device = current_cuda_device()
         self._last_checkpoint_meta: Dict[str, str] = {}
 
         logger.info(
