@@ -16,7 +16,7 @@ Design notes
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -51,6 +51,7 @@ class ValueHead(nn.Module):
         base_model_path: str,
         freeze_backbone: bool = True,
         hidden_size: Optional[int] = None,
+        model_device_map: Optional[Any] = "auto",
     ) -> None:
         super().__init__()
 
@@ -64,7 +65,7 @@ class ValueHead(nn.Module):
         self.backbone = AutoModel.from_pretrained(
             base_model_path,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map=model_device_map,
             trust_remote_code=True,
         )
 

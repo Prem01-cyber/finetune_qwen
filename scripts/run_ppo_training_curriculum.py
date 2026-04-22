@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+import deepspeed
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.eval_sft_inference import evaluate_gsm8k
 from src.rl.math_environment_curriculum import CurriculumMathEnvironment
 from src.rl.checkpoint_manager import CheckpointManager
+from src.rl.ppo_trainer_deepspeed import PPOTrainerDeepSpeed
 from src.rl.ppo_trainer import PPOTrainer
 from src.rl.rollout_buffer import RolloutBuffer
 from src.rl.training_monitor import TrainingMonitor
@@ -134,9 +136,10 @@ def load_reference_questions(path: str) -> List[str]:
     return questions
 
 
-def initialize_models(config: CurriculumTrainingConfig):
+def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = False):
     model_path = Path(config.base_model)
     is_adapter = (model_path / "adapter_config.json").exists()
+    model_device_map = None if use_deepspeed else "auto"
 
     if is_adapter:
         logger.info("Detected LoRA adapter at: %s", config.base_model)
@@ -161,13 +164,13 @@ def initialize_models(config: CurriculumTrainingConfig):
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map=model_device_map,
             trust_remote_code=True,
         )
         policy = PeftModel.from_pretrained(base_model, config.base_model)
         policy = policy.merge_and_unload()
 
-        value = ValueHead(base_model_name).to(policy.device)
+        value = ValueHead(base_model_name, model_device_map=model_device_map)
     else:
         logger.info("Loading full model: %s", config.base_model)
         tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
@@ -176,15 +179,18 @@ def initialize_models(config: CurriculumTrainingConfig):
         policy = AutoModelForCausalLM.from_pretrained(
             config.base_model,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map=model_device_map,
             trust_remote_code=True,
         )
-        value = ValueHead(config.base_model).to(policy.device)
+        value = ValueHead(config.base_model, model_device_map=model_device_map)
 
-    logger.info("Policy loaded on device: %s", policy.device)
+    policy_device = getattr(policy, "device", "sharded")
+    logger.info("Policy loaded on device: %s", policy_device)
     
     # Disable torch.compile when using VLLM (inference tensors incompatible with CUDA graphs)
-    if config.use_torch_compile and not config.use_vllm_rollouts:
+    if use_deepspeed:
+        logger.info("Skipping torch.compile when DeepSpeed training is enabled")
+    elif config.use_torch_compile and not config.use_vllm_rollouts:
         try:
             logger.info("Compiling policy model with torch.compile (may take 2-3 min on first run)...")
             policy = torch.compile(policy, mode="reduce-overhead")
@@ -347,7 +353,20 @@ def main():
     parser.add_argument("--checkpoint-keep-every", type=int, default=100)
     parser.add_argument("--no-compress-old-logs", action="store_true")
     parser.add_argument("--run-name", type=str, default=None, help="Optional run name for logging")
+    parser.add_argument("--use-deepspeed", action="store_true", help="Enable DeepSpeed ZeRO-3 training")
+    parser.add_argument(
+        "--deepspeed-config",
+        type=str,
+        default="configs/deepspeed_zero3_rl.json",
+        help="Path to DeepSpeed config JSON",
+    )
+    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank used by DeepSpeed launcher")
     args = parser.parse_args()
+
+    if args.use_deepspeed and args.local_rank >= 0:
+        torch.cuda.set_device(args.local_rank)
+    if args.use_deepspeed and not torch.distributed.is_initialized():
+        deepspeed.init_distributed()
 
     config = CurriculumTrainingConfig()
     config.base_model = args.base_model
@@ -388,7 +407,7 @@ def main():
 
     math_env = None
     try:
-        policy, value, tokenizer = initialize_models(config)
+        policy, value, tokenizer = initialize_models(config, use_deepspeed=args.use_deepspeed)
         reference_questions = load_reference_questions(config.gsm8k_reference_data)
 
         math_env = CurriculumMathEnvironment(
@@ -420,20 +439,43 @@ def main():
             compress_old_logs=config.compress_old_logs,
         )
 
-        ppo_trainer = PPOTrainer(
-            policy_model=policy,
-            value_model=value,
-            tokenizer=tokenizer,
-            learning_rate=config.learning_rate,
-            ppo_epochs=config.ppo_epochs,
-            batch_size=config.batch_size,
-            clip_range=config.clip_range,
-            clip_range_vf=config.clip_range_vf,
-            vf_coef=config.vf_coef,
-            ent_coef=config.ent_coef,
-            max_grad_norm=config.max_grad_norm,
-            target_kl=config.target_kl,
-        )
+        if args.use_deepspeed:
+            logger.info("Using DeepSpeed ZeRO-3 PPO trainer")
+            ppo_trainer = PPOTrainerDeepSpeed(
+                policy_model=policy,
+                value_model=value,
+                tokenizer=tokenizer,
+                learning_rate=config.learning_rate,
+                ppo_epochs=config.ppo_epochs,
+                batch_size=config.batch_size,
+                clip_range=config.clip_range,
+                clip_range_vf=config.clip_range_vf,
+                vf_coef=config.vf_coef,
+                ent_coef=config.ent_coef,
+                max_grad_norm=config.max_grad_norm,
+                target_kl=config.target_kl,
+                ds_config=args.deepspeed_config,
+            )
+            policy = ppo_trainer.policy
+            value = ppo_trainer.value
+            math_env.policy = policy
+            math_env.value = value
+        else:
+            logger.info("Using standard PPO trainer")
+            ppo_trainer = PPOTrainer(
+                policy_model=policy,
+                value_model=value,
+                tokenizer=tokenizer,
+                learning_rate=config.learning_rate,
+                ppo_epochs=config.ppo_epochs,
+                batch_size=config.batch_size,
+                clip_range=config.clip_range,
+                clip_range_vf=config.clip_range_vf,
+                vf_coef=config.vf_coef,
+                ent_coef=config.ent_coef,
+                max_grad_norm=config.max_grad_norm,
+                target_kl=config.target_kl,
+            )
 
         if args.skip_initial_eval:
             logger.info("\n%s\nSKIPPING INITIAL EVALUATION (use --skip-initial-eval)\n%s", "=" * 80, "=" * 80)
