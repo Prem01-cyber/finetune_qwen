@@ -122,9 +122,16 @@ def initialize_models(config: CurriculumTrainingConfig):
         else:
             base_model_name = "Qwen/Qwen2.5-Math-1.5B-Instruct"
 
-        tokenizer = AutoTokenizer.from_pretrained(config.base_model)
+        tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        
+        # Ensure chat template is set - load from base model if needed
+        if tokenizer.chat_template is None:
+            logger.info("Chat template not found in adapter, loading from base model")
+            base_tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+            if base_tokenizer.chat_template is not None:
+                tokenizer.chat_template = base_tokenizer.chat_template
 
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name,
@@ -138,13 +145,14 @@ def initialize_models(config: CurriculumTrainingConfig):
         value = ValueHead(base_model_name).to(policy.device)
     else:
         logger.info("Loading full model: %s", config.base_model)
-        tokenizer = AutoTokenizer.from_pretrained(config.base_model)
+        tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         policy = AutoModelForCausalLM.from_pretrained(
             config.base_model,
             torch_dtype=torch.bfloat16,
             device_map="auto",
+            trust_remote_code=True,
         )
         value = ValueHead(config.base_model).to(policy.device)
 

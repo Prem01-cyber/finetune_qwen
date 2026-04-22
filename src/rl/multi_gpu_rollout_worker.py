@@ -50,9 +50,15 @@ def _load_policy_and_value(base_model_path: str) -> tuple[Any, ValueHead, Any]:
         else:
             base_model_name = "Qwen/Qwen2.5-Math-1.5B-Instruct"
 
-        tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+        tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        
+        # Ensure chat template is set - load from base model if needed
+        if tokenizer.chat_template is None:
+            base_tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+            if base_tokenizer.chat_template is not None:
+                tokenizer.chat_template = base_tokenizer.chat_template
 
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name,
@@ -63,7 +69,7 @@ def _load_policy_and_value(base_model_path: str) -> tuple[Any, ValueHead, Any]:
         policy = PeftModel.from_pretrained(base_model, base_model_path).merge_and_unload()
         value = ValueHead(base_model_name).to(policy.device)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+        tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         policy = AutoModelForCausalLM.from_pretrained(
