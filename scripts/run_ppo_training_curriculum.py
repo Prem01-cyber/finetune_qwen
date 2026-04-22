@@ -204,10 +204,6 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
             )
             logger.info(f"Max memory config: {max_memory}")
             
-            # Disable accelerate's automatic memory calculation
-            import os
-            os.environ["ACCELERATE_USE_MPS"] = "0"
-            
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
                 torch_dtype=torch.bfloat16,
