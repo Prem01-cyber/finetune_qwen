@@ -92,7 +92,8 @@ class PPOTrainerDeepSpeed:
     def _policy_logits_at_state(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        outputs = self.policy_engine(
+        # Use the module directly, not the engine wrapper for forward pass
+        outputs = self.policy_engine.module(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
@@ -173,9 +174,11 @@ class PPOTrainerDeepSpeed:
 
                 # Policy update (DeepSpeed ZeRO-3 with offload)
                 policy_objective = policy_loss - self.ent_coef * entropy
-                # Use standard backward for ZeRO-3 offload (engine.backward not available)
+                
+                # For ZeRO-3, manually zero gradients, then backward, then step
+                self.policy_engine.optimizer.zero_grad()
                 policy_objective.backward()
-                self.policy_engine.step()
+                self.policy_engine.optimizer.step()
                 
                 # Value update (standard PyTorch)
                 self.value_optimizer.zero_grad()
