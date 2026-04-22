@@ -166,17 +166,18 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
 
         if is_main_process or not use_deepspeed:
             # Load and merge adapter (only on rank 0 for DeepSpeed)
+            # Always use device_map="auto" to avoid PEFT tensor parallel bug
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
                 torch_dtype=torch.bfloat16,
-                device_map="auto" if not use_deepspeed else None,
+                device_map="auto",
                 trust_remote_code=True,
             )
             policy = PeftModel.from_pretrained(base_model, config.base_model)
             policy = policy.merge_and_unload()
             
-            # For DeepSpeed, keep on CPU so DeepSpeed can manage placement
-            if use_deepspeed and policy.device.type != "cpu":
+            # For DeepSpeed, move merged model to CPU so DeepSpeed can manage placement
+            if use_deepspeed:
                 logger.info("Moving merged model to CPU for DeepSpeed initialization")
                 policy = policy.cpu()
         else:
@@ -197,12 +198,12 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
             policy = AutoModelForCausalLM.from_pretrained(
                 config.base_model,
                 torch_dtype=torch.bfloat16,
-                device_map="auto" if not use_deepspeed else None,
+                device_map="auto",
                 trust_remote_code=True,
             )
             
             # For DeepSpeed, move model to CPU so DeepSpeed can manage placement
-            if use_deepspeed and policy.device.type != "cpu":
+            if use_deepspeed:
                 logger.info("Moving model to CPU for DeepSpeed initialization")
                 policy = policy.cpu()
         else:
