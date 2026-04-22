@@ -183,6 +183,25 @@ def _ensure_peft_tensor_parallel_shim() -> None:
         )
 
 
+def _strip_accelerate_hooks(module: torch.nn.Module) -> None:
+    """
+    Remove any ``accelerate`` pre/post-forward hooks the loader may have
+    installed (e.g. via ``device_map=`` or as a side-effect of PEFT's
+    ``merge_and_unload``).
+
+    Under DeepSpeed these hooks are actively harmful: every forward call they
+    yank tensors back to the device accelerate thinks they belong on, which
+    then collides with ZeRO-3's parameter gathering and with inputs placed on
+    this rank's ``cuda:<local_rank>``.  Running pure DeepSpeed means DeepSpeed
+    alone decides where things live; accelerate has no business intervening.
+    """
+    try:
+        from accelerate.hooks import remove_hook_from_module
+    except Exception:
+        return
+    remove_hook_from_module(module, recurse=True)
+
+
 def initialize_models(
     config: CurriculumTrainingConfig,
     use_deepspeed: bool = False,
@@ -224,23 +243,37 @@ def initialize_models(
     _ensure_peft_tensor_parallel_shim()
 
     # --- Policy --------------------------------------------------------
+    # CRITICAL: when ``use_deepspeed`` is set we must NOT pass
+    # ``device_map`` — that installs accelerate's pre/post-forward hooks
+    # which then fight ZeRO-3 parameter gathering every forward call (the
+    # hooks try to relocate params to the accelerate-assigned device while
+    # inputs are on ``cuda:<local_rank>`` and ZeRO-3 gathers params to that
+    # same device).  ``low_cpu_mem_usage=True`` alone is enough to keep the
+    # load out of GPU memory until DeepSpeed initialises.
+    policy_load_kwargs = {
+        "torch_dtype": torch.bfloat16,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
+    }
+    if not use_deepspeed:
+        policy_load_kwargs["device_map"] = {"": "cpu"}
+
     if is_adapter:
         base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_name,
-            torch_dtype=torch.bfloat16,
-            device_map={"": "cpu"},
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
+            base_model_name, **policy_load_kwargs
         )
-        policy = PeftModel.from_pretrained(base_model, config.base_model).merge_and_unload()
+        policy = PeftModel.from_pretrained(
+            base_model, config.base_model
+        ).merge_and_unload()
     else:
         policy = AutoModelForCausalLM.from_pretrained(
-            config.base_model,
-            torch_dtype=torch.bfloat16,
-            device_map={"": "cpu"},
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
+            config.base_model, **policy_load_kwargs
         )
+
+    # Belt-and-braces: strip any accelerate hooks that PEFT's
+    # ``merge_and_unload`` or the loader may have installed.
+    if use_deepspeed:
+        _strip_accelerate_hooks(policy)
 
     if not use_deepspeed:
         policy = policy.to("cuda:0")
@@ -249,8 +282,12 @@ def initialize_models(
         log_gpu_memory("After policy loaded on CPU (pre-DeepSpeed)")
 
     # --- Value network -------------------------------------------------
-    value = ValueHead(base_model_name, model_device_map={"": "cpu"})
-    if not use_deepspeed:
+    # Same device_map story for the critic backbone.
+    if use_deepspeed:
+        value = ValueHead(base_model_name, model_device_map=None)
+        _strip_accelerate_hooks(value)
+    else:
+        value = ValueHead(base_model_name, model_device_map={"": "cpu"})
         value.backbone = value.backbone.to("cuda:0")
         value.value_head = value.value_head.to("cuda:0")
     log_gpu_memory("After ValueHead loaded")

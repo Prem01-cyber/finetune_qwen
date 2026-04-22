@@ -106,6 +106,27 @@ def _make_value_ds_config(policy_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return value_cfg
 
 
+def _strip_accelerate_hooks(module: torch.nn.Module) -> None:
+    """
+    Remove ``accelerate``'s pre/post-forward hooks if present.
+
+    HuggingFace's ``from_pretrained`` installs these when ``device_map`` is
+    used.  They actively fight DeepSpeed ZeRO-3: every forward call they try
+    to migrate tensors to the accelerate-tracked device, which collides with
+    ZeRO-3's gathered-parameter placement and causes::
+
+        RuntimeError: Expected all tensors to be on the same device,
+        but found at least two devices, cuda:0 and cuda:1
+
+    Silent no-op when accelerate isn't installed or no hooks are attached.
+    """
+    try:
+        from accelerate.hooks import remove_hook_from_module
+    except Exception:
+        return
+    remove_hook_from_module(module, recurse=True)
+
+
 def _migrate_buffers_to_device(module: torch.nn.Module, device: torch.device) -> int:
     """
     Move all registered buffers on ``module`` (and every submodule) to
@@ -189,6 +210,12 @@ class PPOTrainerDeepSpeed:
         if torch.cuda.is_available():
             torch.cuda.set_device(get_local_rank())
         self.device = current_cuda_device()
+
+        # Strip any leftover accelerate hooks before handing the model to
+        # DeepSpeed; they would otherwise break every forward by trying to
+        # migrate ZeRO-3-partitioned params to accelerate's chosen device.
+        _strip_accelerate_hooks(policy_model)
+        _strip_accelerate_hooks(value_model)
 
         # ------------------------------------------------------------------
         # Policy engine: every parameter is trainable (we merged the adapter
