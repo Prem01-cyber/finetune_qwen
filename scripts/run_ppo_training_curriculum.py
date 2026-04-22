@@ -5,6 +5,7 @@ PPO training with curriculum-guided dual-task rewards.
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -139,6 +140,9 @@ def load_reference_questions(path: str) -> List[str]:
 def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = False):
     model_path = Path(config.base_model)
     is_adapter = (model_path / "adapter_config.json").exists()
+    
+    # For DeepSpeed, only rank 0 loads the model to avoid PEFT distributed issues
+    is_main_process = not use_deepspeed or int(os.environ.get("LOCAL_RANK", "0")) == 0
 
     if is_adapter:
         logger.info("Detected LoRA adapter at: %s", config.base_model)
@@ -160,20 +164,27 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
             if base_tokenizer.chat_template is not None:
                 tokenizer.chat_template = base_tokenizer.chat_template
 
-        # Always load with device_map="auto" first to avoid PEFT compatibility issues
-        base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        policy = PeftModel.from_pretrained(base_model, config.base_model)
-        policy = policy.merge_and_unload()
-        
-        # For DeepSpeed, move merged model off GPU so DeepSpeed can manage placement
-        if use_deepspeed:
-            logger.info("Moving merged model to CPU for DeepSpeed initialization")
-            policy = policy.cpu()
+        if is_main_process or not use_deepspeed:
+            # Load and merge adapter (only on rank 0 for DeepSpeed)
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto" if not use_deepspeed else None,
+                trust_remote_code=True,
+            )
+            policy = PeftModel.from_pretrained(base_model, config.base_model)
+            policy = policy.merge_and_unload()
+            
+            # For DeepSpeed, keep on CPU so DeepSpeed can manage placement
+            if use_deepspeed and policy.device.type != "cpu":
+                logger.info("Moving merged model to CPU for DeepSpeed initialization")
+                policy = policy.cpu()
+        else:
+            # Non-main ranks: load base architecture without weights (DeepSpeed will sync)
+            logger.info("Rank %s: Loading model architecture only", os.environ.get("LOCAL_RANK"))
+            from transformers import AutoConfig
+            config_obj = AutoConfig.from_pretrained(base_model_name, trust_remote_code=True)
+            policy = AutoModelForCausalLM.from_config(config_obj, torch_dtype=torch.bfloat16)
 
         value = ValueHead(base_model_name, model_device_map=None if use_deepspeed else "auto")
     else:
@@ -181,17 +192,25 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
         tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        policy = AutoModelForCausalLM.from_pretrained(
-            config.base_model,
-            torch_dtype=torch.bfloat16,
-            device_map="auto" if not use_deepspeed else None,
-            trust_remote_code=True,
-        )
         
-        # For DeepSpeed, move model to CPU so DeepSpeed can manage placement
-        if use_deepspeed and policy.device.type != "cpu":
-            logger.info("Moving model to CPU for DeepSpeed initialization")
-            policy = policy.cpu()
+        if is_main_process or not use_deepspeed:
+            policy = AutoModelForCausalLM.from_pretrained(
+                config.base_model,
+                torch_dtype=torch.bfloat16,
+                device_map="auto" if not use_deepspeed else None,
+                trust_remote_code=True,
+            )
+            
+            # For DeepSpeed, move model to CPU so DeepSpeed can manage placement
+            if use_deepspeed and policy.device.type != "cpu":
+                logger.info("Moving model to CPU for DeepSpeed initialization")
+                policy = policy.cpu()
+        else:
+            # Non-main ranks: load architecture only
+            logger.info("Rank %s: Loading model architecture only", os.environ.get("LOCAL_RANK"))
+            from transformers import AutoConfig
+            config_obj = AutoConfig.from_pretrained(config.base_model, trust_remote_code=True)
+            policy = AutoModelForCausalLM.from_config(config_obj, torch_dtype=torch.bfloat16)
         
         value = ValueHead(config.base_model, model_device_map=None if use_deepspeed else "auto")
 
