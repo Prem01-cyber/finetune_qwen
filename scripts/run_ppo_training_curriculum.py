@@ -33,15 +33,15 @@ logger = logging.getLogger(__name__)
 
 class CurriculumTrainingConfig:
     base_model = "checkpoints/dual_task_v1"
-    learning_rate = 5e-6
-    ppo_epochs = 2
+    learning_rate = 1e-6  # Reduced from 5e-6 for more conservative updates on specialized model
+    ppo_epochs = 3  # Increased from 2 to allow more gradient steps per batch
     batch_size = 32
-    clip_range = 0.2
-    clip_range_vf = 0.2
+    clip_range = 0.3  # Increased from 0.25 to allow larger policy updates
+    clip_range_vf = 0.25  # Increased proportionally with clip_range
     vf_coef = 0.5
-    ent_coef = 0.01
-    max_grad_norm = 1.0
-    target_kl = 0.03
+    ent_coef = 0.02  # Doubled from 0.01 to encourage more exploration
+    max_grad_norm = 0.5  # Reduced from 1.0 to prevent large gradient updates
+    target_kl = 0.15  # Increased from 0.08 to allow more policy divergence for specialized models
 
     gamma = 1.0
     gae_lambda = 0.95
