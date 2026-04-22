@@ -1,0 +1,20 @@
+# Runtime-only deps for the OpenEnv server (HF Space or local Docker).
+#
+# This is intentionally a *subset* of the training requirements.txt -
+# we only need inference + the reward verifier, not DeepSpeed/vLLM/etc.
+# Versions are pinned to what the training env has been tested against
+# so we never hit silent behaviour changes between training and
+# deployment (rubric rule #16 warns about exactly this class of drift).
+
+accelerate==1.2.1
+fastapi==0.136.0
+numpy==1.26.4
+peft==0.19.1
+pydantic==2.13.3
+pydantic-core==2.46.3
+requests==2.33.1
+sympy==1.13.1
+torch==2.5.1
+tqdm==4.67.3
+transformers==4.46.3
+uvicorn==0.45.0
