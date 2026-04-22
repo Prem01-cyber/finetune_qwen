@@ -651,6 +651,13 @@ def main():
                     verbose=True,
                 )
             rollout_seconds = time.perf_counter() - rollout_start
+            
+            # CRITICAL: Shutdown rollout workers to free GPU memory before training
+            if config.use_multi_gpu_rollouts:
+                logger.info("Shutting down rollout workers to free GPU memory before training")
+                math_env.shutdown_parallel_rollout_workers()
+                torch.cuda.empty_cache()
+                log_gpu_memory("After shutting down rollout workers")
 
             pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
             rollout_buffer = RolloutBuffer(
@@ -670,6 +677,11 @@ def main():
             train_start = time.perf_counter()
             training_metrics = ppo_trainer.train_step(rollout_buffer)
             train_seconds = time.perf_counter() - train_start
+            
+            # Restart rollout workers for next iteration if needed
+            if config.use_multi_gpu_rollouts and iteration < config.num_iterations:
+                logger.info("Will restart rollout workers on next iteration")
+            
             logger.info(
                 "PPO update metrics: policy_loss=%.4f value_loss=%.4f entropy=%.4f "
                 "approx_kl=%.4f clip_fraction=%.4f update_steps=%d",
