@@ -113,6 +113,11 @@ class CurriculumTrainingConfig:
 
     num_iterations = 10
     eval_every = 5
+    # GSM8K eval at 1.5B runs at ~1 problem/s greedy, so 500 samples ≈ 8-10 min.
+    # Override from CLI with --eval-max-samples / --eval-max-new-tokens if you
+    # want cheaper (but noisier) signal between updates.
+    eval_max_samples = 500
+    eval_max_new_tokens = 512
     save_every = 1
     # torch.compile + HF .generate() with a growing KV cache is broken:
     # reduce-overhead mode uses CUDA graphs that require fixed shapes, so
@@ -264,13 +269,24 @@ def initialize_models(config: CurriculumTrainingConfig):
     return policy, value, tokenizer, device
 
 
-def evaluate_policy(policy, tokenizer, eval_data_path: str) -> Dict[str, float]:
-    logger.info("Evaluating policy on GSM8K test set...")
+def evaluate_policy(
+    policy,
+    tokenizer,
+    eval_data_path: str,
+    max_samples: int = 500,
+    max_new_tokens: int = 512,
+) -> Dict[str, float]:
+    logger.info(
+        "Evaluating policy on GSM8K (max_samples=%d, max_new_tokens=%d)",
+        max_samples,
+        max_new_tokens,
+    )
     results = evaluate_gsm8k(
         model=policy,
         tokenizer=tokenizer,
         data_path=eval_data_path,
-        max_samples=500,
+        max_samples=max_samples,
+        max_new_tokens=max_new_tokens,
     )
     logger.info(
         "GSM8K Accuracy: %.2f%% (%d/%d)",
@@ -421,6 +437,27 @@ def main():
         "--gsm8k-reference-data", type=str, default="data/sft/gsm8k_sft.jsonl"
     )
     parser.add_argument("--skip-initial-eval", action="store_true")
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=5,
+        help="Run GSM8K eval every N iterations (default: 5).  Raise to 10 for "
+        "a long run where eval wall-time dominates.",
+    )
+    parser.add_argument(
+        "--eval-max-samples",
+        type=int,
+        default=500,
+        help="GSM8K problems per eval (default: 500, ≈8-10 min on 1.5B).  "
+        "Drop to 250 for ~2x faster eval with noisier signal.",
+    )
+    parser.add_argument(
+        "--eval-max-new-tokens",
+        type=int,
+        default=512,
+        help="Max generated tokens per GSM8K answer (default: 512).  Drop to "
+        "384 for ~20%% cheaper eval; GSM8K rarely needs more.",
+    )
     parser.add_argument("--disk-warning-gb", type=float, default=5.0)
     parser.add_argument("--checkpoint-keep-last", type=int, default=2)
     parser.add_argument("--checkpoint-keep-every", type=int, default=100)
@@ -449,6 +486,9 @@ def main():
     config.checkpoint_keep_last = max(1, int(args.checkpoint_keep_last))
     config.checkpoint_keep_every = max(1, int(args.checkpoint_keep_every))
     config.compress_old_logs = not args.no_compress_old_logs
+    config.eval_every = max(1, int(args.eval_every))
+    config.eval_max_samples = max(1, int(args.eval_max_samples))
+    config.eval_max_new_tokens = max(32, int(args.eval_max_new_tokens))
     if args.torch_compile:
         config.use_torch_compile = True
 
@@ -527,7 +567,13 @@ def main():
             logger.info(
                 "\n%s\nINITIAL EVALUATION (Iteration 0)\n%s", "=" * 80, "=" * 80
             )
-            initial_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
+            initial_eval = evaluate_policy(
+                policy,
+                tokenizer,
+                config.eval_data_path,
+                max_samples=config.eval_max_samples,
+                max_new_tokens=config.eval_max_new_tokens,
+            )
             best_accuracy = float(initial_eval.get("accuracy", 0.0))
             logger_csv.log(
                 {
@@ -593,7 +639,11 @@ def main():
             eval_start = time.perf_counter()
             if iteration % config.eval_every == 0:
                 eval_results = evaluate_policy(
-                    policy, tokenizer, config.eval_data_path
+                    policy,
+                    tokenizer,
+                    config.eval_data_path,
+                    max_samples=config.eval_max_samples,
+                    max_new_tokens=config.eval_max_new_tokens,
                 )
                 best_accuracy = max(
                     best_accuracy, float(eval_results.get("accuracy", 0.0))
@@ -703,7 +753,13 @@ def main():
 
             logger_csv.log(csv_metrics, step=iteration)
 
-        final_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
+        final_eval = evaluate_policy(
+            policy,
+            tokenizer,
+            config.eval_data_path,
+            max_samples=config.eval_max_samples,
+            max_new_tokens=config.eval_max_new_tokens,
+        )
         logger.info(
             "Training complete. Initial acc: %.2f%% | Final acc: %.2f%% | Delta: %.2f%%",
             initial_eval.get("accuracy", 0.0) * 100.0,

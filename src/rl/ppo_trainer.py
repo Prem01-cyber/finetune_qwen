@@ -20,6 +20,7 @@ is aborted to avoid destructive policy updates.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Dict
 
@@ -27,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.rl.rollout_buffer import RolloutBuffer
@@ -211,6 +213,21 @@ class PPOTrainer:
         early_stopped = False
         update_steps = 0
 
+        # Every mini-batch runs a full fwd+bwd on the 1.5B policy *and* the
+        # value head (~150 ms on an A100), so a typical update does a few
+        # hundred steps.  A single bar across ppo_epochs * batches_per_epoch
+        # is the right granularity — per-epoch bars thrash the terminal and
+        # per-iteration log lines hide the shape of the early-KL exit.
+        batches_per_epoch = max(1, math.ceil(len(rollout_buffer) / self.batch_size))
+        total_steps = self.ppo_epochs * batches_per_epoch
+        pbar = tqdm(
+            total=total_steps,
+            desc="PPO update",
+            unit="step",
+            dynamic_ncols=True,
+            leave=False,
+        )
+
         for epoch in range(self.ppo_epochs):
             if early_stopped:
                 break
@@ -276,6 +293,18 @@ class PPOTrainer:
                 stats["entropy"].append(mean_entropy.item())
                 stats["approx_kl"].append(pg_info["approx_kl"])
                 stats["clip_fraction"].append(pg_info["clip_fraction"])
+
+                pbar.set_postfix(
+                    ep=f"{epoch + 1}/{self.ppo_epochs}",
+                    pl=f"{policy_loss.item():+.4f}",
+                    vl=f"{value_loss.item():.4f}",
+                    kl=f"{pg_info['approx_kl']:.4f}",
+                    clip=f"{pg_info['clip_fraction']:.2f}",
+                    refresh=False,
+                )
+                pbar.update(1)
+
+        pbar.close()
 
         if update_steps == 0:
             logger.warning(

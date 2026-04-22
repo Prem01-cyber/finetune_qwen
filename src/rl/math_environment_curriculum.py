@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.rl.consensus_reward_calculator import ConsensusRewardCalculator
@@ -355,9 +356,34 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         num_replay = min(num_replay, len(self.replay_buffer))
         num_fresh = max(0, num_trajectories - num_replay)
 
-        fresh_trajectories = [self.rollout_trajectory() for _ in range(num_fresh)]
-        for trajectory in fresh_trajectories:
+        fresh_trajectories: List[Trajectory] = []
+        # Token-by-token HF .generate() on a 1.5B model runs at ~40-50 tok/s and
+        # each rollout is three generate() calls (question + solution + triple
+        # verifier), so the bar is the only signal we're making forward progress.
+        pbar = tqdm(
+            range(num_fresh),
+            desc="Rollouts",
+            unit="ep",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not verbose,
+        )
+        running_reward = 0.0
+        running_ok = 0
+        for _ in pbar:
+            trajectory = self.rollout_trajectory()
             trajectory.metadata["rollout_source"] = "fresh"
+            fresh_trajectories.append(trajectory)
+
+            running_reward += float(trajectory.metadata.get("combined_reward", 0.0))
+            if trajectory.metadata.get("final_answer_ok", False):
+                running_ok += 1
+            done = len(fresh_trajectories)
+            pbar.set_postfix(
+                reward=f"{running_reward / done:+.3f}",
+                ok=f"{running_ok}/{done}",
+                refresh=False,
+            )
 
         replay_trajectories = self.replay_buffer.sample_replay_batch(
             num_replay, diversity_sample=True
