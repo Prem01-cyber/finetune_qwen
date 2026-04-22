@@ -549,59 +549,56 @@ def main():
                     "training/entropy": training_metrics["entropy"],
                     "training/approx_kl": training_metrics["approx_kl"],
                     "training/clip_fraction": training_metrics["clip_fraction"],
-                    "timing/rollout_seconds": timing_metrics["rollout_seconds"],
-                    "timing/train_seconds": timing_metrics["train_seconds"],
-                    "timing/sync_seconds": timing_metrics["sync_seconds"],
-                    "timing/eval_seconds": timing_metrics["eval_seconds"],
-                    "timing/save_seconds": timing_metrics["save_seconds"],
                     "timing/total_seconds": timing_metrics["total_seconds"],
+                    "timing/rollout_seconds": timing_metrics["rollout_seconds"],
                     "throughput/rollouts_per_second": throughput_metrics["rollouts_per_second"],
-                    "throughput/tokens_per_second": throughput_metrics["tokens_per_second"],
-                    "sync/workers_synced": float(sync_metrics.get("workers_synced", 0)),
-                    "disk/free_gb": disk_metrics.get("free_gb", 0.0),
-                    "disk/used_percent": disk_metrics.get("used_percent", 0.0),
-                    "curriculum/num_topics_in_sweet_spot": curriculum_stats["topics_in_sweet_spot"],
-                    "curriculum/avg_topic_match": curriculum_stats["avg_topic_match"],
-                    "curriculum/avg_difficulty_match": curriculum_stats["avg_difficulty_match"],
-                    "curriculum/avg_clarity": curriculum_stats["avg_clarity"],
-                    "curriculum/avg_solvability": curriculum_stats["avg_solvability"],
-                    "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
-                    "reward/question_component": curriculum_stats["avg_question_reward"],
-                    "reward/solution_component": curriculum_stats["avg_solution_reward"],
                     "reward/combined": curriculum_stats["avg_combined_reward"],
-                    "reward/pre_expert": curriculum_stats["avg_pre_expert_reward"],
-                    "reward/expert_modifier": curriculum_stats["avg_expert_modifier"],
-                    "reward/fresh_mean": curriculum_stats["fresh_mean_reward"],
-                    "reward/replay_mean": curriculum_stats["replay_mean_reward"],
-                    "expert/phase_counts/pedagogy": curriculum_stats["expert_phase_counts"].get("pedagogy", 0),
-                    "expert/phase_counts/accuracy": curriculum_stats["expert_phase_counts"].get("accuracy", 0),
-                    "expert/phase_counts/challenge": curriculum_stats["expert_phase_counts"].get("challenge", 0),
+                    "reward/question": curriculum_stats["avg_question_reward"],
+                    "reward/solution": curriculum_stats["avg_solution_reward"],
+                    "curriculum/topics_in_sweet_spot": curriculum_stats["topics_in_sweet_spot"],
+                    "curriculum/avg_solvability": curriculum_stats["avg_solvability"],
                     "replay/ratio": math_env.last_replay_ratio,
-                    "replay/fresh_rollouts": math_env.last_rollout_mix.get("fresh", 0),
-                    "replay/replayed_rollouts": math_env.last_rollout_mix.get("replay", 0),
-                    "replay/new_admissions": curriculum_stats["replay_added_count"],
-                    "replay/buffer_size": replay_stats.get("buffer_size", 0.0),
-                    "replay/avg_quality": replay_stats.get("avg_quality", 0.0),
-                    "replay/quality_variance": replay_stats.get("quality_variance", 0.0),
-                    "replay/staleness": replay_stats.get("staleness", 0.0),
-                    "replay/topic_entropy": replay_stats.get("topic_entropy", 0.0),
-                    "replay/replay_success_rate": replay_stats.get("replay_success_rate", 0.0),
-                    "replay/buffer_turnover_rate": replay_stats.get("buffer_turnover_rate", 0.0),
-                    "replay/topics_in_buffer": replay_stats.get("topics_in_buffer", 0.0),
                     "replay/buffer_health": replay_stats.get("buffer_health", 0.0),
                 }
-                for topic, success in curriculum_stats["per_topic_success"].items():
-                    wandb_metrics[f"curriculum/topic_success/{topic}"] = success
-                for topic, difficulty in curriculum_stats["per_topic_difficulty"].items():
-                    wandb_metrics[f"curriculum/topic_difficulty/{topic}"] = difficulty
                 if eval_results:
                     wandb_metrics["eval/accuracy"] = eval_results["accuracy"]
-                wandb_metrics.update(gpu_metrics)
+                
+                if iteration % 5 == 0:
+                    wandb_metrics.update({
+                        "curriculum/avg_topic_match": curriculum_stats["avg_topic_match"],
+                        "curriculum/avg_difficulty_match": curriculum_stats["avg_difficulty_match"],
+                        "curriculum/avg_clarity": curriculum_stats["avg_clarity"],
+                        "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
+                        "reward/pre_expert": curriculum_stats["avg_pre_expert_reward"],
+                        "reward/expert_modifier": curriculum_stats["avg_expert_modifier"],
+                        "reward/fresh_mean": curriculum_stats["fresh_mean_reward"],
+                        "reward/replay_mean": curriculum_stats["replay_mean_reward"],
+                        "replay/buffer_size": replay_stats.get("buffer_size", 0.0),
+                        "replay/avg_quality": replay_stats.get("avg_quality", 0.0),
+                        "replay/topic_entropy": replay_stats.get("topic_entropy", 0.0),
+                        "sync/workers_synced": float(sync_metrics.get("workers_synced", 0)),
+                    })
+                
+                if iteration % 10 == 0:
+                    wandb_metrics.update({
+                        "expert/phase_counts/pedagogy": curriculum_stats["expert_phase_counts"].get("pedagogy", 0),
+                        "expert/phase_counts/accuracy": curriculum_stats["expert_phase_counts"].get("accuracy", 0),
+                        "expert/phase_counts/challenge": curriculum_stats["expert_phase_counts"].get("challenge", 0),
+                        "replay/new_admissions": curriculum_stats["replay_added_count"],
+                        "replay/quality_variance": replay_stats.get("quality_variance", 0.0),
+                        "replay/staleness": replay_stats.get("staleness", 0.0),
+                        "replay/replay_success_rate": replay_stats.get("replay_success_rate", 0.0),
+                        "replay/buffer_turnover_rate": replay_stats.get("buffer_turnover_rate", 0.0),
+                        "replay/topics_in_buffer": replay_stats.get("topics_in_buffer", 0.0),
+                        "disk/free_gb": disk_metrics.get("free_gb", 0.0),
+                    })
+                    for topic, success in curriculum_stats["per_topic_success"].items():
+                        wandb_metrics[f"curriculum/topic_success/{topic}"] = success
+                
                 try:
                     wandb.log(wandb_metrics)
                 except Exception as e:
-                    logger.error("Failed to log metrics to W&B at iteration %d: %s", iteration, e)
-                    config.use_wandb = False
+                    logger.warning("Failed to log metrics to W&B at iteration %d (retrying next iteration): %s", iteration, e)
     finally:
         math_env.shutdown_parallel_rollout_workers()
 
