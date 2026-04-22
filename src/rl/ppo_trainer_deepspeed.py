@@ -175,10 +175,10 @@ class PPOTrainerDeepSpeed:
                 # Policy update (DeepSpeed ZeRO-3 with offload)
                 policy_objective = policy_loss - self.ent_coef * entropy
                 
-                # For ZeRO-3, manually zero gradients, then backward, then step
-                self.policy_engine.optimizer.zero_grad()
+                # DeepSpeed engine handles gradient zeroing automatically
+                # Just do backward on the loss, then step the engine
                 policy_objective.backward()
-                self.policy_engine.optimizer.step()
+                self.policy_engine.step()
                 
                 # Value update (standard PyTorch)
                 self.value_optimizer.zero_grad()
