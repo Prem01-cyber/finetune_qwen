@@ -13,7 +13,6 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-import wandb
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -25,6 +24,7 @@ from src.rl.math_environment_consensus import ConsensusMathEnvironment
 from src.rl.ppo_trainer import PPOTrainer
 from src.rl.rollout_buffer import RolloutBuffer
 from src.rl.value_network import ValueHead
+from src.utils.csv_logger import CSVLogger
 
 
 # Configure logging
@@ -73,9 +73,8 @@ class ConsensusTrainingConfig:
     output_dir = "checkpoints/ppo_training_consensus"
 
     # Logging
-    use_wandb = True
-    wandb_project = "math-self-improvement-consensus"
-    wandb_run_name = None
+    log_dir = "logs"
+    run_name = None
 
 
 def initialize_models(config: ConsensusTrainingConfig):
@@ -289,9 +288,10 @@ def main():
         help="Number of trajectories per iteration",
     )
     parser.add_argument(
-        "--no-wandb",
-        action="store_true",
-        help="Disable Weights & Biases logging",
+        "--run-name",
+        type=str,
+        default=None,
+        help="Optional run name for logging",
     )
     parser.add_argument(
         "--skip-initial-eval",
@@ -306,15 +306,15 @@ def main():
     config.output_dir = args.output_dir
     config.num_iterations = args.num_iterations
     config.num_rollouts_per_iter = args.rollouts_per_iter
-    config.use_wandb = not args.no_wandb
+    config.run_name = args.run_name
 
-    if config.use_wandb:
-        wandb.init(
-            project=config.wandb_project,
-            name=config.wandb_run_name
-            or f"ppo_consensus_{datetime.now():%Y%m%d_%H%M%S}",
-            config=vars(config),
-        )
+    # Initialize CSV logger
+    logger_csv = CSVLogger(
+        project="math-self-improvement-consensus",
+        run_name=config.run_name or f"ppo_consensus_{datetime.now():%Y%m%d_%H%M%S}",
+        log_dir=config.log_dir,
+        config=vars(config),
+    )
 
     policy, value, tokenizer = initialize_models(config)
 
@@ -354,14 +354,13 @@ def main():
         initial_eval = evaluate_policy(policy, tokenizer)
         best_accuracy = initial_eval["accuracy"]
 
-        if config.use_wandb:
-            wandb.log(
-                {
-                    "iteration": 0,
-                    "eval/accuracy": initial_eval["accuracy"],
-                    "eval/exact_match": initial_eval.get("exact_match", 0.0),
-                }
-            )
+        logger_csv.log(
+            {
+                "eval/accuracy": initial_eval["accuracy"],
+                "eval/exact_match": initial_eval.get("exact_match", 0.0),
+            },
+            step=0,
+        )
     else:
         logger.info("\n" + "=" * 80)
         logger.info("SKIPPING INITIAL EVALUATION (use --skip-initial-eval)")
@@ -456,26 +455,24 @@ def main():
             "eval": eval_results,
         }
 
-        if config.use_wandb:
-            wandb_metrics = {
-                "iteration": iteration,
-                "buffer/mean_reward": buffer_stats["mean_episode_reward"],
-                "buffer/mean_episode_length": buffer_stats["mean_episode_length"],
-                "training/policy_loss": training_metrics["policy_loss"],
-                "training/value_loss": training_metrics["value_loss"],
-                "training/entropy": training_metrics["entropy"],
-                "training/approx_kl": training_metrics["approx_kl"],
-                "training/clip_fraction": training_metrics["clip_fraction"],
-                "consensus/consensus_rate": consensus_metrics["consensus_rate"],
-                "consensus/answer_diversity": consensus_metrics["mean_answer_diversity"],
-                "consensus/consensus_score": consensus_metrics["mean_consensus_score"],
-                "consensus/sympy_score": consensus_metrics["mean_sympy_score"],
-            }
+        csv_metrics = {
+            "buffer/mean_reward": buffer_stats["mean_episode_reward"],
+            "buffer/mean_episode_length": buffer_stats["mean_episode_length"],
+            "training/policy_loss": training_metrics["policy_loss"],
+            "training/value_loss": training_metrics["value_loss"],
+            "training/entropy": training_metrics["entropy"],
+            "training/approx_kl": training_metrics["approx_kl"],
+            "training/clip_fraction": training_metrics["clip_fraction"],
+            "consensus/consensus_rate": consensus_metrics["consensus_rate"],
+            "consensus/answer_diversity": consensus_metrics["mean_answer_diversity"],
+            "consensus/consensus_score": consensus_metrics["mean_consensus_score"],
+            "consensus/sympy_score": consensus_metrics["mean_sympy_score"],
+        }
 
-            if eval_results:
-                wandb_metrics["eval/accuracy"] = eval_results["accuracy"]
+        if eval_results:
+            csv_metrics["eval/accuracy"] = eval_results["accuracy"]
 
-            wandb.log(wandb_metrics)
+        logger_csv.log(csv_metrics, step=iteration)
 
         # ===== STEP 5: SAVE =====
         save_iteration_results(iteration, trajectories, all_metrics, config)
@@ -503,13 +500,20 @@ def main():
             f"\nFinal accuracy:   {final_eval['accuracy']:.2%}"
             f"\nImprovement:      {final_eval['accuracy'] - initial_eval['accuracy']:.2%}"
         )
+        
+        # Save final summary
+        logger_csv.save_summary({
+            "initial_accuracy": initial_eval["accuracy"],
+            "final_accuracy": final_eval["accuracy"],
+            "improvement": final_eval["accuracy"] - initial_eval["accuracy"],
+            "best_accuracy": best_accuracy,
+        })
     else:
         logger.info("\n" + "=" * 80)
         logger.info("TRAINING COMPLETE (evaluations skipped)")
         logger.info("=" * 80)
 
-    if config.use_wandb:
-        wandb.finish()
+    logger_csv.finish()
 
 
 if __name__ == "__main__":

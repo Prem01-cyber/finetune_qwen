@@ -13,8 +13,7 @@ Use this BEFORE starting PPO training to ensure your SFT model is ready.
 Usage:
     python scripts/diagnose_model_quality.py \
         --adapter checkpoints/dual_task_v1 \
-        --num-samples 20 \
-        --wandb-project "math-diagnostics"
+        --num-samples 20
 """
 
 import argparse
@@ -25,7 +24,6 @@ from datetime import datetime
 from typing import Dict, List
 
 import torch
-import wandb
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -34,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.sft.solution_format import validate_sympy_solution_format
 from src.rl.triple_verifier import TripleVerifier
+from src.utils.csv_logger import CSVLogger
 
 
 def load_model(adapter_path: str, base_model: str):
@@ -378,25 +377,22 @@ def main():
     parser.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-Math-1.5B-Instruct")
     parser.add_argument("--num-samples", type=int, default=20, help="Number of format test samples")
     parser.add_argument("--num-consensus", type=int, default=10, help="Number of consensus test samples")
-    parser.add_argument("--wandb-project", type=str, default="math-diagnostics")
-    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--output-json", type=str, help="Save results to JSON file")
     
     args = parser.parse_args()
     
-    # Initialize wandb
-    if not args.no_wandb:
-        wandb.init(
-            project=args.wandb_project,
-            name=f"diagnostics_{Path(args.adapter).name}_{datetime.now():%Y%m%d_%H%M%S}",
-            config={
-                "adapter": args.adapter,
-                "base_model": args.base_model,
-                "num_samples": args.num_samples,
-                "num_consensus": args.num_consensus,
-            },
-            tags=["diagnostics", "pre-ppo"],
-        )
+    # Initialize CSV logger
+    logger_csv = CSVLogger(
+        project="math-diagnostics",
+        run_name=f"diagnostics_{Path(args.adapter).name}_{datetime.now():%Y%m%d_%H%M%S}",
+        log_dir="logs",
+        config={
+            "adapter": args.adapter,
+            "base_model": args.base_model,
+            "num_samples": args.num_samples,
+            "num_consensus": args.num_consensus,
+        },
+    )
     
     print("="*80)
     print("MODEL QUALITY DIAGNOSTICS")
@@ -430,37 +426,25 @@ def main():
     for i, action in enumerate(recommendations["suggested_actions"], 1):
         print(f"  {i}. {action}")
     
-    # Log to wandb
-    if not args.no_wandb:
-        wandb.log({
-            "format/format_ok_rate": format_test["summary"]["format_ok_rate"],
-            "format/has_steps_rate": format_test["summary"]["has_steps_rate"],
-            "format/has_final_answer_rate": format_test["summary"]["has_final_answer_rate"],
-            "format/sympy_ok_rate": format_test["summary"]["sympy_ok_rate"],
-            "consensus/consensus_rate": consensus_test["summary"]["consensus_rate"],
-            "consensus/primary_match_rate": consensus_test["summary"]["primary_match_rate"],
-            "consensus/accuracy": consensus_test["summary"]["accuracy"],
-            "consensus/avg_diversity": consensus_test["summary"]["avg_diversity"],
-            "recommendations/ready_for_ppo": 1.0 if recommendations["ready_for_ppo"] else 0.0,
-        })
-        
-        # Create summary table
-        table = wandb.Table(
-            columns=["Metric", "Value", "Status"],
-            data=[
-                ["Format OK Rate", f"{format_test['summary']['format_ok_rate']:.1%}", 
-                 "✓" if format_test['summary']['format_ok_rate'] >= 0.8 else "✗"],
-                ["Consensus Rate", f"{consensus_test['summary']['consensus_rate']:.1%}",
-                 "✓" if consensus_test['summary']['consensus_rate'] >= 0.5 else "✗"],
-                ["Answer Accuracy", f"{consensus_test['summary']['accuracy']:.1%}",
-                 "✓" if consensus_test['summary']['accuracy'] >= 0.6 else "✗"],
-                ["Ready for PPO", "Yes" if recommendations["ready_for_ppo"] else "No",
-                 "✓" if recommendations["ready_for_ppo"] else "✗"],
-            ]
-        )
-        wandb.log({"diagnostic_summary": table})
-        
-        wandb.finish()
+    # Log to CSV
+    logger_csv.log({
+        "format/format_ok_rate": format_test["summary"]["format_ok_rate"],
+        "format/has_steps_rate": format_test["summary"]["has_steps_rate"],
+        "format/has_final_answer_rate": format_test["summary"]["has_final_answer_rate"],
+        "format/sympy_ok_rate": format_test["summary"]["sympy_ok_rate"],
+        "consensus/consensus_rate": consensus_test["summary"]["consensus_rate"],
+        "consensus/primary_match_rate": consensus_test["summary"]["primary_match_rate"],
+        "consensus/accuracy": consensus_test["summary"]["accuracy"],
+        "consensus/avg_diversity": consensus_test["summary"]["avg_diversity"],
+        "recommendations/ready_for_ppo": 1.0 if recommendations["ready_for_ppo"] else 0.0,
+    })
+    
+    # Save detailed results
+    logger_csv.save_artifact("format_test", format_test)
+    logger_csv.save_artifact("consensus_test", consensus_test)
+    logger_csv.save_artifact("recommendations", recommendations)
+    
+    logger_csv.finish()
     
     # Save to JSON
     if args.output_json:

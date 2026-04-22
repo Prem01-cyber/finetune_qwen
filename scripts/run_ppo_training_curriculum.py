@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
-import wandb
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -25,6 +24,7 @@ from src.rl.ppo_trainer import PPOTrainer
 from src.rl.rollout_buffer import RolloutBuffer
 from src.rl.training_monitor import TrainingMonitor
 from src.rl.value_network import ValueHead
+from src.utils.csv_logger import CSVLogger
 
 
 logging.basicConfig(
@@ -73,13 +73,14 @@ class CurriculumTrainingConfig:
     eval_data_path = "data/sft/dual_task_val.jsonl"
     gsm8k_reference_data = "data/sft/gsm8k_sft.jsonl"
 
-    use_wandb = True
-    wandb_project = "math-ppo-curriculum"
-    wandb_run_name = None
     disk_warning_gb = 5.0
     checkpoint_keep_last = 2
     checkpoint_keep_every = 100
     compress_old_logs = True
+    
+    # Logging
+    log_dir = "logs"
+    run_name = None
 
 
 def load_reference_questions(path: str) -> List[str]:
@@ -298,7 +299,6 @@ def main():
     parser.add_argument("--eval-data-path", type=str, default="data/sft/dual_task_val.jsonl")
     parser.add_argument("--gsm8k-reference-data", type=str, default="data/sft/gsm8k_sft.jsonl")
     parser.add_argument("--skip-initial-eval", action="store_true")
-    parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--disable-multi-gpu-rollouts", action="store_true")
     parser.add_argument("--use-vllm-rollouts", action="store_true")
     parser.add_argument("--num-rollout-gpus", type=int, default=None)
@@ -310,6 +310,7 @@ def main():
     parser.add_argument("--checkpoint-keep-last", type=int, default=2)
     parser.add_argument("--checkpoint-keep-every", type=int, default=100)
     parser.add_argument("--no-compress-old-logs", action="store_true")
+    parser.add_argument("--run-name", type=str, default=None, help="Optional run name for logging")
     args = parser.parse_args()
 
     config = CurriculumTrainingConfig()
@@ -320,7 +321,7 @@ def main():
     config.eval_data_path = args.eval_data_path
     config.gsm8k_reference_data = args.gsm8k_reference_data
     config.curriculum_checkpoint_dir = str(Path(args.output_dir) / "curriculum")
-    config.use_wandb = not args.no_wandb
+    config.run_name = args.run_name
     config.use_multi_gpu_rollouts = not args.disable_multi_gpu_rollouts
     config.use_vllm_rollouts = args.use_vllm_rollouts
     config.num_rollout_gpus = args.num_rollout_gpus
@@ -333,18 +334,14 @@ def main():
     config.checkpoint_keep_every = max(1, int(args.checkpoint_keep_every))
     config.compress_old_logs = not args.no_compress_old_logs
 
-    if config.use_wandb:
-        try:
-            wandb.init(
-                project=config.wandb_project,
-                name=config.wandb_run_name or f"ppo_curriculum_{datetime.now():%Y%m%d_%H%M%S}",
-                config=vars(config),
-            )
-            logger.info("W&B initialized successfully: project=%s", config.wandb_project)
-        except Exception as e:
-            logger.error("Failed to initialize W&B: %s", e, exc_info=True)
-            logger.warning("Continuing without W&B logging")
-            config.use_wandb = False
+    # Initialize CSV logger
+    logger_csv = CSVLogger(
+        project="ppo-curriculum",
+        run_name=config.run_name or f"curriculum_{datetime.now():%Y%m%d_%H%M%S}",
+        log_dir=config.log_dir,
+        config=vars(config),
+        log_detailed=True,
+    )
 
     policy, value, tokenizer = initialize_models(config)
     reference_questions = load_reference_questions(config.gsm8k_reference_data)
@@ -401,6 +398,12 @@ def main():
         logger.info("\n%s\nINITIAL EVALUATION (Iteration 0)\n%s", "=" * 80, "=" * 80)
         initial_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
         best_accuracy = float(initial_eval["accuracy"])
+        
+        logger_csv.log({
+            "eval/accuracy": initial_eval["accuracy"],
+            "eval/correct": initial_eval.get("correct", 0),
+            "eval/total": initial_eval.get("total", 0),
+        }, step=0)
 
     try:
         for iteration in range(1, config.num_iterations + 1):
@@ -538,67 +541,39 @@ def main():
                 "replay_ratio": math_env.last_replay_ratio,
             }
             save_iteration_results(iteration, trajectories, all_metrics, config)
-
-            if config.use_wandb:
-                wandb_metrics = {
-                    "iteration": iteration,
-                    "buffer/mean_reward": buffer_stats["mean_episode_reward"],
-                    "buffer/mean_episode_length": buffer_stats["mean_episode_length"],
-                    "training/policy_loss": training_metrics["policy_loss"],
-                    "training/value_loss": training_metrics["value_loss"],
-                    "training/entropy": training_metrics["entropy"],
-                    "training/approx_kl": training_metrics["approx_kl"],
-                    "training/clip_fraction": training_metrics["clip_fraction"],
-                    "timing/total_seconds": timing_metrics["total_seconds"],
-                    "timing/rollout_seconds": timing_metrics["rollout_seconds"],
-                    "throughput/rollouts_per_second": throughput_metrics["rollouts_per_second"],
-                    "reward/combined": curriculum_stats["avg_combined_reward"],
-                    "reward/question": curriculum_stats["avg_question_reward"],
-                    "reward/solution": curriculum_stats["avg_solution_reward"],
-                    "curriculum/topics_in_sweet_spot": curriculum_stats["topics_in_sweet_spot"],
-                    "curriculum/avg_solvability": curriculum_stats["avg_solvability"],
-                    "replay/ratio": math_env.last_replay_ratio,
-                    "replay/buffer_health": replay_stats.get("buffer_health", 0.0),
-                }
-                if eval_results:
-                    wandb_metrics["eval/accuracy"] = eval_results["accuracy"]
-                
-                if iteration % 5 == 0:
-                    wandb_metrics.update({
-                        "curriculum/avg_topic_match": curriculum_stats["avg_topic_match"],
-                        "curriculum/avg_difficulty_match": curriculum_stats["avg_difficulty_match"],
-                        "curriculum/avg_clarity": curriculum_stats["avg_clarity"],
-                        "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
-                        "reward/pre_expert": curriculum_stats["avg_pre_expert_reward"],
-                        "reward/expert_modifier": curriculum_stats["avg_expert_modifier"],
-                        "reward/fresh_mean": curriculum_stats["fresh_mean_reward"],
-                        "reward/replay_mean": curriculum_stats["replay_mean_reward"],
-                        "replay/buffer_size": replay_stats.get("buffer_size", 0.0),
-                        "replay/avg_quality": replay_stats.get("avg_quality", 0.0),
-                        "replay/topic_entropy": replay_stats.get("topic_entropy", 0.0),
-                        "sync/workers_synced": float(sync_metrics.get("workers_synced", 0)),
-                    })
-                
-                if iteration % 10 == 0:
-                    wandb_metrics.update({
-                        "expert/phase_counts/pedagogy": curriculum_stats["expert_phase_counts"].get("pedagogy", 0),
-                        "expert/phase_counts/accuracy": curriculum_stats["expert_phase_counts"].get("accuracy", 0),
-                        "expert/phase_counts/challenge": curriculum_stats["expert_phase_counts"].get("challenge", 0),
-                        "replay/new_admissions": curriculum_stats["replay_added_count"],
-                        "replay/quality_variance": replay_stats.get("quality_variance", 0.0),
-                        "replay/staleness": replay_stats.get("staleness", 0.0),
-                        "replay/replay_success_rate": replay_stats.get("replay_success_rate", 0.0),
-                        "replay/buffer_turnover_rate": replay_stats.get("buffer_turnover_rate", 0.0),
-                        "replay/topics_in_buffer": replay_stats.get("topics_in_buffer", 0.0),
-                        "disk/free_gb": disk_metrics.get("free_gb", 0.0),
-                    })
-                    for topic, success in curriculum_stats["per_topic_success"].items():
-                        wandb_metrics[f"curriculum/topic_success/{topic}"] = success
-                
-                try:
-                    wandb.log(wandb_metrics)
-                except Exception as e:
-                    logger.warning("Failed to log metrics to W&B at iteration %d (retrying next iteration): %s", iteration, e)
+            
+            # Log to CSV (simplified metrics)
+            csv_metrics = {
+                "iteration": iteration,
+                "train/policy_loss": training_metrics["policy_loss"],
+                "train/value_loss": training_metrics["value_loss"],
+                "train/entropy": training_metrics["entropy"],
+                "train/approx_kl": training_metrics["approx_kl"],
+                "train/clip_fraction": training_metrics["clip_fraction"],
+                "rollout/mean_reward": buffer_stats["mean_episode_reward"],
+                "rollout/num_trajectories": len(trajectories),
+                "rollout/mean_length": buffer_stats["mean_episode_length"],
+                "curriculum/topic_diversity": curriculum_stats["topic_diversity"],
+                "curriculum/avg_difficulty": curriculum_stats["avg_difficulty"],
+                "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
+                "curriculum/replay_ratio": math_env.last_replay_ratio,
+                "perf/rollout_time": rollout_seconds,
+                "perf/train_time": train_seconds,
+                "perf/total_time": total_seconds,
+                "perf/tokens_per_second": throughput_metrics.get("tokens_per_second", 0.0),
+                "system/disk_free_gb": disk_metrics.get("free_gb", 0.0),
+            }
+            
+            if eval_results:
+                csv_metrics["eval/accuracy"] = eval_results["accuracy"]
+                csv_metrics["eval/correct"] = eval_results.get("correct", 0)
+                csv_metrics["eval/total"] = eval_results.get("total", 0)
+            
+            if gpu_metrics:
+                avg_gpu_util = sum(gpu_metrics.values()) / max(1, len(gpu_metrics))
+                csv_metrics["system/gpu_util_percent"] = avg_gpu_util
+            
+            logger_csv.log(csv_metrics, step=iteration)
     finally:
         math_env.shutdown_parallel_rollout_workers()
 
@@ -609,13 +584,17 @@ def main():
         final_eval["accuracy"] * 100.0,
         (final_eval["accuracy"] - initial_eval["accuracy"]) * 100.0,
     )
-
-    if config.use_wandb:
-        try:
-            wandb.finish()
-            logger.info("W&B run finished successfully")
-        except Exception as e:
-            logger.error("Failed to finish W&B run: %s", e)
+    
+    # Save final summary
+    logger_csv.save_summary({
+        "initial_accuracy": initial_eval["accuracy"],
+        "final_accuracy": final_eval["accuracy"],
+        "improvement": final_eval["accuracy"] - initial_eval["accuracy"],
+        "best_accuracy": best_accuracy,
+        "total_iterations": config.num_iterations,
+    })
+    
+    logger_csv.finish()
 
 
 if __name__ == "__main__":

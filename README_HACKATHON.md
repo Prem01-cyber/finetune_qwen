@@ -83,7 +83,7 @@ notebooks/
 
 ```bash
 pip install torch transformers trl peft unsloth
-pip install sympy numpy scipy matplotlib seaborn wandb
+pip install sympy numpy scipy matplotlib seaborn
 pip install gym  # for OpenEnv wrapper (optional)
 ```
 

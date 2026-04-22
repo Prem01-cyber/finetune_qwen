@@ -20,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-import wandb
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -33,6 +32,7 @@ from src.rl.ppo_trainer import PPOTrainer
 from src.rl.reward_calculator import RewardCalculator
 from src.rl.rollout_buffer import RolloutBuffer
 from src.rl.value_network import ValueHead
+from src.utils.csv_logger import CSVLogger
 
 
 # Configure logging
@@ -80,9 +80,8 @@ class PPOTrainingConfig:
     output_dir = "checkpoints/ppo_training"
 
     # Logging
-    use_wandb = True
-    wandb_project = "math-self-improvement"
-    wandb_run_name = None
+    log_dir = "logs"
+    run_name = None
 
 
 def initialize_models(config: PPOTrainingConfig):
@@ -252,9 +251,10 @@ def main():
         help="Number of trajectories per iteration",
     )
     parser.add_argument(
-        "--no-wandb",
-        action="store_true",
-        help="Disable Weights & Biases logging",
+        "--run-name",
+        type=str,
+        default=None,
+        help="Optional run name for logging",
     )
 
     args = parser.parse_args()
@@ -264,15 +264,15 @@ def main():
     config.output_dir = args.output_dir
     config.num_iterations = args.num_iterations
     config.num_rollouts_per_iter = args.rollouts_per_iter
-    config.use_wandb = not args.no_wandb
+    config.run_name = args.run_name
 
-    if config.use_wandb:
-        wandb.init(
-            project=config.wandb_project,
-            name=config.wandb_run_name
-            or f"ppo_{datetime.now():%Y%m%d_%H%M%S}",
-            config=vars(config),
-        )
+    # Initialize CSV logger
+    logger_csv = CSVLogger(
+        project="math-self-improvement",
+        run_name=config.run_name or f"ppo_{datetime.now():%Y%m%d_%H%M%S}",
+        log_dir=config.log_dir,
+        config=vars(config),
+    )
 
     policy, value, tokenizer = initialize_models(config)
 
@@ -312,14 +312,13 @@ def main():
     initial_eval = evaluate_policy(policy, tokenizer)
     best_accuracy = initial_eval["accuracy"]
 
-    if config.use_wandb:
-        wandb.log(
-            {
-                "iteration": 0,
-                "eval/accuracy": initial_eval["accuracy"],
-                "eval/exact_match": initial_eval.get("exact_match", 0.0),
-            }
-        )
+    logger_csv.log(
+        {
+            "eval/accuracy": initial_eval["accuracy"],
+            "eval/exact_match": initial_eval.get("exact_match", 0.0),
+        },
+        step=0,
+    )
 
     # Training loop
     for iteration in range(1, config.num_iterations + 1):
@@ -398,22 +397,20 @@ def main():
             "eval": eval_results,
         }
 
-        if config.use_wandb:
-            wandb_metrics = {
-                "iteration": iteration,
-                "buffer/mean_reward": buffer_stats["mean_episode_reward"],
-                "buffer/mean_episode_length": buffer_stats["mean_episode_length"],
-                "training/policy_loss": training_metrics["policy_loss"],
-                "training/value_loss": training_metrics["value_loss"],
-                "training/entropy": training_metrics["entropy"],
-                "training/approx_kl": training_metrics["approx_kl"],
-                "training/clip_fraction": training_metrics["clip_fraction"],
-            }
+        csv_metrics = {
+            "buffer/mean_reward": buffer_stats["mean_episode_reward"],
+            "buffer/mean_episode_length": buffer_stats["mean_episode_length"],
+            "training/policy_loss": training_metrics["policy_loss"],
+            "training/value_loss": training_metrics["value_loss"],
+            "training/entropy": training_metrics["entropy"],
+            "training/approx_kl": training_metrics["approx_kl"],
+            "training/clip_fraction": training_metrics["clip_fraction"],
+        }
 
-            if eval_results:
-                wandb_metrics["eval/accuracy"] = eval_results["accuracy"]
+        if eval_results:
+            csv_metrics["eval/accuracy"] = eval_results["accuracy"]
 
-            wandb.log(wandb_metrics)
+        logger_csv.log(csv_metrics, step=iteration)
 
         # ===== STEP 5: SAVE =====
         save_iteration_results(iteration, trajectories, all_metrics, config)
@@ -441,8 +438,15 @@ def main():
         f"\nImprovement:      {final_eval['accuracy'] - initial_eval['accuracy']:.2%}"
     )
 
-    if config.use_wandb:
-        wandb.finish()
+    # Save final summary
+    logger_csv.save_summary({
+        "initial_accuracy": initial_eval["accuracy"],
+        "final_accuracy": final_eval["accuracy"],
+        "improvement": final_eval["accuracy"] - initial_eval["accuracy"],
+        "best_accuracy": best_accuracy,
+    })
+    
+    logger_csv.finish()
 
 
 if __name__ == "__main__":
