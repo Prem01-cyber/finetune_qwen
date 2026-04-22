@@ -2,11 +2,8 @@
 Curriculum-aware math environment with dual reward signals.
 
 This file is deliberately minimal: a single ``collect_rollouts`` method is all
-the training loop needs.  In single-GPU runs it is called directly; in
-DeepSpeed multi-GPU runs every rank calls it locally (under a gathered-params
-context) and the launcher all-gathers the resulting trajectories.  No extra
-subprocesses, no RPC server, no vLLM colocation — that was the machinery that
-kept fighting DeepSpeed over the same GPUs.
+the training loop needs.  Rollouts and PPO updates run in the same process on
+a single GPU — no subprocesses, no RPC, no vLLM colocation.
 """
 
 from __future__ import annotations

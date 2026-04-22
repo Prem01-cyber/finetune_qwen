@@ -80,11 +80,8 @@ class MathEnvironment:
             max_solution_tokens: Max tokens for solution generation
             temperature: Sampling temperature
             top_p: Nucleus sampling parameter
-            device: Optional explicit compute device.  This is needed when
-                using DeepSpeed ZeRO-3 with CPU offload, where
-                ``next(policy_model.parameters()).device`` would return
-                ``cpu`` (params are offloaded) but we actually want to run
-                on the local GPU.
+            device: Optional explicit compute device.  Defaults to the
+                device of ``policy_model``'s first parameter.
         """
         self.policy = policy_model
         self.value = value_model

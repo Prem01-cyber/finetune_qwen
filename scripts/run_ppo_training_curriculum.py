@@ -1,19 +1,16 @@
 """
-PPO training with curriculum-guided dual-task rewards.
+PPO training with curriculum-guided dual-task rewards (single-GPU).
 
-Single entry point for both single-GPU and multi-GPU (DeepSpeed ZeRO-3) runs.
+    python scripts/run_ppo_training_curriculum.py \\
+        --base-model checkpoints/dual_task_v1 \\
+        --num-iterations 10 --rollouts-per-iter 96
 
-    # Single GPU
-    python scripts/run_ppo_training_curriculum.py --base-model checkpoints/dual_task_v1
-
-    # Multi-GPU (N GPUs)
-    deepspeed --num_gpus=N scripts/run_ppo_training_curriculum.py \\
-        --use-deepspeed --base-model checkpoints/dual_task_v1
-
-Under DeepSpeed, each rank loads the merged weights, ZeRO-3 shards them across
-ranks, and rollouts are collected *data-parallel* with a temporary
-``GatheredParameters`` context.  PPO updates then shard mini-batches across
-ranks and DeepSpeed's built-in gradient all-reduce stitches them back together.
+A Qwen2.5-Math-1.5B policy + ValueHead critic, plus the AdamW optimiser and
+rollout activations, fit comfortably on a single 40GB GPU in bfloat16, so this
+script deliberately does one GPU only.  It is fast, simple, and has no
+distributed-training failure modes (no ZeRO hooks, no ``accelerate`` device
+reshuffles, no cross-rank deadlocks).  Rollouts and PPO updates run on the
+same device sequentially.
 """
 
 import argparse
@@ -36,21 +33,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.eval_sft_inference import evaluate_gsm8k
 from src.rl.checkpoint_manager import CheckpointManager
-from src.rl.deepspeed_utils import (
-    all_gather_objects,
-    barrier,
-    broadcast_object,
-    current_cuda_device,
-    gather_params_for_generation,
-    get_local_rank,
-    get_rank,
-    get_world_size,
-    is_main_process,
-    my_share,
-)
 from src.rl.math_environment_curriculum import CurriculumMathEnvironment
 from src.rl.ppo_trainer import PPOTrainer
-from src.rl.ppo_trainer_deepspeed import PPOTrainerDeepSpeed
 from src.rl.rollout_buffer import RolloutBuffer
 from src.rl.training_monitor import TrainingMonitor
 from src.rl.value_network import ValueHead
@@ -157,22 +141,22 @@ def load_reference_questions(path: str) -> List[str]:
 def log_gpu_memory(stage: str) -> None:
     if not torch.cuda.is_available():
         return
-    for i in range(torch.cuda.device_count()):
-        allocated = torch.cuda.memory_allocated(i) / (1024 ** 3)
-        reserved = torch.cuda.memory_reserved(i) / (1024 ** 3)
-        total = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
-        logger.info(
-            "[%s] GPU %d: %.2fGB allocated, %.2fGB reserved, %.2fGB total (%.1f%% used)",
-            stage, i, allocated, reserved, total, allocated / total * 100,
-        )
+    i = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(i) / (1024 ** 3)
+    reserved = torch.cuda.memory_reserved(i) / (1024 ** 3)
+    total = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
+    logger.info(
+        "[%s] GPU %d: %.2fGB allocated, %.2fGB reserved, %.2fGB total (%.1f%% used)",
+        stage, i, allocated, reserved, total, allocated / total * 100,
+    )
 
 
 def _ensure_peft_tensor_parallel_shim() -> None:
     """
     PEFT <= 0.12 unconditionally imports
     ``transformers.integrations.tensor_parallel`` on attribute lookup.  Older
-    transformers versions don't ship that module and the import crashes under
-    torchrun/deepspeed.  Install a harmless stub to unblock the merge path.
+    transformers versions don't ship that module and the import crashes on the
+    ``merge_and_unload`` path.  Install a harmless stub so the merge succeeds.
     """
     import sys as _sys
     import types
@@ -183,37 +167,8 @@ def _ensure_peft_tensor_parallel_shim() -> None:
         )
 
 
-def _strip_accelerate_hooks(module: torch.nn.Module) -> None:
-    """
-    Remove any ``accelerate`` pre/post-forward hooks the loader may have
-    installed (e.g. via ``device_map=`` or as a side-effect of PEFT's
-    ``merge_and_unload``).
-
-    Under DeepSpeed these hooks are actively harmful: every forward call they
-    yank tensors back to the device accelerate thinks they belong on, which
-    then collides with ZeRO-3's parameter gathering and with inputs placed on
-    this rank's ``cuda:<local_rank>``.  Running pure DeepSpeed means DeepSpeed
-    alone decides where things live; accelerate has no business intervening.
-    """
-    try:
-        from accelerate.hooks import remove_hook_from_module
-    except Exception:
-        return
-    remove_hook_from_module(module, recurse=True)
-
-
-def initialize_models(
-    config: CurriculumTrainingConfig,
-    use_deepspeed: bool = False,
-):
-    """
-    Load the policy, value network and tokenizer.
-
-    Single-GPU: models go straight to cuda:0.
-    DeepSpeed:  models stay on CPU until ``deepspeed.initialize`` shards them
-                across ranks.  Every rank has to perform this load (ZeRO-3
-                requires initialised weights on every rank to partition them).
-    """
+def initialize_models(config: CurriculumTrainingConfig):
+    """Load the policy, value network and tokenizer on ``cuda:0`` (or CPU)."""
     model_path = Path(config.base_model)
     is_adapter = (model_path / "adapter_config.json").exists()
 
@@ -242,21 +197,14 @@ def initialize_models(
 
     _ensure_peft_tensor_parallel_shim()
 
-    # --- Policy --------------------------------------------------------
-    # CRITICAL: when ``use_deepspeed`` is set we must NOT pass
-    # ``device_map`` — that installs accelerate's pre/post-forward hooks
-    # which then fight ZeRO-3 parameter gathering every forward call (the
-    # hooks try to relocate params to the accelerate-assigned device while
-    # inputs are on ``cuda:<local_rank>`` and ZeRO-3 gathers params to that
-    # same device).  ``low_cpu_mem_usage=True`` alone is enough to keep the
-    # load out of GPU memory until DeepSpeed initialises.
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
     policy_load_kwargs = {
         "torch_dtype": torch.bfloat16,
         "low_cpu_mem_usage": True,
         "trust_remote_code": True,
+        "device_map": {"": "cpu"},
     }
-    if not use_deepspeed:
-        policy_load_kwargs["device_map"] = {"": "cpu"}
 
     if is_adapter:
         base_model = AutoModelForCausalLM.from_pretrained(
@@ -270,38 +218,22 @@ def initialize_models(
             config.base_model, **policy_load_kwargs
         )
 
-    # Belt-and-braces: strip any accelerate hooks that PEFT's
-    # ``merge_and_unload`` or the loader may have installed.
-    if use_deepspeed:
-        _strip_accelerate_hooks(policy)
+    policy = policy.to(device)
+    log_gpu_memory("After policy loaded")
 
-    if not use_deepspeed:
-        policy = policy.to("cuda:0")
-        log_gpu_memory("After policy loaded on GPU 0")
-    else:
-        log_gpu_memory("After policy loaded on CPU (pre-DeepSpeed)")
-
-    # --- Value network -------------------------------------------------
-    # Same device_map story for the critic backbone.
-    if use_deepspeed:
-        value = ValueHead(base_model_name, model_device_map=None)
-        _strip_accelerate_hooks(value)
-    else:
-        value = ValueHead(base_model_name, model_device_map={"": "cpu"})
-        value.backbone = value.backbone.to("cuda:0")
-        value.value_head = value.value_head.to("cuda:0")
+    value = ValueHead(base_model_name, model_device_map={"": "cpu"})
+    value.backbone = value.backbone.to(device)
+    value.value_head = value.value_head.to(device)
     log_gpu_memory("After ValueHead loaded")
 
-    # torch.compile conflicts with DeepSpeed's ZeRO-3 pre/post-forward hooks,
-    # so only enable it for the single-process path.
-    if not use_deepspeed and config.use_torch_compile:
+    if config.use_torch_compile:
         try:
             logger.info("Compiling policy with torch.compile (may take 2-3 min)")
             policy = torch.compile(policy, mode="reduce-overhead")
         except Exception as exc:  # pragma: no cover - best effort
             logger.warning("torch.compile failed: %s. Continuing without.", exc)
 
-    return policy, value, tokenizer
+    return policy, value, tokenizer, device
 
 
 def evaluate_policy(policy, tokenizer, eval_data_path: str) -> Dict[str, float]:
@@ -444,29 +376,9 @@ def save_iteration_results(
     )
 
 
-def _move_trajectories_to_cpu(trajectories: List) -> None:
-    """
-    Detach rollout tensors to CPU before cross-rank pickling.
-
-    all_gather_object serialises the tensors with their original device, so a
-    tensor produced on rank 0's ``cuda:0`` is revived on rank 1 as ``cuda:0`` —
-    which is a *different* physical GPU than rank 1's own ``cuda:1``.  Moving
-    to CPU first lets the PPO trainer do an unambiguous ``.to(self.device)``.
-    """
-    for traj in trajectories:
-        for trans in traj.transitions:
-            trans.state.input_ids = trans.state.input_ids.detach().cpu()
-            trans.state.attention_mask = trans.state.attention_mask.detach().cpu()
-            if trans.next_state is not None:
-                trans.next_state.input_ids = trans.next_state.input_ids.detach().cpu()
-                trans.next_state.attention_mask = (
-                    trans.next_state.attention_mask.detach().cpu()
-                )
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Train PPO with curriculum-guided dual-task rewards"
+        description="Train PPO with curriculum-guided dual-task rewards (single GPU)"
     )
     parser.add_argument("--base-model", type=str, default="checkpoints/dual_task_v1")
     parser.add_argument(
@@ -485,34 +397,11 @@ def main():
     parser.add_argument("--checkpoint-keep-last", type=int, default=2)
     parser.add_argument("--checkpoint-keep-every", type=int, default=100)
     parser.add_argument("--no-compress-old-logs", action="store_true")
+    parser.add_argument("--no-torch-compile", action="store_true")
     parser.add_argument(
         "--run-name", type=str, default=None, help="Optional run name for logging"
     )
-    parser.add_argument(
-        "--use-deepspeed",
-        action="store_true",
-        help="Enable DeepSpeed ZeRO-3 multi-GPU training",
-    )
-    parser.add_argument(
-        "--deepspeed-config",
-        type=str,
-        default="configs/deepspeed_zero3_rl.json",
-        help="Path to DeepSpeed config JSON",
-    )
-    parser.add_argument(
-        "--local_rank", type=int, default=-1,
-        help="Local rank set by the DeepSpeed launcher",
-    )
     args = parser.parse_args()
-
-    # -----------------------------------------------------------------
-    # DeepSpeed launcher hygiene: pin this process to its local GPU
-    # *before* any CUDA allocation so deepspeed.initialize() lays params
-    # out on the right device.
-    # -----------------------------------------------------------------
-    if args.use_deepspeed and torch.cuda.is_available():
-        local_rank = args.local_rank if args.local_rank >= 0 else get_local_rank()
-        torch.cuda.set_device(local_rank)
 
     config = CurriculumTrainingConfig()
     config.base_model = args.base_model
@@ -527,49 +416,32 @@ def main():
     config.checkpoint_keep_last = max(1, int(args.checkpoint_keep_last))
     config.checkpoint_keep_every = max(1, int(args.checkpoint_keep_every))
     config.compress_old_logs = not args.no_compress_old_logs
+    if args.no_torch_compile:
+        config.use_torch_compile = False
 
-    # Deterministic but per-rank seeding so every rank samples a different
-    # slice of rollouts (true data parallelism) while still being reproducible.
     base_seed = 1234
-    random.seed(base_seed + get_rank())
-    np.random.seed(base_seed + get_rank())
+    random.seed(base_seed)
+    np.random.seed(base_seed)
     torch.manual_seed(base_seed)
 
-    # CSV logger and stdout tee live on rank 0 only.  Other ranks keep their
-    # stdout so tracebacks still surface.
-    logger_csv = None
-    console_log_file = None
+    logger_csv = CSVLogger(
+        project="ppo-curriculum",
+        run_name=config.run_name or f"curriculum_{datetime.now():%Y%m%d_%H%M%S}",
+        log_dir=config.log_dir,
+        config=vars(config),
+        log_detailed=True,
+    )
+    console_log_path = Path(logger_csv.log_path) / "console_output.log"
+    console_log_file = console_log_path.open("a", encoding="utf-8", buffering=1)
     original_stdout = sys.stdout
     original_stderr = sys.stderr
-    console_log_path: Optional[Path] = None
-    if is_main_process():
-        logger_csv = CSVLogger(
-            project="ppo-curriculum",
-            run_name=config.run_name or f"curriculum_{datetime.now():%Y%m%d_%H%M%S}",
-            log_dir=config.log_dir,
-            config=vars(config),
-            log_detailed=True,
-        )
-        console_log_path = Path(logger_csv.log_path) / "console_output.log"
-        console_log_file = console_log_path.open("a", encoding="utf-8", buffering=1)
-        sys.stdout = TeeStream(original_stdout, console_log_file)
-        sys.stderr = TeeStream(original_stderr, console_log_file)
-        logger.info("Full console output is being captured at %s", console_log_path)
+    sys.stdout = TeeStream(original_stdout, console_log_file)
+    sys.stderr = TeeStream(original_stderr, console_log_file)
+    logger.info("Full console output is being captured at %s", console_log_path)
 
     try:
-        policy, value, tokenizer = initialize_models(
-            config, use_deepspeed=args.use_deepspeed
-        )
+        policy, value, tokenizer, device = initialize_models(config)
         reference_questions = load_reference_questions(config.gsm8k_reference_data)
-
-        # Pin the env to this rank's local GPU.  Without this, a ZeRO-3
-        # partitioned/offloaded policy would make the env put tensors on CPU
-        # during generation.
-        env_device = (
-            current_cuda_device()
-            if args.use_deepspeed
-            else (next(policy.parameters()).device if torch.cuda.is_available() else torch.device("cpu"))
-        )
 
         math_env = CurriculumMathEnvironment(
             policy_model=policy,
@@ -582,7 +454,7 @@ def main():
             temperature=config.temperature,
             top_p=config.top_p,
             consensus_temperature=config.consensus_temperature,
-            device=env_device,
+            device=device,
         )
         training_monitor = TrainingMonitor(
             output_dir=config.output_dir,
@@ -595,209 +467,65 @@ def main():
             compress_old_logs=config.compress_old_logs,
         )
 
-        if args.use_deepspeed:
-            logger.info(
-                "Using DeepSpeed ZeRO-3 PPO trainer (rank=%d, world=%d)",
-                get_rank(), get_world_size(),
-            )
-            ppo_trainer = PPOTrainerDeepSpeed(
-                policy_model=policy,
-                value_model=value,
-                tokenizer=tokenizer,
-                learning_rate=config.learning_rate,
-                ppo_epochs=config.ppo_epochs,
-                batch_size=config.batch_size,
-                clip_range=config.clip_range,
-                clip_range_vf=config.clip_range_vf,
-                vf_coef=config.vf_coef,
-                ent_coef=config.ent_coef,
-                max_grad_norm=config.max_grad_norm,
-                target_kl=config.target_kl,
-                ds_config=args.deepspeed_config,
-            )
-            # DeepSpeed returned the same nn.Module references (engine.module is
-            # our policy_model), but point env at the canonical handles kept
-            # by the trainer so weight sync is unambiguous.
-            policy = ppo_trainer.policy
-            value = ppo_trainer.value
-            math_env.policy = policy
-            math_env.value = value
-            math_env.triple_verifier.model = policy
-        else:
-            logger.info("Using single-GPU PPO trainer")
-            ppo_trainer = PPOTrainer(
-                policy_model=policy,
-                value_model=value,
-                tokenizer=tokenizer,
-                learning_rate=config.learning_rate,
-                ppo_epochs=config.ppo_epochs,
-                batch_size=config.batch_size,
-                clip_range=config.clip_range,
-                clip_range_vf=config.clip_range_vf,
-                vf_coef=config.vf_coef,
-                ent_coef=config.ent_coef,
-                max_grad_norm=config.max_grad_norm,
-                target_kl=config.target_kl,
-            )
-
-        def _collect_rollouts_this_iteration() -> List:
-            """
-            Collect ``num_rollouts_per_iter`` trajectories.
-
-            Under DeepSpeed: each rank runs ``collect_rollouts`` locally on its
-            share of the work (with full params temporarily gathered), then we
-            all-gather the lists so every rank trains on the same buffer.
-            Single-GPU: one process does the whole thing.
-            """
-            if not args.use_deepspeed:
-                return math_env.collect_rollouts(
-                    num_trajectories=config.num_rollouts_per_iter, verbose=True,
-                )
-
-            my_count = my_share(config.num_rollouts_per_iter)
-            logger.info(
-                "[rank %d] Generating %d/%d rollouts with gathered weights",
-                get_rank(), my_count, config.num_rollouts_per_iter,
-            )
-
-            gather_start = time.perf_counter()
-            local_start = None
-            local_tokens = 0
-            with gather_params_for_generation(policy, value):
-                gather_seconds = time.perf_counter() - gather_start
-                logger.info(
-                    "[rank %d] Param gather + hook detach: %.2fs",
-                    get_rank(), gather_seconds,
-                )
-                local_start = time.perf_counter()
-                local_trajs = math_env.collect_rollouts(
-                    num_trajectories=my_count, verbose=True
-                )
-                local_tokens = sum(len(t) for t in local_trajs)
-
-            local_seconds = time.perf_counter() - local_start if local_start else 0.0
-            logger.info(
-                "[rank %d] Local rollouts done: %d trajs, %d tokens, %.1fs "
-                "(%.1f tok/s)",
-                get_rank(), len(local_trajs), local_tokens, local_seconds,
-                local_tokens / max(local_seconds, 1e-6),
-            )
-
-            _move_trajectories_to_cpu(local_trajs)
-
-            # Surface cross-rank imbalance: if one rank finishes much faster
-            # than another we're wasting GPUs.  all-gather tuples of
-            # (rank, count, tokens, seconds) so rank 0 can print the spread.
-            per_rank_stats = all_gather_objects(
-                {
-                    "rank": get_rank(),
-                    "trajs": len(local_trajs),
-                    "tokens": local_tokens,
-                    "seconds": local_seconds,
-                }
-            )
-
-            gathered_lists = all_gather_objects(local_trajs)
-            combined: List = []
-            for chunk in gathered_lists:
-                combined.extend(chunk)
-
-            if is_main_process() and len(per_rank_stats) > 1:
-                tokens = [s["tokens"] for s in per_rank_stats]
-                seconds = [s["seconds"] for s in per_rank_stats]
-                slowest = max(seconds)
-                fastest = min(seconds)
-                imbalance = (slowest - fastest) / max(slowest, 1e-6) * 100.0
-                logger.info(
-                    "Rollout per-rank stats: %s | slowest=%.1fs fastest=%.1fs "
-                    "imbalance=%.1f%% (idle GPU time)",
-                    ", ".join(
-                        f"rank{s['rank']}={s['trajs']}t/{s['tokens']}tok/{s['seconds']:.1f}s"
-                        for s in per_rank_stats
-                    ),
-                    slowest, fastest, imbalance,
-                )
-                if imbalance > 25.0:
-                    logger.warning(
-                        "Rank imbalance > 25%% — faster ranks idle while slowest "
-                        "rank finishes.  A larger rollouts-per-iter (or a "
-                        "single-GPU + vLLM rollout path) would amortise this."
-                    )
-
-            logger.info(
-                "[rank %d] Gathered %d rollouts from %d ranks",
-                get_rank(), len(combined), get_world_size(),
-            )
-            return combined
-
-        def _rank0_evaluate(tag: str) -> Dict[str, float]:
-            """
-            Run GSM8K eval on rank 0 and broadcast the result.  Every rank
-            must enter and exit the ``gather_params_for_generation`` context
-            together — it's a collective on the ZeRO-3 shards.
-            """
-            if not args.use_deepspeed:
-                return evaluate_policy(policy, tokenizer, config.eval_data_path)
-
-            results: Optional[Dict[str, float]] = None
-            with gather_params_for_generation(policy, value):
-                if is_main_process():
-                    logger.info("[rank 0] %s (gathered weights)", tag)
-                    results = evaluate_policy(
-                        policy, tokenizer, config.eval_data_path
-                    )
-            results = broadcast_object(results, src_rank=0)
-            return results or {"accuracy": 0.0, "correct": 0, "total": 0}
+        logger.info("Using single-GPU PPO trainer on %s", device)
+        ppo_trainer = PPOTrainer(
+            policy_model=policy,
+            value_model=value,
+            tokenizer=tokenizer,
+            learning_rate=config.learning_rate,
+            ppo_epochs=config.ppo_epochs,
+            batch_size=config.batch_size,
+            clip_range=config.clip_range,
+            clip_range_vf=config.clip_range_vf,
+            vf_coef=config.vf_coef,
+            ent_coef=config.ent_coef,
+            max_grad_norm=config.max_grad_norm,
+            target_kl=config.target_kl,
+        )
 
         if args.skip_initial_eval:
-            if is_main_process():
-                logger.info(
-                    "\n%s\nSKIPPING INITIAL EVALUATION (--skip-initial-eval)\n%s",
-                    "=" * 80, "=" * 80,
-                )
+            logger.info(
+                "\n%s\nSKIPPING INITIAL EVALUATION (--skip-initial-eval)\n%s",
+                "=" * 80, "=" * 80,
+            )
             initial_eval = {"accuracy": 0.0}
             best_accuracy = 0.0
         else:
-            if is_main_process():
-                logger.info(
-                    "\n%s\nINITIAL EVALUATION (Iteration 0)\n%s", "=" * 80, "=" * 80
-                )
-            initial_eval = _rank0_evaluate("Initial evaluation")
+            logger.info(
+                "\n%s\nINITIAL EVALUATION (Iteration 0)\n%s", "=" * 80, "=" * 80
+            )
+            initial_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
             best_accuracy = float(initial_eval.get("accuracy", 0.0))
-
-            if is_main_process() and logger_csv is not None:
-                logger_csv.log(
-                    {
-                        "eval/accuracy": initial_eval.get("accuracy", 0.0),
-                        "eval/correct": initial_eval.get("correct", 0),
-                        "eval/total": initial_eval.get("total", 0),
-                    },
-                    step=0,
-                )
+            logger_csv.log(
+                {
+                    "eval/accuracy": initial_eval.get("accuracy", 0.0),
+                    "eval/correct": initial_eval.get("correct", 0),
+                    "eval/total": initial_eval.get("total", 0),
+                },
+                step=0,
+            )
 
         for iteration in range(1, config.num_iterations + 1):
             iteration_start = time.perf_counter()
-            if is_main_process():
-                logger.info(
-                    "\n%s\nITERATION %d/%d\n%s",
-                    "=" * 80, iteration, config.num_iterations, "=" * 80,
-                )
+            logger.info(
+                "\n%s\nITERATION %d/%d\n%s",
+                "=" * 80, iteration, config.num_iterations, "=" * 80,
+            )
             current_phase = math_env.expert_panel.get_current_expert(
                 math_env.curriculum_manager.current_iteration
             )
-            if is_main_process():
-                logger.info(
-                    "Active expert phase: %s (%s)",
-                    current_phase.name, current_phase.description,
-                )
+            logger.info(
+                "Active expert phase: %s (%s)",
+                current_phase.name, current_phase.description,
+            )
 
             rollout_start = time.perf_counter()
-            trajectories = _collect_rollouts_this_iteration()
+            trajectories = math_env.collect_rollouts(
+                num_trajectories=config.num_rollouts_per_iter, verbose=True,
+            )
             rollout_seconds = time.perf_counter() - rollout_start
 
             pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
-            # Shared seed for PPO shuffle so every rank agrees on batch order;
-            # per-rank sharding happens inside PPOTrainerDeepSpeed.
             np.random.seed(base_seed + iteration)
             rollout_buffer = RolloutBuffer(
                 gamma=config.gamma,
@@ -812,27 +540,28 @@ def main():
             replay_stats = math_env.replay_buffer.get_buffer_stats(
                 current_iteration=math_env.curriculum_manager.current_iteration
             )
-            if is_main_process():
-                logger.info("Running PPO update...")
+
+            logger.info("Running PPO update...")
             train_start = time.perf_counter()
             training_metrics = ppo_trainer.train_step(rollout_buffer)
             train_seconds = time.perf_counter() - train_start
 
-            if is_main_process():
-                logger.info(
-                    "PPO update metrics: policy_loss=%.4f value_loss=%.4f "
-                    "entropy=%.4f approx_kl=%.4f clip_fraction=%.4f update_steps=%d",
-                    training_metrics["policy_loss"],
-                    training_metrics["value_loss"],
-                    training_metrics["entropy"],
-                    training_metrics["approx_kl"],
-                    training_metrics["clip_fraction"],
-                    int(training_metrics.get("update_steps", 0.0)),
-                )
+            logger.info(
+                "PPO update metrics: policy_loss=%.4f value_loss=%.4f "
+                "entropy=%.4f approx_kl=%.4f clip_fraction=%.4f update_steps=%d",
+                training_metrics["policy_loss"],
+                training_metrics["value_loss"],
+                training_metrics["entropy"],
+                training_metrics["approx_kl"],
+                training_metrics["clip_fraction"],
+                int(training_metrics.get("update_steps", 0.0)),
+            )
 
             eval_start = time.perf_counter()
             if iteration % config.eval_every == 0:
-                eval_results = _rank0_evaluate(f"Iteration {iteration} evaluation")
+                eval_results = evaluate_policy(
+                    policy, tokenizer, config.eval_data_path
+                )
                 best_accuracy = max(
                     best_accuracy, float(eval_results.get("accuracy", 0.0))
                 )
@@ -843,17 +572,12 @@ def main():
             save_start = time.perf_counter()
             cleanup_metrics = {"deleted_checkpoints": 0, "compressed_logs": 0}
             if iteration % config.save_every == 0:
-                # Every rank participates in save_checkpoint; the CheckpointManager
-                # delegates to trainer.save_checkpoint which does the right thing
-                # for both PPOTrainer and PPOTrainerDeepSpeed.
                 checkpoint_manager.save_checkpoint(
                     iteration=iteration, trainer=ppo_trainer
                 )
-                if is_main_process():
-                    cleanup_metrics = checkpoint_manager.cleanup_old_checkpoints(
-                        current_iteration=iteration
-                    )
-                barrier()
+                cleanup_metrics = checkpoint_manager.cleanup_old_checkpoints(
+                    current_iteration=iteration
+                )
             save_seconds = time.perf_counter() - save_start
 
             total_seconds = time.perf_counter() - iteration_start
@@ -869,168 +593,108 @@ def main():
                     * (config.max_question_tokens + 4 * config.max_solution_tokens)
                 ),
             }
-            if is_main_process():
-                throughput_metrics = training_monitor.log_iteration_timing(
-                    iteration=iteration, timings=timing_metrics
-                )
-                disk_metrics = training_monitor.check_disk_space()
-                gpu_metrics = training_monitor.log_gpu_utilization(
-                    gpu_ids=list(range(torch.cuda.device_count()))
-                )
-                total_s = max(timing_metrics["total_seconds"], 1e-6)
-                rollout_pct = 100.0 * timing_metrics["rollout_seconds"] / total_s
-                train_pct = 100.0 * timing_metrics["train_seconds"] / total_s
-                eval_pct = 100.0 * timing_metrics["eval_seconds"] / total_s
-                save_pct = 100.0 * timing_metrics["save_seconds"] / total_s
-                logger.info(
-                    "Timing breakdown: rollout=%.1fs (%.0f%%)  train=%.1fs (%.0f%%)  "
-                    "eval=%.1fs (%.0f%%)  save=%.1fs (%.0f%%)  total=%.1fs",
-                    timing_metrics["rollout_seconds"], rollout_pct,
-                    timing_metrics["train_seconds"], train_pct,
-                    timing_metrics["eval_seconds"], eval_pct,
-                    timing_metrics["save_seconds"], save_pct,
-                    timing_metrics["total_seconds"],
-                )
-
-                # Decision-support: is DeepSpeed paying its way?
-                if args.use_deepspeed:
-                    world = max(get_world_size(), 1)
-                    tokens_this_iter = timing_metrics.get("num_rollouts", 0.0) * (
-                        config.max_question_tokens + config.max_solution_tokens
-                    )
-                    rollout_tok_per_s = tokens_this_iter / max(
-                        timing_metrics["rollout_seconds"], 1e-6
-                    )
-                    verdict_bits: List[str] = []
-                    if rollout_pct > 80.0:
-                        verdict_bits.append(
-                            "rollout-bound (>80%) — DeepSpeed speeds the PPO "
-                            "update but NOT generation; consider vLLM or a "
-                            "single-GPU rollout + ZeRO-2 training split"
-                        )
-                    if training_metrics.get("update_steps", 0) == 0:
-                        verdict_bits.append(
-                            "0 PPO updates — likely hitting early-stop KL; "
-                            "training is not actually learning"
-                        )
-                    if train_pct < 5.0 and rollout_pct > 90.0:
-                        verdict_bits.append(
-                            "DeepSpeed's speed-up on training is invisible here"
-                        )
-                    util_vals = [
-                        v for k, v in (gpu_metrics or {}).items()
-                        if k.endswith("_utilization")
-                    ]
-                    if util_vals and max(util_vals) - min(util_vals) > 30.0:
-                        verdict_bits.append(
-                            f"GPU util spread {max(util_vals):.0f}%/{min(util_vals):.0f}% "
-                            "— ranks imbalanced; DS scaling inefficient"
-                        )
-                    logger.info(
-                        "Deep-dive: world_size=%d, est %.0f tok/s rollout, "
-                        "PPO update peak=%s, grad_norm=%s",
-                        world, rollout_tok_per_s,
-                        training_metrics.get("peak_mem_gb", "n/a"),
-                        training_metrics.get("mean_grad_norm", "n/a"),
-                    )
-                    if verdict_bits:
-                        logger.warning(
-                            "DEEPSPEED VERDICT (iter %d): %s",
-                            iteration, "  ||  ".join(verdict_bits),
-                        )
-                    else:
-                        logger.info(
-                            "DEEPSPEED VERDICT (iter %d): healthy — training "
-                            "happening, ranks balanced, memory OK",
-                            iteration,
-                        )
-
-                all_metrics = {
-                    "iteration": iteration,
-                    "buffer": buffer_stats,
-                    "curriculum": curriculum_stats,
-                    "training": training_metrics,
-                    "eval": eval_results,
-                    "timing": timing_metrics,
-                    "throughput": throughput_metrics,
-                    "disk": disk_metrics,
-                    "gpu": gpu_metrics,
-                    "checkpoint_cleanup": cleanup_metrics,
-                    "curriculum_state": math_env.curriculum_manager.get_curriculum_stats(),
-                    "replay_buffer": replay_stats,
-                    "rollout_mix": dict(math_env.last_rollout_mix),
-                    "replay_ratio": math_env.last_replay_ratio,
-                }
-                save_iteration_results(iteration, trajectories, all_metrics, config)
-
-                csv_metrics = {
-                    "iteration": iteration,
-                    "train/policy_loss": training_metrics["policy_loss"],
-                    "train/value_loss": training_metrics["value_loss"],
-                    "train/entropy": training_metrics["entropy"],
-                    "train/approx_kl": training_metrics["approx_kl"],
-                    "train/clip_fraction": training_metrics["clip_fraction"],
-                    "rollout/mean_reward": buffer_stats["mean_episode_reward"],
-                    "rollout/num_trajectories": len(trajectories),
-                    "rollout/mean_length": buffer_stats["mean_episode_length"],
-                    "curriculum/topic_diversity": curriculum_stats["topic_diversity"],
-                    "curriculum/avg_difficulty": curriculum_stats["avg_difficulty"],
-                    "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
-                    "curriculum/replay_ratio": math_env.last_replay_ratio,
-                    "perf/rollout_time": rollout_seconds,
-                    "perf/train_time": train_seconds,
-                    "perf/total_time": total_seconds,
-                    "perf/tokens_per_second": throughput_metrics.get(
-                        "tokens_per_second", 0.0
-                    ),
-                    "system/disk_free_gb": disk_metrics.get("free_gb", 0.0),
-                }
-                if eval_results:
-                    csv_metrics["eval/accuracy"] = eval_results.get("accuracy", 0.0)
-                    csv_metrics["eval/correct"] = eval_results.get("correct", 0)
-                    csv_metrics["eval/total"] = eval_results.get("total", 0)
-                if gpu_metrics:
-                    csv_metrics["system/gpu_util_percent"] = (
-                        sum(gpu_metrics.values()) / max(1, len(gpu_metrics))
-                    )
-
-                if logger_csv is not None:
-                    logger_csv.log(csv_metrics, step=iteration)
-
-            # Keep ranks in lockstep between iterations: without this a fast
-            # rank could start the next rollout while another is still saving.
-            barrier()
-
-        final_eval = _rank0_evaluate("Final evaluation")
-        if is_main_process():
+            throughput_metrics = training_monitor.log_iteration_timing(
+                iteration=iteration, timings=timing_metrics
+            )
+            disk_metrics = training_monitor.check_disk_space()
+            gpu_metrics = training_monitor.log_gpu_utilization(
+                gpu_ids=list(range(torch.cuda.device_count()))
+            )
+            total_s = max(timing_metrics["total_seconds"], 1e-6)
+            rollout_pct = 100.0 * timing_metrics["rollout_seconds"] / total_s
+            train_pct = 100.0 * timing_metrics["train_seconds"] / total_s
+            eval_pct = 100.0 * timing_metrics["eval_seconds"] / total_s
+            save_pct = 100.0 * timing_metrics["save_seconds"] / total_s
             logger.info(
-                "Training complete. Initial acc: %.2f%% | Final acc: %.2f%% | Delta: %.2f%%",
-                initial_eval.get("accuracy", 0.0) * 100.0,
-                final_eval.get("accuracy", 0.0) * 100.0,
-                (final_eval.get("accuracy", 0.0) - initial_eval.get("accuracy", 0.0))
-                * 100.0,
+                "Timing breakdown: rollout=%.1fs (%.0f%%)  train=%.1fs (%.0f%%)  "
+                "eval=%.1fs (%.0f%%)  save=%.1fs (%.0f%%)  total=%.1fs",
+                timing_metrics["rollout_seconds"], rollout_pct,
+                timing_metrics["train_seconds"], train_pct,
+                timing_metrics["eval_seconds"], eval_pct,
+                timing_metrics["save_seconds"], save_pct,
+                timing_metrics["total_seconds"],
             )
 
-            if logger_csv is not None:
-                logger_csv.save_summary(
-                    {
-                        "initial_accuracy": initial_eval.get("accuracy", 0.0),
-                        "final_accuracy": final_eval.get("accuracy", 0.0),
-                        "improvement": final_eval.get("accuracy", 0.0)
-                        - initial_eval.get("accuracy", 0.0),
-                        "best_accuracy": best_accuracy,
-                        "total_iterations": config.num_iterations,
-                        "console_output_path": str(console_log_path)
-                        if console_log_path
-                        else "",
-                    }
-                )
-                logger_csv.finish()
+            all_metrics = {
+                "iteration": iteration,
+                "buffer": buffer_stats,
+                "curriculum": curriculum_stats,
+                "training": training_metrics,
+                "eval": eval_results,
+                "timing": timing_metrics,
+                "throughput": throughput_metrics,
+                "disk": disk_metrics,
+                "gpu": gpu_metrics,
+                "checkpoint_cleanup": cleanup_metrics,
+                "curriculum_state": math_env.curriculum_manager.get_curriculum_stats(),
+                "replay_buffer": replay_stats,
+                "rollout_mix": dict(math_env.last_rollout_mix),
+                "replay_ratio": math_env.last_replay_ratio,
+            }
+            save_iteration_results(iteration, trajectories, all_metrics, config)
+
+            csv_metrics = {
+                "iteration": iteration,
+                "train/policy_loss": training_metrics["policy_loss"],
+                "train/value_loss": training_metrics["value_loss"],
+                "train/entropy": training_metrics["entropy"],
+                "train/approx_kl": training_metrics["approx_kl"],
+                "train/clip_fraction": training_metrics["clip_fraction"],
+                "rollout/mean_reward": buffer_stats["mean_episode_reward"],
+                "rollout/num_trajectories": len(trajectories),
+                "rollout/mean_length": buffer_stats["mean_episode_length"],
+                "curriculum/topic_diversity": curriculum_stats["topic_diversity"],
+                "curriculum/avg_difficulty": curriculum_stats["avg_difficulty"],
+                "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
+                "curriculum/replay_ratio": math_env.last_replay_ratio,
+                "perf/rollout_time": rollout_seconds,
+                "perf/train_time": train_seconds,
+                "perf/total_time": total_seconds,
+                "perf/tokens_per_second": throughput_metrics.get(
+                    "tokens_per_second", 0.0
+                ),
+                "system/disk_free_gb": disk_metrics.get("free_gb", 0.0),
+            }
+            if eval_results:
+                csv_metrics["eval/accuracy"] = eval_results.get("accuracy", 0.0)
+                csv_metrics["eval/correct"] = eval_results.get("correct", 0)
+                csv_metrics["eval/total"] = eval_results.get("total", 0)
+            if gpu_metrics:
+                util_vals = [
+                    v for k, v in gpu_metrics.items() if k.endswith("_utilization")
+                ]
+                if util_vals:
+                    csv_metrics["system/gpu_util_percent"] = (
+                        sum(util_vals) / len(util_vals)
+                    )
+
+            logger_csv.log(csv_metrics, step=iteration)
+
+        final_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
+        logger.info(
+            "Training complete. Initial acc: %.2f%% | Final acc: %.2f%% | Delta: %.2f%%",
+            initial_eval.get("accuracy", 0.0) * 100.0,
+            final_eval.get("accuracy", 0.0) * 100.0,
+            (final_eval.get("accuracy", 0.0) - initial_eval.get("accuracy", 0.0))
+            * 100.0,
+        )
+
+        logger_csv.save_summary(
+            {
+                "initial_accuracy": initial_eval.get("accuracy", 0.0),
+                "final_accuracy": final_eval.get("accuracy", 0.0),
+                "improvement": final_eval.get("accuracy", 0.0)
+                - initial_eval.get("accuracy", 0.0),
+                "best_accuracy": best_accuracy,
+                "total_iterations": config.num_iterations,
+                "console_output_path": str(console_log_path),
+            }
+        )
+        logger_csv.finish()
     finally:
-        if console_log_file is not None:
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
-            console_log_file.close()
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        console_log_file.close()
 
 
 if __name__ == "__main__":

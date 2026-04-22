@@ -56,9 +56,8 @@ class TripleVerifier:
             temperature: Sampling temperature (0.5 = moderate consensus, was 0.7)
             top_p: Nucleus sampling parameter
             max_tokens: Maximum tokens per solution
-            device: Optional explicit compute device.  Needed under DeepSpeed
-                ZeRO-3 where ``next(model.parameters()).device`` may point at
-                CPU (offloaded) even though we want generation on the GPU.
+            device: Optional explicit compute device.  Defaults to the
+                device of ``model``'s first parameter.
         """
         self.model = model
         self.tokenizer = tokenizer
