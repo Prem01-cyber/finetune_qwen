@@ -182,13 +182,9 @@ class PPOTrainerDeepSpeed:
                 # Policy update (DeepSpeed ZeRO-3 with offload)
                 policy_objective = policy_loss - self.ent_coef * entropy
                 
-                # For ZeRO-3, use engine.backward() which handles param gathering
-                # If backward method doesn't exist, fall back to standard backward
-                if hasattr(self.policy_engine, 'backward'):
-                    self.policy_engine.backward(policy_objective)
-                else:
-                    policy_objective.backward()
-                
+                # For ZeRO-3 offload: standard backward, then engine.step()
+                # engine.backward() doesn't work with DeepSpeedZeRoOffload
+                policy_objective.backward()
                 self.policy_engine.step()
                 
                 # Value update (standard PyTorch)
