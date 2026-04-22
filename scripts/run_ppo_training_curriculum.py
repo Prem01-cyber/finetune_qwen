@@ -165,8 +165,16 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
                 tokenizer.chat_template = base_tokenizer.chat_template
 
         if is_main_process or not use_deepspeed:
+            # Workaround for PEFT tensor parallel import bug in distributed context
+            # Temporarily mock the missing module
+            import sys
+            import types
+            if 'transformers.integrations.tensor_parallel' not in sys.modules:
+                logger.info("Creating mock transformers.integrations.tensor_parallel to work around PEFT bug")
+                mock_module = types.ModuleType('tensor_parallel')
+                sys.modules['transformers.integrations.tensor_parallel'] = mock_module
+            
             # Load and merge adapter (only on rank 0 for DeepSpeed)
-            # Always use device_map="auto" to avoid PEFT tensor parallel bug
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
                 torch_dtype=torch.bfloat16,
@@ -394,10 +402,10 @@ def main():
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank used by DeepSpeed launcher")
     args = parser.parse_args()
 
+    # NOTE: Do NOT initialize distributed here if using adapters
+    # We need to load/merge adapters before distributed init to avoid PEFT tensor parallel bug
     if args.use_deepspeed and args.local_rank >= 0:
         torch.cuda.set_device(args.local_rank)
-    if args.use_deepspeed and not torch.distributed.is_initialized():
-        deepspeed.init_distributed()
 
     config = CurriculumTrainingConfig()
     config.base_model = args.base_model
