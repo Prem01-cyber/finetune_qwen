@@ -1,29 +1,56 @@
 """
 PPO training with curriculum-guided dual-task rewards.
+
+Single entry point for both single-GPU and multi-GPU (DeepSpeed ZeRO-3) runs.
+
+    # Single GPU
+    python scripts/run_ppo_training_curriculum.py --base-model checkpoints/dual_task_v1
+
+    # Multi-GPU (N GPUs)
+    deepspeed --num_gpus=N scripts/run_ppo_training_curriculum.py \\
+        --use-deepspeed --base-model checkpoints/dual_task_v1
+
+Under DeepSpeed, each rank loads the merged weights, ZeRO-3 shards them across
+ranks, and rollouts are collected *data-parallel* with a temporary
+``GatheredParameters`` context.  PPO updates then shard mini-batches across
+ranks and DeepSpeed's built-in gradient all-reduce stitches them back together.
 """
 
 import argparse
 import json
 import logging
 import os
+import random
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
-import deepspeed
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.eval_sft_inference import evaluate_gsm8k
-from src.rl.math_environment_curriculum import CurriculumMathEnvironment
 from src.rl.checkpoint_manager import CheckpointManager
-from src.rl.ppo_trainer_deepspeed import PPOTrainerDeepSpeed
+from src.rl.deepspeed_utils import (
+    all_gather_objects,
+    barrier,
+    broadcast_object,
+    current_cuda_device,
+    gather_params_for_generation,
+    get_local_rank,
+    get_rank,
+    get_world_size,
+    is_main_process,
+    my_share,
+)
+from src.rl.math_environment_curriculum import CurriculumMathEnvironment
 from src.rl.ppo_trainer import PPOTrainer
+from src.rl.ppo_trainer_deepspeed import PPOTrainerDeepSpeed
 from src.rl.rollout_buffer import RolloutBuffer
 from src.rl.training_monitor import TrainingMonitor
 from src.rl.value_network import ValueHead
@@ -52,27 +79,25 @@ class TeeStream:
     def flush(self) -> None:
         self.primary.flush()
         self.secondary.flush()
-    
+
     def isatty(self) -> bool:
-        """Check if primary stream is a TTY (for colored output detection)."""
-        return getattr(self.primary, 'isatty', lambda: False)()
-    
+        return getattr(self.primary, "isatty", lambda: False)()
+
     def fileno(self) -> int:
-        """Return file descriptor of primary stream."""
         return self.primary.fileno()
 
 
 class CurriculumTrainingConfig:
     base_model = "checkpoints/dual_task_v1"
-    learning_rate = 1e-6  # Reduced from 5e-6 for more conservative updates on specialized model
-    ppo_epochs = 3  # Increased from 2 to allow more gradient steps per batch
+    learning_rate = 1e-6
+    ppo_epochs = 3
     batch_size = 32
-    clip_range = 0.3  # Increased from 0.25 to allow larger policy updates
-    clip_range_vf = 0.25  # Increased proportionally with clip_range
+    clip_range = 0.3
+    clip_range_vf = 0.25
     vf_coef = 0.5
-    ent_coef = 0.02  # Doubled from 0.01 to encourage more exploration
-    max_grad_norm = 0.5  # Reduced from 1.0 to prevent large gradient updates
-    target_kl = 0.15  # Increased from 0.08 to allow more policy divergence for specialized models
+    ent_coef = 0.02
+    max_grad_norm = 0.5
+    target_kl = 0.15
 
     gamma = 1.0
     gae_lambda = 0.95
@@ -82,19 +107,12 @@ class CurriculumTrainingConfig:
     max_solution_tokens = 500
     temperature = 0.7
     top_p = 0.9
-    consensus_temperature = 0.5  # Lowered from 0.7 for higher consensus rate
+    consensus_temperature = 0.5
 
     num_iterations = 10
-    eval_every = 5  # Reduced from 1 to save 80% of eval time
+    eval_every = 5
     save_every = 1
-    use_torch_compile = True  # Enable torch.compile for faster inference
-    use_multi_gpu_rollouts = True
-    use_vllm_rollouts = False
-    num_rollout_gpus: Optional[int] = None
-    rollout_batch_size = 16
-    vllm_tensor_parallel_size = 1
-    vllm_gpu_memory_utilization = 0.85
-    worker_timeout_seconds = 900.0
+    use_torch_compile = True
 
     output_dir = "checkpoints/ppo_training_curriculum"
     curriculum_checkpoint_dir = "checkpoints/ppo_training_curriculum/curriculum"
@@ -105,8 +123,7 @@ class CurriculumTrainingConfig:
     checkpoint_keep_last = 2
     checkpoint_keep_every = 100
     compress_old_logs = True
-    
-    # Logging
+
     log_dir = "logs"
     run_name = None
 
@@ -137,197 +154,116 @@ def load_reference_questions(path: str) -> List[str]:
     return questions
 
 
-def log_gpu_memory(stage: str):
-    """Log current GPU memory usage."""
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            allocated = torch.cuda.memory_allocated(i) / (1024**3)
-            reserved = torch.cuda.memory_reserved(i) / (1024**3)
-            total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
-            logger.info(
-                f"[{stage}] GPU {i}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, "
-                f"{total:.2f}GB total ({allocated/total*100:.1f}% used)"
-            )
+def log_gpu_memory(stage: str) -> None:
+    if not torch.cuda.is_available():
+        return
+    for i in range(torch.cuda.device_count()):
+        allocated = torch.cuda.memory_allocated(i) / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved(i) / (1024 ** 3)
+        total = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
+        logger.info(
+            "[%s] GPU %d: %.2fGB allocated, %.2fGB reserved, %.2fGB total (%.1f%% used)",
+            stage, i, allocated, reserved, total, allocated / total * 100,
+        )
 
 
-def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = False, max_gpu_memory_utilization: float = 0.15):
+def _ensure_peft_tensor_parallel_shim() -> None:
+    """
+    PEFT <= 0.12 unconditionally imports
+    ``transformers.integrations.tensor_parallel`` on attribute lookup.  Older
+    transformers versions don't ship that module and the import crashes under
+    torchrun/deepspeed.  Install a harmless stub to unblock the merge path.
+    """
+    import sys as _sys
+    import types
+
+    if "transformers.integrations.tensor_parallel" not in _sys.modules:
+        _sys.modules["transformers.integrations.tensor_parallel"] = types.ModuleType(
+            "tensor_parallel"
+        )
+
+
+def initialize_models(
+    config: CurriculumTrainingConfig,
+    use_deepspeed: bool = False,
+):
+    """
+    Load the policy, value network and tokenizer.
+
+    Single-GPU: models go straight to cuda:0.
+    DeepSpeed:  models stay on CPU until ``deepspeed.initialize`` shards them
+                across ranks.  Every rank has to perform this load (ZeRO-3
+                requires initialised weights on every rank to partition them).
+    """
     model_path = Path(config.base_model)
     is_adapter = (model_path / "adapter_config.json").exists()
-    
-    # For DeepSpeed, only rank 0 loads the model to avoid PEFT distributed issues
-    is_main_process = not use_deepspeed or int(os.environ.get("LOCAL_RANK", "0")) == 0
-    
-    log_gpu_memory("Before model loading")
 
     if is_adapter:
-        logger.info("Detected LoRA adapter at: %s", config.base_model)
         meta_file = model_path / "pipeline_meta.json"
         if meta_file.exists():
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
             base_model_name = meta.get("base_model", "Qwen/Qwen2.5-Math-1.5B-Instruct")
         else:
             base_model_name = "Qwen/Qwen2.5-Math-1.5B-Instruct"
-
-        tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        # Ensure chat template is set - load from base model if needed
-        if tokenizer.chat_template is None:
-            logger.info("Chat template not found in adapter, loading from base model")
-            base_tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
-            if base_tokenizer.chat_template is not None:
-                tokenizer.chat_template = base_tokenizer.chat_template
-
-        if is_main_process or not use_deepspeed:
-            # Workaround for PEFT tensor parallel import bug in distributed context
-            # Temporarily mock the missing module
-            import sys
-            import types
-            if 'transformers.integrations.tensor_parallel' not in sys.modules:
-                logger.info("Creating mock transformers.integrations.tensor_parallel to work around PEFT bug")
-                mock_module = types.ModuleType('tensor_parallel')
-                sys.modules['transformers.integrations.tensor_parallel'] = mock_module
-            
-            # Load and merge adapter (only on rank 0 for DeepSpeed)
-            if use_deepspeed:
-                # For DeepSpeed: load directly on CPU, never touch GPU
-                logger.info("Loading model on CPU for DeepSpeed (0% GPU allocation)")
-                base_model = AutoModelForCausalLM.from_pretrained(
-                    base_model_name,
-                    torch_dtype=torch.bfloat16,
-                    device_map={"": "cpu"},
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=True,
-                )
-                log_gpu_memory("After base model loading on CPU")
-                
-                policy = PeftModel.from_pretrained(base_model, config.base_model)
-                policy = policy.merge_and_unload()
-                log_gpu_memory("After adapter merge on CPU")
-            else:
-                # For standard training: load on GPU with controlled memory
-                max_memory = {}
-                for i in range(torch.cuda.device_count()):
-                    total_memory = torch.cuda.get_device_properties(i).total_memory
-                    max_memory[i] = int(total_memory * max_gpu_memory_utilization)
-                max_memory["cpu"] = "100GB"
-                
-                target_memory_gb = max_memory[0] / (1024**3)
-                logger.info(
-                    "Loading model with %.1f%% GPU memory limit (~%.1f GB on GPU 0)",
-                    max_gpu_memory_utilization * 100,
-                    target_memory_gb,
-                )
-                
-                base_model = AutoModelForCausalLM.from_pretrained(
-                    base_model_name,
-                    torch_dtype=torch.bfloat16,
-                    device_map={"": "cpu"},
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=True,
-                )
-                base_model = base_model.to("cuda:0")
-                log_gpu_memory("After base model loading")
-                
-                policy = PeftModel.from_pretrained(base_model, config.base_model)
-                policy = policy.merge_and_unload()
-                log_gpu_memory("After adapter merge")
-        else:
-            # Non-main ranks: load base architecture without weights (DeepSpeed will sync)
-            logger.info("Rank %s: Loading model architecture only", os.environ.get("LOCAL_RANK"))
-            from transformers import AutoConfig
-            config_obj = AutoConfig.from_pretrained(base_model_name, trust_remote_code=True)
-            policy = AutoModelForCausalLM.from_config(config_obj, torch_dtype=torch.bfloat16)
-
-        # ValueHead: load on CPU for DeepSpeed (never touch GPU), load on GPU for standard
-        if use_deepspeed:
-            logger.info("Loading ValueHead on CPU for DeepSpeed (0% GPU allocation)")
-            value = ValueHead(base_model_name, model_device_map={"": "cpu"})
-            log_gpu_memory("After ValueHead loading on CPU")
-        else:
-            logger.info("Loading ValueHead on GPU with controlled memory")
-            value = ValueHead(base_model_name, model_device_map={"": "cpu"})
-            value.backbone = value.backbone.to("cuda:0")
-            value.value_head = value.value_head.to("cuda:0")
-            log_gpu_memory("After ValueHead loading on GPU")
     else:
-        logger.info("Loading full model: %s", config.base_model)
-        tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        if is_main_process or not use_deepspeed:
-            if use_deepspeed:
-                # For DeepSpeed: load on CPU only
-                logger.info("Loading full model on CPU for DeepSpeed (0% GPU allocation)")
-                policy = AutoModelForCausalLM.from_pretrained(
-                    config.base_model,
-                    torch_dtype=torch.bfloat16,
-                    device_map={"": "cpu"},
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=True,
-                )
-                log_gpu_memory("After full model loading on CPU")
-            else:
-                # For standard training: load on GPU with controlled memory
-                max_memory = {}
-                for i in range(torch.cuda.device_count()):
-                    total_memory = torch.cuda.get_device_properties(i).total_memory
-                    max_memory[i] = int(total_memory * max_gpu_memory_utilization)
-                max_memory["cpu"] = "100GB"
-                
-                target_memory_gb = max_memory[0] / (1024**3)
-                logger.info(
-                    "Loading model with %.1f%% GPU memory limit (~%.1f GB on GPU 0)",
-                    max_gpu_memory_utilization * 100,
-                    target_memory_gb,
-                )
-                
-                policy = AutoModelForCausalLM.from_pretrained(
-                    config.base_model,
-                    torch_dtype=torch.bfloat16,
-                    device_map={"": "cpu"},
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=True,
-                )
-                policy = policy.to("cuda:0")
-                log_gpu_memory("After model loading")
-        else:
-            # Non-main ranks: load architecture only
-            logger.info("Rank %s: Loading model architecture only", os.environ.get("LOCAL_RANK"))
-            from transformers import AutoConfig
-            config_obj = AutoConfig.from_pretrained(config.base_model, trust_remote_code=True)
-            policy = AutoModelForCausalLM.from_config(config_obj, torch_dtype=torch.bfloat16)
-        
-        # ValueHead: load on CPU for DeepSpeed, GPU for standard
-        if use_deepspeed:
-            logger.info("Loading ValueHead on CPU for DeepSpeed (0% GPU allocation)")
-            value = ValueHead(config.base_model, model_device_map={"": "cpu"})
-            log_gpu_memory("After ValueHead loading on CPU")
-        else:
-            logger.info("Loading ValueHead on GPU with controlled memory")
-            value = ValueHead(config.base_model, model_device_map={"": "cpu"})
-            value.backbone = value.backbone.to("cuda:0")
-            value.value_head = value.value_head.to("cuda:0")
-            log_gpu_memory("After ValueHead loading on GPU")
+        base_model_name = config.base_model
 
-    policy_device = getattr(policy, "device", "sharded")
-    logger.info("Policy loaded on device: %s", policy_device)
-    
-    # Disable torch.compile when using VLLM (inference tensors incompatible with CUDA graphs)
-    if use_deepspeed:
-        logger.info("Skipping torch.compile when DeepSpeed training is enabled")
-    elif config.use_torch_compile and not config.use_vllm_rollouts:
+    log_gpu_memory("Before model loading")
+
+    tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.chat_template is None and is_adapter:
+        logger.info("Chat template not found in adapter, loading from base model")
+        base_tokenizer = AutoTokenizer.from_pretrained(
+            base_model_name, trust_remote_code=True
+        )
+        if base_tokenizer.chat_template is not None:
+            tokenizer.chat_template = base_tokenizer.chat_template
+
+    _ensure_peft_tensor_parallel_shim()
+
+    # --- Policy --------------------------------------------------------
+    if is_adapter:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            torch_dtype=torch.bfloat16,
+            device_map={"": "cpu"},
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        policy = PeftModel.from_pretrained(base_model, config.base_model).merge_and_unload()
+    else:
+        policy = AutoModelForCausalLM.from_pretrained(
+            config.base_model,
+            torch_dtype=torch.bfloat16,
+            device_map={"": "cpu"},
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+
+    if not use_deepspeed:
+        policy = policy.to("cuda:0")
+        log_gpu_memory("After policy loaded on GPU 0")
+    else:
+        log_gpu_memory("After policy loaded on CPU (pre-DeepSpeed)")
+
+    # --- Value network -------------------------------------------------
+    value = ValueHead(base_model_name, model_device_map={"": "cpu"})
+    if not use_deepspeed:
+        value.backbone = value.backbone.to("cuda:0")
+        value.value_head = value.value_head.to("cuda:0")
+    log_gpu_memory("After ValueHead loaded")
+
+    # torch.compile conflicts with DeepSpeed's ZeRO-3 pre/post-forward hooks,
+    # so only enable it for the single-process path.
+    if not use_deepspeed and config.use_torch_compile:
         try:
-            logger.info("Compiling policy model with torch.compile (may take 2-3 min on first run)...")
+            logger.info("Compiling policy with torch.compile (may take 2-3 min)")
             policy = torch.compile(policy, mode="reduce-overhead")
-            logger.info("Policy model compiled successfully")
-        except Exception as e:
-            logger.warning("torch.compile failed: %s. Continuing without compilation.", e)
-    elif config.use_vllm_rollouts:
-        logger.info("Skipping torch.compile (incompatible with VLLM inference mode tensors)")
-    
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("torch.compile failed: %s. Continuing without.", exc)
+
     return policy, value, tokenizer
 
 
@@ -353,16 +289,16 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
     topic_successes: Dict[str, int] = {}
     topic_difficulty: Dict[str, List[float]] = {}
 
-    topic_match_scores = []
-    difficulty_match_scores = []
-    clarity_scores = []
-    solvability_scores = []
-    novelty_scores = []
-    question_rewards = []
-    solution_rewards = []
-    combined_rewards = []
-    pre_expert_rewards = []
-    expert_modifiers = []
+    topic_match_scores: List[float] = []
+    difficulty_match_scores: List[float] = []
+    clarity_scores: List[float] = []
+    solvability_scores: List[float] = []
+    novelty_scores: List[float] = []
+    question_rewards: List[float] = []
+    solution_rewards: List[float] = []
+    combined_rewards: List[float] = []
+    pre_expert_rewards: List[float] = []
+    expert_modifiers: List[float] = []
     expert_phase_counts: Dict[str, int] = {}
     source_counts: Dict[str, int] = {}
     replay_added_count = 0
@@ -371,18 +307,26 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
         meta = trajectory.metadata
         topic = str(meta["target_topic"])
         topic_counts[topic] = topic_counts.get(topic, 0) + 1
-        topic_successes[topic] = topic_successes.get(topic, 0) + int(meta["consensus_achieved"] and meta["primary_matches_majority"])
-        topic_difficulty.setdefault(topic, []).append(float(meta["estimated_difficulty"]))
+        topic_successes[topic] = topic_successes.get(topic, 0) + int(
+            meta["consensus_achieved"] and meta["primary_matches_majority"]
+        )
+        topic_difficulty.setdefault(topic, []).append(
+            float(meta["estimated_difficulty"])
+        )
 
         topic_match_scores.append(float(meta["topic_match_score"]))
-        difficulty_match_scores.append(1.0 - abs(float(meta["estimated_difficulty"]) - float(meta["target_difficulty"])))
+        difficulty_match_scores.append(
+            1.0 - abs(float(meta["estimated_difficulty"]) - float(meta["target_difficulty"]))
+        )
         clarity_scores.append(float(meta["clarity_score"]))
         solvability_scores.append(1.0 if bool(meta["sympy_verified"]) else 0.0)
         novelty_scores.append(float(meta["novelty_scores"]["combined"]))
         question_rewards.append(float(meta["question_reward"]))
         solution_rewards.append(float(meta["solution_reward"]))
         combined_rewards.append(float(meta["combined_reward"]))
-        pre_expert_rewards.append(float(meta.get("pre_expert_reward", meta["combined_reward"])))
+        pre_expert_rewards.append(
+            float(meta.get("pre_expert_reward", meta["combined_reward"]))
+        )
         expert_modifiers.append(float(meta.get("expert_reward_modifier", 0.0)))
         phase = str(meta.get("expert_phase", "unknown"))
         expert_phase_counts[phase] = expert_phase_counts.get(phase, 0) + 1
@@ -399,51 +343,52 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
         for topic, values in topic_difficulty.items()
     }
 
+    def _mean_reward_for(source: str) -> float:
+        vals = [
+            float(t.metadata["combined_reward"])
+            for t in trajectories
+            if str(t.metadata.get("rollout_source", "fresh")) == source
+        ]
+        return float(sum(vals) / max(1, len(vals)))
+
     return {
         "topics_in_sweet_spot": len(
-            [
-                topic
-                for topic, success in per_topic_success.items()
-                if 0.4 <= success <= 0.7
-            ]
+            [s for s in per_topic_success.values() if 0.4 <= s <= 0.7]
         ),
-        "avg_difficulty": float(sum(difficulty_match_scores) / max(1, len(difficulty_match_scores))),
+        "avg_difficulty": float(
+            sum(difficulty_match_scores) / max(1, len(difficulty_match_scores))
+        ),
         "topic_diversity": len(topic_counts),
         "per_topic_success": per_topic_success,
         "per_topic_difficulty": per_topic_difficulty,
         "avg_topic_match": float(sum(topic_match_scores) / max(1, len(topic_match_scores))),
-        "avg_difficulty_match": float(sum(difficulty_match_scores) / max(1, len(difficulty_match_scores))),
+        "avg_difficulty_match": float(
+            sum(difficulty_match_scores) / max(1, len(difficulty_match_scores))
+        ),
         "avg_clarity": float(sum(clarity_scores) / max(1, len(clarity_scores))),
         "avg_solvability": float(sum(solvability_scores) / max(1, len(solvability_scores))),
         "avg_novelty": float(sum(novelty_scores) / max(1, len(novelty_scores))),
         "avg_question_reward": float(sum(question_rewards) / max(1, len(question_rewards))),
         "avg_solution_reward": float(sum(solution_rewards) / max(1, len(solution_rewards))),
         "avg_combined_reward": float(sum(combined_rewards) / max(1, len(combined_rewards))),
-        "avg_pre_expert_reward": float(sum(pre_expert_rewards) / max(1, len(pre_expert_rewards))),
+        "avg_pre_expert_reward": float(
+            sum(pre_expert_rewards) / max(1, len(pre_expert_rewards))
+        ),
         "avg_expert_modifier": float(sum(expert_modifiers) / max(1, len(expert_modifiers))),
         "expert_phase_counts": expert_phase_counts,
         "source_counts": source_counts,
         "replay_added_count": replay_added_count,
-        "fresh_mean_reward": float(
-            sum(
-                float(t.metadata["combined_reward"])
-                for t in trajectories
-                if str(t.metadata.get("rollout_source", "fresh")) == "fresh"
-            )
-            / max(1, sum(1 for t in trajectories if str(t.metadata.get("rollout_source", "fresh")) == "fresh"))
-        ),
-        "replay_mean_reward": float(
-            sum(
-                float(t.metadata["combined_reward"])
-                for t in trajectories
-                if str(t.metadata.get("rollout_source", "fresh")) == "replay"
-            )
-            / max(1, sum(1 for t in trajectories if str(t.metadata.get("rollout_source", "fresh")) == "replay"))
-        ),
+        "fresh_mean_reward": _mean_reward_for("fresh"),
+        "replay_mean_reward": _mean_reward_for("replay"),
     }
 
 
-def save_iteration_results(iteration: int, trajectories: List, metrics: Dict[str, object], config: CurriculumTrainingConfig) -> None:
+def save_iteration_results(
+    iteration: int,
+    trajectories: List,
+    metrics: Dict[str, object],
+    config: CurriculumTrainingConfig,
+) -> None:
     output_dir = Path(config.output_dir) / f"iteration_{iteration:03d}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -457,50 +402,80 @@ def save_iteration_results(iteration: int, trajectories: List, metrics: Dict[str
             }
             handle.write(json.dumps(payload) + "\n")
 
-    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    (output_dir / "metrics.json").write_text(
+        json.dumps(metrics, indent=2), encoding="utf-8"
+    )
+
+
+def _move_trajectories_to_cpu(trajectories: List) -> None:
+    """
+    Detach rollout tensors to CPU before cross-rank pickling.
+
+    all_gather_object serialises the tensors with their original device, so a
+    tensor produced on rank 0's ``cuda:0`` is revived on rank 1 as ``cuda:0`` —
+    which is a *different* physical GPU than rank 1's own ``cuda:1``.  Moving
+    to CPU first lets the PPO trainer do an unambiguous ``.to(self.device)``.
+    """
+    for traj in trajectories:
+        for trans in traj.transitions:
+            trans.state.input_ids = trans.state.input_ids.detach().cpu()
+            trans.state.attention_mask = trans.state.attention_mask.detach().cpu()
+            if trans.next_state is not None:
+                trans.next_state.input_ids = trans.next_state.input_ids.detach().cpu()
+                trans.next_state.attention_mask = (
+                    trans.next_state.attention_mask.detach().cpu()
+                )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train PPO with curriculum-guided dual-task rewards")
+    parser = argparse.ArgumentParser(
+        description="Train PPO with curriculum-guided dual-task rewards"
+    )
     parser.add_argument("--base-model", type=str, default="checkpoints/dual_task_v1")
-    parser.add_argument("--output-dir", type=str, default="checkpoints/ppo_training_curriculum")
+    parser.add_argument(
+        "--output-dir", type=str, default="checkpoints/ppo_training_curriculum"
+    )
     parser.add_argument("--num-iterations", type=int, default=10)
     parser.add_argument("--rollouts-per-iter", type=int, default=100)
-    parser.add_argument("--eval-data-path", type=str, default="data/sft/dual_task_val.jsonl")
-    parser.add_argument("--gsm8k-reference-data", type=str, default="data/sft/gsm8k_sft.jsonl")
+    parser.add_argument(
+        "--eval-data-path", type=str, default="data/sft/dual_task_val.jsonl"
+    )
+    parser.add_argument(
+        "--gsm8k-reference-data", type=str, default="data/sft/gsm8k_sft.jsonl"
+    )
     parser.add_argument("--skip-initial-eval", action="store_true")
-    parser.add_argument("--disable-multi-gpu-rollouts", action="store_true")
-    parser.add_argument("--use-vllm-rollouts", action="store_true")
-    parser.add_argument("--num-rollout-gpus", type=int, default=None)
-    parser.add_argument("--rollout-batch-size", type=int, default=16)
-    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.85)
-    parser.add_argument("--worker-timeout-seconds", type=float, default=900.0)
     parser.add_argument("--disk-warning-gb", type=float, default=5.0)
     parser.add_argument("--checkpoint-keep-last", type=int, default=2)
     parser.add_argument("--checkpoint-keep-every", type=int, default=100)
     parser.add_argument("--no-compress-old-logs", action="store_true")
-    parser.add_argument("--run-name", type=str, default=None, help="Optional run name for logging")
-    parser.add_argument("--use-deepspeed", action="store_true", help="Enable DeepSpeed ZeRO-3 training")
+    parser.add_argument(
+        "--run-name", type=str, default=None, help="Optional run name for logging"
+    )
+    parser.add_argument(
+        "--use-deepspeed",
+        action="store_true",
+        help="Enable DeepSpeed ZeRO-3 multi-GPU training",
+    )
     parser.add_argument(
         "--deepspeed-config",
         type=str,
         default="configs/deepspeed_zero3_rl.json",
         help="Path to DeepSpeed config JSON",
     )
-    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank used by DeepSpeed launcher")
     parser.add_argument(
-        "--max-gpu-memory-utilization",
-        type=float,
-        default=0.15,
-        help="Max GPU memory fraction for model loading (e.g., 0.15 = 15%%, ignored when using DeepSpeed)",
+        "--local_rank", type=int, default=-1,
+        help="Local rank set by the DeepSpeed launcher",
     )
     args = parser.parse_args()
 
-    # NOTE: Do NOT initialize distributed here if using adapters
-    # We need to load/merge adapters before distributed init to avoid PEFT tensor parallel bug
-    if args.use_deepspeed and args.local_rank >= 0:
-        torch.cuda.set_device(args.local_rank)
+    # -----------------------------------------------------------------
+    # DeepSpeed launcher hygiene: pin this process to its local GPU
+    # *before* any CUDA allocation so deepspeed.initialize() lays params
+    # out on the right device.
+    # -----------------------------------------------------------------
+    if args.use_deepspeed and torch.cuda.is_available():
+        local_rank = args.local_rank if args.local_rank >= 0 else get_local_rank()
+        torch.cuda.set_device(local_rank)
 
     config = CurriculumTrainingConfig()
     config.base_model = args.base_model
@@ -511,42 +486,53 @@ def main():
     config.gsm8k_reference_data = args.gsm8k_reference_data
     config.curriculum_checkpoint_dir = str(Path(args.output_dir) / "curriculum")
     config.run_name = args.run_name
-    config.use_multi_gpu_rollouts = not args.disable_multi_gpu_rollouts
-    config.use_vllm_rollouts = args.use_vllm_rollouts
-    config.num_rollout_gpus = args.num_rollout_gpus
-    config.rollout_batch_size = max(1, int(args.rollout_batch_size))
-    config.vllm_tensor_parallel_size = max(1, int(args.vllm_tensor_parallel_size))
-    config.vllm_gpu_memory_utilization = float(args.vllm_gpu_memory_utilization)
-    config.worker_timeout_seconds = float(args.worker_timeout_seconds)
     config.disk_warning_gb = float(args.disk_warning_gb)
     config.checkpoint_keep_last = max(1, int(args.checkpoint_keep_last))
     config.checkpoint_keep_every = max(1, int(args.checkpoint_keep_every))
     config.compress_old_logs = not args.no_compress_old_logs
 
-    # Initialize CSV logger
-    logger_csv = CSVLogger(
-        project="ppo-curriculum",
-        run_name=config.run_name or f"curriculum_{datetime.now():%Y%m%d_%H%M%S}",
-        log_dir=config.log_dir,
-        config=vars(config),
-        log_detailed=True,
-    )
-    console_log_path = Path(logger_csv.log_path) / "console_output.log"
-    console_log_file = console_log_path.open("a", encoding="utf-8", buffering=1)
+    # Deterministic but per-rank seeding so every rank samples a different
+    # slice of rollouts (true data parallelism) while still being reproducible.
+    base_seed = 1234
+    random.seed(base_seed + get_rank())
+    np.random.seed(base_seed + get_rank())
+    torch.manual_seed(base_seed)
+
+    # CSV logger and stdout tee live on rank 0 only.  Other ranks keep their
+    # stdout so tracebacks still surface.
+    logger_csv = None
+    console_log_file = None
     original_stdout = sys.stdout
     original_stderr = sys.stderr
-    sys.stdout = TeeStream(original_stdout, console_log_file)
-    sys.stderr = TeeStream(original_stderr, console_log_file)
-    logger.info("Full console output is being captured at %s", console_log_path)
+    console_log_path: Optional[Path] = None
+    if is_main_process():
+        logger_csv = CSVLogger(
+            project="ppo-curriculum",
+            run_name=config.run_name or f"curriculum_{datetime.now():%Y%m%d_%H%M%S}",
+            log_dir=config.log_dir,
+            config=vars(config),
+            log_detailed=True,
+        )
+        console_log_path = Path(logger_csv.log_path) / "console_output.log"
+        console_log_file = console_log_path.open("a", encoding="utf-8", buffering=1)
+        sys.stdout = TeeStream(original_stdout, console_log_file)
+        sys.stderr = TeeStream(original_stderr, console_log_file)
+        logger.info("Full console output is being captured at %s", console_log_path)
 
-    math_env = None
     try:
         policy, value, tokenizer = initialize_models(
-            config,
-            use_deepspeed=args.use_deepspeed,
-            max_gpu_memory_utilization=args.max_gpu_memory_utilization,
+            config, use_deepspeed=args.use_deepspeed
         )
         reference_questions = load_reference_questions(config.gsm8k_reference_data)
+
+        # Pin the env to this rank's local GPU.  Without this, a ZeRO-3
+        # partitioned/offloaded policy would make the env put tensors on CPU
+        # during generation.
+        env_device = (
+            current_cuda_device()
+            if args.use_deepspeed
+            else (next(policy.parameters()).device if torch.cuda.is_available() else torch.device("cpu"))
+        )
 
         math_env = CurriculumMathEnvironment(
             policy_model=policy,
@@ -559,12 +545,7 @@ def main():
             temperature=config.temperature,
             top_p=config.top_p,
             consensus_temperature=config.consensus_temperature,
-            use_vllm=config.use_vllm_rollouts,
-            vllm_tensor_parallel_size=config.vllm_tensor_parallel_size,
-            vllm_batch_size=config.rollout_batch_size,
-            vllm_gpu_memory_utilization=config.vllm_gpu_memory_utilization,
-            base_model_path=config.base_model,
-            parallel_worker_timeout_seconds=config.worker_timeout_seconds,
+            device=env_device,
         )
         training_monitor = TrainingMonitor(
             output_dir=config.output_dir,
@@ -578,7 +559,10 @@ def main():
         )
 
         if args.use_deepspeed:
-            logger.info("Using DeepSpeed ZeRO-3 PPO trainer")
+            logger.info(
+                "Using DeepSpeed ZeRO-3 PPO trainer (rank=%d, world=%d)",
+                get_rank(), get_world_size(),
+            )
             ppo_trainer = PPOTrainerDeepSpeed(
                 policy_model=policy,
                 value_model=value,
@@ -594,12 +578,16 @@ def main():
                 target_kl=config.target_kl,
                 ds_config=args.deepspeed_config,
             )
+            # DeepSpeed returned the same nn.Module references (engine.module is
+            # our policy_model), but point env at the canonical handles kept
+            # by the trainer so weight sync is unambiguous.
             policy = ppo_trainer.policy
             value = ppo_trainer.value
             math_env.policy = policy
             math_env.value = value
+            math_env.triple_verifier.model = policy
         else:
-            logger.info("Using standard PPO trainer")
+            logger.info("Using single-GPU PPO trainer")
             ppo_trainer = PPOTrainer(
                 policy_model=policy,
                 value_model=value,
@@ -615,60 +603,111 @@ def main():
                 target_kl=config.target_kl,
             )
 
+        def _collect_rollouts_this_iteration() -> List:
+            """
+            Collect ``num_rollouts_per_iter`` trajectories.
+
+            Under DeepSpeed: each rank runs ``collect_rollouts`` locally on its
+            share of the work (with full params temporarily gathered), then we
+            all-gather the lists so every rank trains on the same buffer.
+            Single-GPU: one process does the whole thing.
+            """
+            if not args.use_deepspeed:
+                return math_env.collect_rollouts(
+                    num_trajectories=config.num_rollouts_per_iter, verbose=True,
+                )
+
+            my_count = my_share(config.num_rollouts_per_iter)
+            logger.info(
+                "[rank %d] Generating %d/%d rollouts with gathered weights",
+                get_rank(), my_count, config.num_rollouts_per_iter,
+            )
+            with gather_params_for_generation(policy, value):
+                local_trajs = math_env.collect_rollouts(
+                    num_trajectories=my_count, verbose=False
+                )
+
+            _move_trajectories_to_cpu(local_trajs)
+
+            gathered_lists = all_gather_objects(local_trajs)
+            combined: List = []
+            for chunk in gathered_lists:
+                combined.extend(chunk)
+            logger.info(
+                "[rank %d] Gathered %d rollouts from %d ranks",
+                get_rank(), len(combined), get_world_size(),
+            )
+            return combined
+
+        def _rank0_evaluate(tag: str) -> Dict[str, float]:
+            """
+            Run GSM8K eval on rank 0 and broadcast the result.  Every rank
+            must enter and exit the ``gather_params_for_generation`` context
+            together — it's a collective on the ZeRO-3 shards.
+            """
+            if not args.use_deepspeed:
+                return evaluate_policy(policy, tokenizer, config.eval_data_path)
+
+            results: Optional[Dict[str, float]] = None
+            with gather_params_for_generation(policy, value):
+                if is_main_process():
+                    logger.info("[rank 0] %s (gathered weights)", tag)
+                    results = evaluate_policy(
+                        policy, tokenizer, config.eval_data_path
+                    )
+            results = broadcast_object(results, src_rank=0)
+            return results or {"accuracy": 0.0, "correct": 0, "total": 0}
+
         if args.skip_initial_eval:
-            logger.info("\n%s\nSKIPPING INITIAL EVALUATION (use --skip-initial-eval)\n%s", "=" * 80, "=" * 80)
+            if is_main_process():
+                logger.info(
+                    "\n%s\nSKIPPING INITIAL EVALUATION (--skip-initial-eval)\n%s",
+                    "=" * 80, "=" * 80,
+                )
             initial_eval = {"accuracy": 0.0}
             best_accuracy = 0.0
         else:
-            logger.info("\n%s\nINITIAL EVALUATION (Iteration 0)\n%s", "=" * 80, "=" * 80)
-            initial_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
-            best_accuracy = float(initial_eval["accuracy"])
+            if is_main_process():
+                logger.info(
+                    "\n%s\nINITIAL EVALUATION (Iteration 0)\n%s", "=" * 80, "=" * 80
+                )
+            initial_eval = _rank0_evaluate("Initial evaluation")
+            best_accuracy = float(initial_eval.get("accuracy", 0.0))
 
-            logger_csv.log({
-                "eval/accuracy": initial_eval["accuracy"],
-                "eval/correct": initial_eval.get("correct", 0),
-                "eval/total": initial_eval.get("total", 0),
-            }, step=0)
+            if is_main_process() and logger_csv is not None:
+                logger_csv.log(
+                    {
+                        "eval/accuracy": initial_eval.get("accuracy", 0.0),
+                        "eval/correct": initial_eval.get("correct", 0),
+                        "eval/total": initial_eval.get("total", 0),
+                    },
+                    step=0,
+                )
 
         for iteration in range(1, config.num_iterations + 1):
             iteration_start = time.perf_counter()
-            logger.info("\n%s\nITERATION %d/%d\n%s", "=" * 80, iteration, config.num_iterations, "=" * 80)
-            current_phase = math_env.expert_panel.get_current_expert(math_env.curriculum_manager.current_iteration)
-            logger.info(
-                "Active expert phase: %s (%s)",
-                current_phase.name,
-                current_phase.description,
+            if is_main_process():
+                logger.info(
+                    "\n%s\nITERATION %d/%d\n%s",
+                    "=" * 80, iteration, config.num_iterations, "=" * 80,
+                )
+            current_phase = math_env.expert_panel.get_current_expert(
+                math_env.curriculum_manager.current_iteration
             )
+            if is_main_process():
+                logger.info(
+                    "Active expert phase: %s (%s)",
+                    current_phase.name, current_phase.description,
+                )
 
             rollout_start = time.perf_counter()
-            if config.use_multi_gpu_rollouts:
-                trajectories = math_env.collect_rollouts_parallel(
-                    num_trajectories=config.num_rollouts_per_iter,
-                    num_gpus=config.num_rollout_gpus,
-                    batch_size=config.rollout_batch_size,
-                    verbose=True,
-                )
-            elif config.use_vllm_rollouts:
-                trajectories = math_env.collect_rollouts_batched(
-                    num_trajectories=config.num_rollouts_per_iter,
-                    batch_size=config.rollout_batch_size,
-                    verbose=True,
-                )
-            else:
-                trajectories = math_env.collect_rollouts(
-                    num_trajectories=config.num_rollouts_per_iter,
-                    verbose=True,
-                )
+            trajectories = _collect_rollouts_this_iteration()
             rollout_seconds = time.perf_counter() - rollout_start
-            
-            # CRITICAL: Shutdown rollout workers to free GPU memory before training
-            if config.use_multi_gpu_rollouts:
-                logger.info("Shutting down rollout workers to free GPU memory before training")
-                math_env.shutdown_parallel_rollout_workers()
-                torch.cuda.empty_cache()
-                log_gpu_memory("After shutting down rollout workers")
 
             pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+            # Shared seed for PPO shuffle so every rank agrees on batch order;
+            # per-rank sharding happens inside PPOTrainerDeepSpeed.
+            np.random.seed(base_seed + iteration)
             rollout_buffer = RolloutBuffer(
                 gamma=config.gamma,
                 gae_lambda=config.gae_lambda,
@@ -682,41 +721,30 @@ def main():
             replay_stats = math_env.replay_buffer.get_buffer_stats(
                 current_iteration=math_env.curriculum_manager.current_iteration
             )
-            logger.info("Running PPO update...")
+            if is_main_process():
+                logger.info("Running PPO update...")
             train_start = time.perf_counter()
             training_metrics = ppo_trainer.train_step(rollout_buffer)
             train_seconds = time.perf_counter() - train_start
-            
-            # Restart rollout workers for next iteration if needed
-            if config.use_multi_gpu_rollouts and iteration < config.num_iterations:
-                logger.info("Will restart rollout workers on next iteration")
-            
-            logger.info(
-                "PPO update metrics: policy_loss=%.4f value_loss=%.4f entropy=%.4f "
-                "approx_kl=%.4f clip_fraction=%.4f update_steps=%d",
-                training_metrics["policy_loss"],
-                training_metrics["value_loss"],
-                training_metrics["entropy"],
-                training_metrics["approx_kl"],
-                training_metrics["clip_fraction"],
-                int(training_metrics.get("update_steps", 0.0)),
-            )
 
-            sync_metrics = {"workers_synced": 0}
-            sync_seconds = 0.0
-            if config.use_multi_gpu_rollouts:
-                sync_start = time.perf_counter()
-                try:
-                    sync_metrics = math_env.sync_parallel_rollout_workers()
-                except Exception as exc:
-                    logger.error("Failed to sync rollout workers: %s", exc)
-                    sync_metrics = {"workers_synced": 0, "error": str(exc)}
-                sync_seconds = time.perf_counter() - sync_start
+            if is_main_process():
+                logger.info(
+                    "PPO update metrics: policy_loss=%.4f value_loss=%.4f "
+                    "entropy=%.4f approx_kl=%.4f clip_fraction=%.4f update_steps=%d",
+                    training_metrics["policy_loss"],
+                    training_metrics["value_loss"],
+                    training_metrics["entropy"],
+                    training_metrics["approx_kl"],
+                    training_metrics["clip_fraction"],
+                    int(training_metrics.get("update_steps", 0.0)),
+                )
 
             eval_start = time.perf_counter()
             if iteration % config.eval_every == 0:
-                eval_results = evaluate_policy(policy, tokenizer, config.eval_data_path)
-                best_accuracy = max(best_accuracy, float(eval_results["accuracy"]))
+                eval_results = _rank0_evaluate(f"Iteration {iteration} evaluation")
+                best_accuracy = max(
+                    best_accuracy, float(eval_results.get("accuracy", 0.0))
+                )
             else:
                 eval_results = {}
             eval_seconds = time.perf_counter() - eval_start
@@ -724,117 +752,135 @@ def main():
             save_start = time.perf_counter()
             cleanup_metrics = {"deleted_checkpoints": 0, "compressed_logs": 0}
             if iteration % config.save_every == 0:
-                checkpoint_manager.save_checkpoint(iteration=iteration, trainer=ppo_trainer)
-                cleanup_metrics = checkpoint_manager.cleanup_old_checkpoints(current_iteration=iteration)
+                # Every rank participates in save_checkpoint; the CheckpointManager
+                # delegates to trainer.save_checkpoint which does the right thing
+                # for both PPOTrainer and PPOTrainerDeepSpeed.
+                checkpoint_manager.save_checkpoint(
+                    iteration=iteration, trainer=ppo_trainer
+                )
+                if is_main_process():
+                    cleanup_metrics = checkpoint_manager.cleanup_old_checkpoints(
+                        current_iteration=iteration
+                    )
+                barrier()
             save_seconds = time.perf_counter() - save_start
 
             total_seconds = time.perf_counter() - iteration_start
             timing_metrics = {
                 "rollout_seconds": float(rollout_seconds),
                 "train_seconds": float(train_seconds),
-                "sync_seconds": float(sync_seconds),
                 "eval_seconds": float(eval_seconds),
                 "save_seconds": float(save_seconds),
                 "total_seconds": float(total_seconds),
                 "num_rollouts": float(len(trajectories)),
                 "estimated_tokens_generated": float(
-                    len(trajectories) * (config.max_question_tokens + 4 * config.max_solution_tokens)
+                    len(trajectories)
+                    * (config.max_question_tokens + 4 * config.max_solution_tokens)
                 ),
             }
-            throughput_metrics = training_monitor.log_iteration_timing(iteration=iteration, timings=timing_metrics)
-            disk_metrics = training_monitor.check_disk_space()
-            gpu_metrics = training_monitor.log_gpu_utilization(
-                gpu_ids=list(range(config.num_rollout_gpus))
-                if config.num_rollout_gpus is not None
-                else list(range(torch.cuda.device_count()))
-            )
+            if is_main_process():
+                throughput_metrics = training_monitor.log_iteration_timing(
+                    iteration=iteration, timings=timing_metrics
+                )
+                disk_metrics = training_monitor.check_disk_space()
+                gpu_metrics = training_monitor.log_gpu_utilization(
+                    gpu_ids=list(range(torch.cuda.device_count()))
+                )
+                logger.info(
+                    "Timing breakdown: rollout=%.1fs train=%.1fs eval=%.1fs save=%.1fs total=%.1fs",
+                    timing_metrics["rollout_seconds"],
+                    timing_metrics["train_seconds"],
+                    timing_metrics["eval_seconds"],
+                    timing_metrics["save_seconds"],
+                    timing_metrics["total_seconds"],
+                )
+
+                all_metrics = {
+                    "iteration": iteration,
+                    "buffer": buffer_stats,
+                    "curriculum": curriculum_stats,
+                    "training": training_metrics,
+                    "eval": eval_results,
+                    "timing": timing_metrics,
+                    "throughput": throughput_metrics,
+                    "disk": disk_metrics,
+                    "gpu": gpu_metrics,
+                    "checkpoint_cleanup": cleanup_metrics,
+                    "curriculum_state": math_env.curriculum_manager.get_curriculum_stats(),
+                    "replay_buffer": replay_stats,
+                    "rollout_mix": dict(math_env.last_rollout_mix),
+                    "replay_ratio": math_env.last_replay_ratio,
+                }
+                save_iteration_results(iteration, trajectories, all_metrics, config)
+
+                csv_metrics = {
+                    "iteration": iteration,
+                    "train/policy_loss": training_metrics["policy_loss"],
+                    "train/value_loss": training_metrics["value_loss"],
+                    "train/entropy": training_metrics["entropy"],
+                    "train/approx_kl": training_metrics["approx_kl"],
+                    "train/clip_fraction": training_metrics["clip_fraction"],
+                    "rollout/mean_reward": buffer_stats["mean_episode_reward"],
+                    "rollout/num_trajectories": len(trajectories),
+                    "rollout/mean_length": buffer_stats["mean_episode_length"],
+                    "curriculum/topic_diversity": curriculum_stats["topic_diversity"],
+                    "curriculum/avg_difficulty": curriculum_stats["avg_difficulty"],
+                    "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
+                    "curriculum/replay_ratio": math_env.last_replay_ratio,
+                    "perf/rollout_time": rollout_seconds,
+                    "perf/train_time": train_seconds,
+                    "perf/total_time": total_seconds,
+                    "perf/tokens_per_second": throughput_metrics.get(
+                        "tokens_per_second", 0.0
+                    ),
+                    "system/disk_free_gb": disk_metrics.get("free_gb", 0.0),
+                }
+                if eval_results:
+                    csv_metrics["eval/accuracy"] = eval_results.get("accuracy", 0.0)
+                    csv_metrics["eval/correct"] = eval_results.get("correct", 0)
+                    csv_metrics["eval/total"] = eval_results.get("total", 0)
+                if gpu_metrics:
+                    csv_metrics["system/gpu_util_percent"] = (
+                        sum(gpu_metrics.values()) / max(1, len(gpu_metrics))
+                    )
+
+                if logger_csv is not None:
+                    logger_csv.log(csv_metrics, step=iteration)
+
+            # Keep ranks in lockstep between iterations: without this a fast
+            # rank could start the next rollout while another is still saving.
+            barrier()
+
+        final_eval = _rank0_evaluate("Final evaluation")
+        if is_main_process():
             logger.info(
-                "Timing breakdown: rollout=%.1fs train=%.1fs sync=%.1fs eval=%.1fs save=%.1fs total=%.1fs",
-                timing_metrics["rollout_seconds"],
-                timing_metrics["train_seconds"],
-                timing_metrics["sync_seconds"],
-                timing_metrics["eval_seconds"],
-                timing_metrics["save_seconds"],
-                timing_metrics["total_seconds"],
+                "Training complete. Initial acc: %.2f%% | Final acc: %.2f%% | Delta: %.2f%%",
+                initial_eval.get("accuracy", 0.0) * 100.0,
+                final_eval.get("accuracy", 0.0) * 100.0,
+                (final_eval.get("accuracy", 0.0) - initial_eval.get("accuracy", 0.0))
+                * 100.0,
             )
 
-            all_metrics = {
-                "iteration": iteration,
-                "buffer": buffer_stats,
-                "curriculum": curriculum_stats,
-                "training": training_metrics,
-                "eval": eval_results,
-                "timing": timing_metrics,
-                "throughput": throughput_metrics,
-                "disk": disk_metrics,
-                "gpu": gpu_metrics,
-                "sync": sync_metrics,
-                "checkpoint_cleanup": cleanup_metrics,
-                "parallel_rollout_details": dict(math_env.last_parallel_rollout_details),
-                "curriculum_state": math_env.curriculum_manager.get_curriculum_stats(),
-                "replay_buffer": replay_stats,
-                "rollout_mix": dict(math_env.last_rollout_mix),
-                "replay_ratio": math_env.last_replay_ratio,
-            }
-            save_iteration_results(iteration, trajectories, all_metrics, config)
-            
-            # Log to CSV (simplified metrics)
-            csv_metrics = {
-                "iteration": iteration,
-                "train/policy_loss": training_metrics["policy_loss"],
-                "train/value_loss": training_metrics["value_loss"],
-                "train/entropy": training_metrics["entropy"],
-                "train/approx_kl": training_metrics["approx_kl"],
-                "train/clip_fraction": training_metrics["clip_fraction"],
-                "rollout/mean_reward": buffer_stats["mean_episode_reward"],
-                "rollout/num_trajectories": len(trajectories),
-                "rollout/mean_length": buffer_stats["mean_episode_length"],
-                "curriculum/topic_diversity": curriculum_stats["topic_diversity"],
-                "curriculum/avg_difficulty": curriculum_stats["avg_difficulty"],
-                "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
-                "curriculum/replay_ratio": math_env.last_replay_ratio,
-                "perf/rollout_time": rollout_seconds,
-                "perf/train_time": train_seconds,
-                "perf/total_time": total_seconds,
-                "perf/tokens_per_second": throughput_metrics.get("tokens_per_second", 0.0),
-                "system/disk_free_gb": disk_metrics.get("free_gb", 0.0),
-            }
-            
-            if eval_results:
-                csv_metrics["eval/accuracy"] = eval_results["accuracy"]
-                csv_metrics["eval/correct"] = eval_results.get("correct", 0)
-                csv_metrics["eval/total"] = eval_results.get("total", 0)
-            
-            if gpu_metrics:
-                avg_gpu_util = sum(gpu_metrics.values()) / max(1, len(gpu_metrics))
-                csv_metrics["system/gpu_util_percent"] = avg_gpu_util
-            
-            logger_csv.log(csv_metrics, step=iteration)
-        final_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
-        logger.info(
-            "Training complete. Initial acc: %.2f%% | Final acc: %.2f%% | Delta: %.2f%%",
-            initial_eval["accuracy"] * 100.0,
-            final_eval["accuracy"] * 100.0,
-            (final_eval["accuracy"] - initial_eval["accuracy"]) * 100.0,
-        )
-
-        # Save final summary
-        logger_csv.save_summary({
-            "initial_accuracy": initial_eval["accuracy"],
-            "final_accuracy": final_eval["accuracy"],
-            "improvement": final_eval["accuracy"] - initial_eval["accuracy"],
-            "best_accuracy": best_accuracy,
-            "total_iterations": config.num_iterations,
-            "console_output_path": str(console_log_path),
-        })
-
-        logger_csv.finish()
+            if logger_csv is not None:
+                logger_csv.save_summary(
+                    {
+                        "initial_accuracy": initial_eval.get("accuracy", 0.0),
+                        "final_accuracy": final_eval.get("accuracy", 0.0),
+                        "improvement": final_eval.get("accuracy", 0.0)
+                        - initial_eval.get("accuracy", 0.0),
+                        "best_accuracy": best_accuracy,
+                        "total_iterations": config.num_iterations,
+                        "console_output_path": str(console_log_path)
+                        if console_log_path
+                        else "",
+                    }
+                )
+                logger_csv.finish()
     finally:
-        if math_env is not None:
-            math_env.shutdown_parallel_rollout_workers()
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        console_log_file.close()
+        if console_log_file is not None:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            console_log_file.close()
 
 
 if __name__ == "__main__":

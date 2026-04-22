@@ -248,6 +248,18 @@ class CurriculumManager:
         return list(self.current_focus_topics)
 
     def save_state(self, iteration: int, rollout: Optional[int] = None) -> None:
+        # When running under torchrun / DeepSpeed every rank calls this
+        # with identical data -- only rank 0 should actually touch disk to
+        # avoid clobbered / interleaved JSON writes.  Guarded import so
+        # this file stays usable without torch.distributed.
+        try:
+            from src.rl.deepspeed_utils import is_main_process as _is_main
+
+            if not _is_main():
+                return
+        except Exception:  # pragma: no cover - best-effort rank detection
+            pass
+
         if rollout is not None and rollout % 10 != 0:
             return
         filename = (

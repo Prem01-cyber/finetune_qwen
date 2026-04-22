@@ -67,6 +67,7 @@ class MathEnvironment:
         max_solution_tokens: int = 500,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        device: Optional[torch.device] = None,
     ):
         """
         Args:
@@ -78,6 +79,11 @@ class MathEnvironment:
             max_solution_tokens: Max tokens for solution generation
             temperature: Sampling temperature
             top_p: Nucleus sampling parameter
+            device: Optional explicit compute device.  This is needed when
+                using DeepSpeed ZeRO-3 with CPU offload, where
+                ``next(policy_model.parameters()).device`` would return
+                ``cpu`` (params are offloaded) but we actually want to run
+                on the local GPU.
         """
         self.policy = policy_model
         self.value = value_model
@@ -89,7 +95,17 @@ class MathEnvironment:
         self.temperature = temperature
         self.top_p = top_p
 
-        self.device = next(policy_model.parameters()).device
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            # Fall back to the first parameter's device.  This is only
+            # meaningful when the model is *not* sharded / offloaded.
+            try:
+                self.device = next(policy_model.parameters()).device
+            except StopIteration:
+                self.device = torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu"
+                )
 
     def sample_instruction(self) -> str:
         """

@@ -1,24 +1,109 @@
 """
 DeepSpeed-backed PPO trainer for memory-efficient multi-GPU updates.
+
+Design
+------
+This trainer keeps the clipped-surrogate PPO objective of ``ppo_trainer.py``
+but wraps **both** the policy and the critic in independent DeepSpeed ZeRO-3
+engines.  Why this layout:
+
+* ZeRO-3 shards model params, gradients *and* optimizer state across every
+  data-parallel rank.  On our 1.5B policy this turns a ~24GB training memory
+  footprint into a few GB per GPU, which is the whole reason we bother with
+  DeepSpeed here.
+
+* The value network is a frozen 1.5B backbone + a tiny MLP head.  We still
+  wrap it in ZeRO-3 so its backbone is sharded for memory, but we tell
+  DeepSpeed that only the MLP head is trainable by passing
+  ``model_parameters=[only-the-head]``.
+
+* Every rank participates in training.  The rollout buffer is replicated on
+  every rank (each iteration collects rollouts data-parallel then all-gathers
+  them), and every rank walks only **its** stride of the mini-batch list.
+  DeepSpeed's built-in gradient all-reduce combines the per-rank gradients
+  into the correct global update.
+
+* Rollouts / generation require *full* parameters, which ZeRO-3 normally
+  partitions.  The launcher wraps the rollout phase in
+  ``deepspeed_utils.gather_params_for_generation`` so each rank materialises
+  the full weights for generation and then releases them before training
+  resumes.
+
+The clipped PPO math is identical to ``ppo_trainer.py``; only the backward /
+optimizer step mechanics differ (engine.backward / engine.step instead of
+loss.backward / optimizer.step).
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
-from typing import Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import deepspeed
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.rl.deepspeed_utils import (
+    barrier,
+    current_cuda_device,
+    get_local_rank,
+    get_rank,
+    get_world_size,
+    is_main_process,
+    select_rank_shard,
+)
 from src.rl.rollout_buffer import RolloutBuffer
 from src.rl.value_network import ValueHead
 
 logger = logging.getLogger(__name__)
+
+
+def _materialise_ds_config(
+    raw_config: Dict[str, Any],
+    *,
+    global_batch_size: int,
+    world_size: int,
+    learning_rate: float,
+    grad_clip: float,
+) -> Dict[str, Any]:
+    """
+    Resolve the "auto" slots in a DeepSpeed config against a concrete PPO
+    batch size, learning rate, and world size.
+    """
+    cfg = copy.deepcopy(raw_config)
+
+    world_size = max(1, int(world_size))
+    micro_batch = max(1, int(global_batch_size) // world_size)
+    effective_global = micro_batch * world_size
+
+    cfg["train_batch_size"] = int(effective_global)
+    cfg["train_micro_batch_size_per_gpu"] = int(micro_batch)
+    cfg["gradient_accumulation_steps"] = 1
+
+    if "optimizer" in cfg and isinstance(cfg["optimizer"].get("params"), dict):
+        cfg["optimizer"]["params"]["lr"] = float(learning_rate)
+    if "scheduler" in cfg and isinstance(cfg["scheduler"].get("params"), dict):
+        cfg["scheduler"]["params"]["warmup_max_lr"] = float(learning_rate)
+
+    cfg["gradient_clipping"] = float(grad_clip)
+
+    return cfg
+
+
+def _make_value_ds_config(policy_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create a DeepSpeed config for the critic.  We reuse the policy config,
+    but turn off CPU offload for the (tiny) optimizer because the MLP head is
+    cheap and we want fast critic updates.
+    """
+    value_cfg = copy.deepcopy(policy_cfg)
+    zero = value_cfg.setdefault("zero_optimization", {})
+    zero["offload_optimizer"] = {"device": "none"}
+    return value_cfg
 
 
 class PPOTrainerDeepSpeed:
@@ -40,7 +125,6 @@ class PPOTrainerDeepSpeed:
         target_kl: float = 0.01,
         ds_config: Optional[str] = None,
     ) -> None:
-
         self.tokenizer = tokenizer
         self.ppo_epochs = ppo_epochs
         self.batch_size = batch_size
@@ -51,118 +135,184 @@ class PPOTrainerDeepSpeed:
         self.target_kl = target_kl
         self.max_grad_norm = max_grad_norm
 
+        # Resolve base config ------------------------------------------------
         config_path = ds_config or "configs/deepspeed_zero3_rl.json"
         with open(config_path, "r", encoding="utf-8") as handle:
-            ds_cfg = json.load(handle)
+            raw_cfg = json.load(handle)
 
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        micro_batch = max(1, batch_size // max(world_size, 1))
-        ds_cfg["train_batch_size"] = int(batch_size)
-        ds_cfg["train_micro_batch_size_per_gpu"] = int(micro_batch)
-        ds_cfg["gradient_accumulation_steps"] = 1
-        
-        # Set learning rate in optimizer config
-        if "optimizer" in ds_cfg and "params" in ds_cfg["optimizer"]:
-            ds_cfg["optimizer"]["params"]["lr"] = learning_rate
-        if "scheduler" in ds_cfg and "params" in ds_cfg["scheduler"]:
-            ds_cfg["scheduler"]["params"]["warmup_max_lr"] = learning_rate
+        world_size = get_world_size()
+        policy_cfg = _materialise_ds_config(
+            raw_cfg,
+            global_batch_size=batch_size,
+            world_size=world_size,
+            learning_rate=learning_rate,
+            grad_clip=max_grad_norm,
+        )
+        value_cfg = _make_value_ds_config(policy_cfg)
 
-        # Only wrap policy in DeepSpeed (it's 1.5B params)
-        # Keep value network in standard PyTorch (it's tiny ~few MB)
-        
-        # Ensure all policy parameters require gradients
-        for param in policy_model.parameters():
-            param.requires_grad = True
-        
-        trainable_count = sum(1 for p in policy_model.parameters() if p.requires_grad)
-        logger.info(f"Policy model has {trainable_count} trainable parameters")
-        
-        logger.info("Initializing policy DeepSpeed engine (ZeRO-3)")
-        # Don't pass model_parameters - let DeepSpeed handle all parameters
+        self._world_size = world_size
+        self._rank = get_rank()
+
+        # ------------------------------------------------------------------
+        # Policy engine: every parameter is trainable (we merged the adapter
+        # earlier).  ZeRO-3 shards params, grads and optimizer state.
+        # ------------------------------------------------------------------
+        for p in policy_model.parameters():
+            p.requires_grad_(True)
+
+        logger.info(
+            "[rank %d] Initialising policy DeepSpeed engine (ZeRO-3, world_size=%d, micro_bs=%d)",
+            self._rank,
+            world_size,
+            policy_cfg["train_micro_batch_size_per_gpu"],
+        )
         self.policy_engine, self.policy_optimizer, _, _ = deepspeed.initialize(
             model=policy_model,
-            config=ds_cfg,
-        )
-        
-        # Move value network to same device as policy
-        # Manually move submodules to avoid triggering accelerate's device_map
-        target_device = self.policy_engine.device
-        logger.info(f"Moving value network to device: {target_device}")
-        value_model.backbone = value_model.backbone.to(target_device)
-        value_model.value_head = value_model.value_head.to(target_device)
-        
-        self.value = value_model
-        self.value_optimizer = torch.optim.AdamW(
-            [p for p in value_model.parameters() if p.requires_grad],
-            lr=learning_rate,
+            model_parameters=[p for p in policy_model.parameters() if p.requires_grad],
+            config=policy_cfg,
         )
 
-        self.policy = self.policy_engine.module
-        self.device = self.policy_engine.device
+        # ------------------------------------------------------------------
+        # Value engine: backbone frozen, only MLP head trains.  Pass the head
+        # params as the trainable set so DeepSpeed only builds optimizer
+        # state for those, but still shards the full model across ranks.
+        # ------------------------------------------------------------------
+        for p in value_model.backbone.parameters():
+            p.requires_grad_(False)
+        for p in value_model.value_head.parameters():
+            p.requires_grad_(True)
+
+        trainable_value_params = [
+            p for p in value_model.parameters() if p.requires_grad
+        ]
+        logger.info(
+            "[rank %d] Initialising value DeepSpeed engine (ZeRO-3, trainable_params=%d)",
+            self._rank,
+            len(trainable_value_params),
+        )
+        self.value_engine, self.value_optimizer, _, _ = deepspeed.initialize(
+            model=value_model,
+            model_parameters=trainable_value_params,
+            config=value_cfg,
+        )
+
+        # Expose .policy / .value so the rest of the codebase that reaches
+        # inside the trainer can still find the raw nn.Module.
+        self.policy: torch.nn.Module = self.policy_engine.module
+        self.value: ValueHead = self.value_engine.module  # type: ignore[assignment]
+
+        # Canonical training device for this rank (not the possibly-offloaded
+        # parameter device).
+        if torch.cuda.is_available():
+            torch.cuda.set_device(get_local_rank())
+        self.device = current_cuda_device()
         self._last_checkpoint_meta: Dict[str, str] = {}
 
         logger.info(
-            "DeepSpeed ready: world_size=%d, micro_batch_per_gpu=%d",
-            world_size,
-            micro_batch,
+            "[rank %d] DeepSpeed PPO trainer ready on %s",
+            self._rank,
+            self.device,
         )
+
+    # ------------------------------------------------------------------
+    # Forward helpers
+    # ------------------------------------------------------------------
 
     def _policy_logits_at_state(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        # Must use the engine (not .module) so ZeRO-3 gathers sharded params
-        # and builds a proper computation graph for backward
+        """
+        Return logits at the final non-pad position as float32.
+
+        We gather only the last-position slice *before* upcasting so we do
+        not materialise a [B, T, V] float32 tensor, which for Qwen-1.5B is
+        roughly ``batch * seq * 150k * 4B`` — easily several GB per step.
+        """
         outputs = self.policy_engine(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
             use_cache=False,
         )
-        logits = outputs.logits.float()
+        logits = outputs.logits  # [B, T, V] in bf16
         last_idx = attention_mask.long().sum(dim=1) - 1
         last_idx = last_idx.clamp(min=0)
         row_idx = torch.arange(logits.size(0), device=logits.device)
-        return logits[row_idx, last_idx]
+        last_logits = logits[row_idx, last_idx]  # [B, V] still bf16
+        return last_logits.float()
 
     def _value_estimates(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        return self.value(input_ids=input_ids, attention_mask=attention_mask).float()
+        return self.value_engine(
+            input_ids=input_ids, attention_mask=attention_mask
+        ).float()
+
+    # ------------------------------------------------------------------
+    # Training step
+    # ------------------------------------------------------------------
 
     def train_step(self, rollout_buffer: RolloutBuffer) -> Dict[str, float]:
-        self.policy_engine.train()
-        self.value.train()
+        """
+        Run ``ppo_epochs`` of gradient updates over the rollout buffer.
 
-        stats: Dict[str, list] = {
+        Each rank processes a **stride-sharded** slice of the mini-batches
+        (rank ``r`` sees batches whose index ``i`` satisfies
+        ``i % world_size == r``).  DeepSpeed's gradient all-reduce turns
+        these per-rank micro-steps into a coherent synchronous update.
+        """
+        self.policy_engine.train()
+        self.value_engine.train()
+
+        stats: Dict[str, List[float]] = {
             "policy_loss": [],
             "value_loss": [],
             "entropy": [],
             "approx_kl": [],
             "clip_fraction": [],
         }
-
         early_stopped = False
         update_steps = 0
+
+        # DeepSpeed expects *per-rank micro-batches* of size
+        # train_batch_size // world_size.  We therefore draw mini-batches
+        # from the rollout buffer at the micro-batch size and stride-shard
+        # them across ranks so that each rank consumes a different slice
+        # of every "global" batch — true data parallelism.
+        micro_batch = max(1, self.batch_size // max(self._world_size, 1))
 
         for epoch in range(self.ppo_epochs):
             if early_stopped:
                 break
 
-            for batch in rollout_buffer.get_batches(batch_size=self.batch_size, shuffle=True):
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                action_token_ids = batch["action_token_ids"].to(self.device)
-                old_log_probs = batch["old_log_probs"].to(self.device).detach()
-                old_values = batch["old_values"].to(self.device).detach()
-                advantages = batch["advantages"].to(self.device)
-                returns = batch["returns"].to(self.device)
+            epoch_batches = list(
+                rollout_buffer.get_batches(batch_size=micro_batch, shuffle=True)
+            )
+            # Drop the trailing batches so every rank processes exactly the
+            # same number of .backward() calls.  Without this step an uneven
+            # tail causes one rank to exit the loop while another is still
+            # mid-backward, which ZeRO-3 treats as a lost collective.
+            usable = len(epoch_batches) - (len(epoch_batches) % max(self._world_size, 1))
+            epoch_batches = epoch_batches[:usable]
+            my_batches = select_rank_shard(epoch_batches)
 
+            for batch in my_batches:
+                input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+                action_token_ids = batch["action_token_ids"].to(self.device, non_blocking=True)
+                old_log_probs = batch["old_log_probs"].to(self.device, non_blocking=True).detach()
+                old_values = batch["old_values"].to(self.device, non_blocking=True).detach()
+                advantages = batch["advantages"].to(self.device, non_blocking=True)
+                returns = batch["returns"].to(self.device, non_blocking=True)
+
+                # ---- Policy forward -----------------------------------
                 logits_last = self._policy_logits_at_state(input_ids, attention_mask)
                 log_probs = F.log_softmax(logits_last, dim=-1)
                 new_log_probs = log_probs[
                     torch.arange(logits_last.size(0), device=logits_last.device),
                     action_token_ids,
                 ]
+                # Entropy of the categorical distribution (stable form).
                 entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
 
                 ratio = torch.exp(new_log_probs - old_log_probs)
@@ -171,101 +321,128 @@ class PPOTrainerDeepSpeed:
                     ratio, 1.0 - self.clip_range, 1.0 + self.clip_range
                 )
                 policy_loss = torch.max(pg_loss1, pg_loss2).mean()
-                approx_kl = ((ratio - 1.0) - torch.log(ratio)).mean().item()
-                clip_fraction = (torch.abs(ratio - 1.0) > self.clip_range).float().mean().item()
+                approx_kl = ((ratio - 1.0) - torch.log(ratio)).mean().detach()
+                clip_fraction = (
+                    (torch.abs(ratio - 1.0) > self.clip_range).float().mean().detach()
+                )
 
-                if approx_kl > 1.5 * self.target_kl:
-                    logger.info(
-                        "Early stopping at epoch %d: approx_kl=%.4f",
-                        epoch,
-                        approx_kl,
+                # Early-stop has to be a *global* decision under DeepSpeed,
+                # otherwise rank A breaks out of the loop while rank B is
+                # still calling engine.backward() and waits forever for
+                # rank A's gradient reduction.  All ranks average their
+                # local KL and make the identical choice.
+                global_kl = approx_kl.clone()
+                if self._world_size > 1 and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(
+                        global_kl, op=torch.distributed.ReduceOp.AVG
                     )
+
+                if global_kl.item() > 1.5 * self.target_kl:
+                    if self._rank == 0:
+                        logger.info(
+                            "Early stop at epoch %d: global approx_kl=%.4f",
+                            epoch,
+                            global_kl.item(),
+                        )
                     early_stopped = True
                     break
 
+                # ---- Policy update ------------------------------------
+                policy_objective = policy_loss - self.ent_coef * entropy
+                self.policy_engine.backward(policy_objective)
+                self.policy_engine.step()
+
+                # ---- Value forward + update ---------------------------
                 new_values = self._value_estimates(input_ids, attention_mask).squeeze(-1)
-                vf_loss_unclipped = (new_values - returns) ** 2
+                vf_unclipped = (new_values - returns) ** 2
                 values_clipped = old_values + torch.clamp(
                     new_values - old_values, -self.clip_range_vf, self.clip_range_vf
                 )
-                vf_loss_clipped = (values_clipped - returns) ** 2
-                value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
+                vf_clipped = (values_clipped - returns) ** 2
+                value_loss = 0.5 * torch.max(vf_unclipped, vf_clipped).mean()
+                value_objective = self.vf_coef * value_loss
 
-                # Policy update (DeepSpeed ZeRO-3 with offload)
-                policy_objective = policy_loss - self.ent_coef * entropy
-                
-                # For ZeRO-3 offload: standard backward, then engine.step()
-                # engine.backward() doesn't work with DeepSpeedZeRoOffload
-                policy_objective.backward()
-                self.policy_engine.step()
-                
-                # Value update (standard PyTorch)
-                self.value_optimizer.zero_grad()
-                value_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.value.parameters(), self.max_grad_norm)
-                self.value_optimizer.step()
-                
+                self.value_engine.backward(value_objective)
+                self.value_engine.step()
+
                 update_steps += 1
 
-                stats["policy_loss"].append(policy_loss.item())
-                stats["value_loss"].append(value_loss.item())
-                stats["entropy"].append(entropy.item())
-                stats["approx_kl"].append(approx_kl)
-                stats["clip_fraction"].append(clip_fraction)
+                stats["policy_loss"].append(float(policy_loss.detach().item()))
+                stats["value_loss"].append(float(value_loss.detach().item()))
+                stats["entropy"].append(float(entropy.detach().item()))
+                stats["approx_kl"].append(float(approx_kl.item()))
+                stats["clip_fraction"].append(float(clip_fraction.item()))
+
+        # Make every rank reach this point before we return.  Otherwise a
+        # faster rank can start the next iteration while a slower rank is
+        # still in .backward(), which ZeRO-3 really doesn't enjoy.
+        barrier()
 
         if update_steps == 0:
             logger.warning(
-                "PPO train_step performed 0 optimizer updates. target_kl=%.4f",
+                "[rank %d] PPO train_step performed 0 optimizer updates (target_kl=%.4f).",
+                self._rank,
                 self.target_kl,
             )
 
-        metrics = {key: float(sum(values) / max(len(values), 1)) for key, values in stats.items()}
+        metrics = {
+            key: float(sum(values) / max(len(values), 1))
+            for key, values in stats.items()
+        }
         metrics["update_steps"] = float(update_steps)
         return metrics
 
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+
     def save_checkpoint(self, path: str) -> None:
         """
-        Save sharded DeepSpeed checkpoints while preserving existing manager API.
+        Save sharded DeepSpeed checkpoints for both engines.
+
+        ``path`` (e.g. ``.../iteration_001/checkpoint.pt``) is kept as the
+        "marker" file so the existing CheckpointManager bookkeeping still
+        works; the real weights live alongside it in ``policy_ds/`` and
+        ``value_ds/`` sub-directories.
         """
         iteration_dir = os.path.dirname(path)
-        os.makedirs(iteration_dir, exist_ok=True)
+        if is_main_process():
+            os.makedirs(iteration_dir, exist_ok=True)
+        barrier()
 
         policy_dir = os.path.join(iteration_dir, "policy_ds")
-        
-        self.policy_engine.save_checkpoint(policy_dir)
-        self.tokenizer.save_pretrained(os.path.join(iteration_dir, "policy_tokenizer"))
-        
-        # Save value network (standard PyTorch)
-        value_checkpoint = {
-            "value_head_state_dict": self.value.value_head.state_dict(),
-            "value_optimizer_state_dict": self.value_optimizer.state_dict(),
-        }
-        torch.save(value_checkpoint, os.path.join(iteration_dir, "value.pt"))
+        value_dir = os.path.join(iteration_dir, "value_ds")
 
-        meta = {
-            "format": "deepspeed_zero3",
-            "policy_dir": policy_dir,
-        }
-        torch.save(meta, path)
-        self._last_checkpoint_meta = meta
-        logger.info("DeepSpeed checkpoint saved under %s", iteration_dir)
+        # Both engines need to participate in the save (sharded state).
+        self.policy_engine.save_checkpoint(policy_dir)
+        self.value_engine.save_checkpoint(value_dir)
+
+        if is_main_process():
+            self.tokenizer.save_pretrained(os.path.join(iteration_dir, "policy_tokenizer"))
+
+            meta = {
+                "format": "deepspeed_zero3_dual_engine",
+                "policy_dir": policy_dir,
+                "value_dir": value_dir,
+            }
+            torch.save(meta, path)
+            self._last_checkpoint_meta = meta
+            logger.info("DeepSpeed checkpoint saved under %s", iteration_dir)
+        barrier()
 
     def load_checkpoint(self, path: str) -> None:
-        """Restore sharded DeepSpeed checkpoint."""
+        """Restore sharded DeepSpeed checkpoints for both engines."""
         if os.path.exists(path):
             meta = torch.load(path, map_location="cpu")
             policy_dir = meta.get("policy_dir")
+            value_dir = meta.get("value_dir")
         else:
             iteration_dir = os.path.dirname(path)
             policy_dir = os.path.join(iteration_dir, "policy_ds")
+            value_dir = os.path.join(iteration_dir, "value_ds")
 
         self.policy_engine.load_checkpoint(policy_dir)
-        
-        # Load value network (standard PyTorch)
-        value_path = os.path.join(os.path.dirname(path), "value.pt")
-        if os.path.exists(value_path):
-            checkpoint = torch.load(value_path, map_location=self.device)
-            self.value.value_head.load_state_dict(checkpoint["value_head_state_dict"])
-            self.value_optimizer.load_state_dict(checkpoint["value_optimizer_state_dict"])
-        
+        if value_dir and os.path.isdir(value_dir):
+            self.value_engine.load_checkpoint(value_dir)
+
         logger.info("DeepSpeed checkpoint loaded from %s", os.path.dirname(path))

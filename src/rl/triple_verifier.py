@@ -45,6 +45,7 @@ class TripleVerifier:
         temperature: float = 0.5,
         top_p: float = 0.9,
         max_tokens: int = 500,
+        device: Optional[torch.device] = None,
     ):
         """
         Initialize triple verifier.
@@ -55,13 +56,24 @@ class TripleVerifier:
             temperature: Sampling temperature (0.5 = moderate consensus, was 0.7)
             top_p: Nucleus sampling parameter
             max_tokens: Maximum tokens per solution
+            device: Optional explicit compute device.  Needed under DeepSpeed
+                ZeRO-3 where ``next(model.parameters()).device`` may point at
+                CPU (offloaded) even though we want generation on the GPU.
         """
         self.model = model
         self.tokenizer = tokenizer
         self.temperature = temperature
         self.top_p = top_p
         self.max_tokens = max_tokens
-        self.device = next(model.parameters()).device
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            try:
+                self.device = next(model.parameters()).device
+            except StopIteration:
+                self.device = torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu"
+                )
     
     def generate_three_solutions(self, question: str) -> List[str]:
         """

@@ -11,8 +11,9 @@ generation, etc.) is inherited from the base class.
 from __future__ import annotations
 
 import logging
-from typing import Dict
+from typing import Dict, Optional
 
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.rl.math_environment import MathEnvironment
@@ -47,6 +48,7 @@ class ConsensusMathEnvironment(MathEnvironment):
         temperature: float = 0.7,
         top_p: float = 0.9,
         consensus_temperature: float = 0.7,
+        device: Optional[torch.device] = None,
     ):
         """
         Initialize consensus math environment.
@@ -72,15 +74,18 @@ class ConsensusMathEnvironment(MathEnvironment):
             max_solution_tokens=max_solution_tokens,
             temperature=temperature,
             top_p=top_p,
+            device=device,
         )
         
-        # Create triple verifier
+        # Create triple verifier (reuse the resolved device from the base
+        # class to avoid inferring it from possibly-sharded parameters).
         self.triple_verifier = TripleVerifier(
             model=self.policy,
             tokenizer=self.tokenizer,
             temperature=consensus_temperature,
             top_p=top_p,
             max_tokens=max_solution_tokens,
+            device=self.device,
         )
         
         # Create consensus reward calculator
