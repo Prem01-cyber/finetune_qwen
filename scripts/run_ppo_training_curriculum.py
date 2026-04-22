@@ -5,6 +5,7 @@ PPO training with curriculum-guided dual-task rewards.
 import argparse
 import json
 import logging
+import random
 import sys
 import time
 from datetime import datetime
@@ -86,8 +87,10 @@ class CurriculumTrainingConfig:
     save_every = 1
     use_torch_compile = True  # Enable torch.compile for faster inference
     use_multi_gpu_rollouts = True
+    use_ray = False
     use_vllm_rollouts = False
     num_rollout_gpus: Optional[int] = None
+    num_ray_workers: Optional[int] = None
     rollout_batch_size = 16
     vllm_tensor_parallel_size = 1
     vllm_gpu_memory_utilization = 0.85
@@ -333,6 +336,8 @@ def main():
     parser.add_argument("--gsm8k-reference-data", type=str, default="data/sft/gsm8k_sft.jsonl")
     parser.add_argument("--skip-initial-eval", action="store_true")
     parser.add_argument("--disable-multi-gpu-rollouts", action="store_true")
+    parser.add_argument("--use-ray", action="store_true")
+    parser.add_argument("--num-ray-workers", type=int, default=None)
     parser.add_argument("--use-vllm-rollouts", action="store_true")
     parser.add_argument("--num-rollout-gpus", type=int, default=None)
     parser.add_argument("--rollout-batch-size", type=int, default=16)
@@ -356,8 +361,10 @@ def main():
     config.curriculum_checkpoint_dir = str(Path(args.output_dir) / "curriculum")
     config.run_name = args.run_name
     config.use_multi_gpu_rollouts = not args.disable_multi_gpu_rollouts
+    config.use_ray = bool(args.use_ray)
     config.use_vllm_rollouts = args.use_vllm_rollouts
     config.num_rollout_gpus = args.num_rollout_gpus
+    config.num_ray_workers = args.num_ray_workers
     config.rollout_batch_size = max(1, int(args.rollout_batch_size))
     config.vllm_tensor_parallel_size = max(1, int(args.vllm_tensor_parallel_size))
     config.vllm_gpu_memory_utilization = float(args.vllm_gpu_memory_utilization)
@@ -384,6 +391,7 @@ def main():
     logger.info("Full console output is being captured at %s", console_log_path)
 
     math_env = None
+    ppo_trainer = None
     try:
         policy, value, tokenizer = initialize_models(config)
         reference_questions = load_reference_questions(config.gsm8k_reference_data)
@@ -417,20 +425,34 @@ def main():
             compress_old_logs=config.compress_old_logs,
         )
 
-        ppo_trainer = PPOTrainer(
-            policy_model=policy,
-            value_model=value,
-            tokenizer=tokenizer,
-            learning_rate=config.learning_rate,
-            ppo_epochs=config.ppo_epochs,
-            batch_size=config.batch_size,
-            clip_range=config.clip_range,
-            clip_range_vf=config.clip_range_vf,
-            vf_coef=config.vf_coef,
-            ent_coef=config.ent_coef,
-            max_grad_norm=config.max_grad_norm,
-            target_kl=config.target_kl,
-        )
+        if config.use_ray:
+            from src.rl.ppo_trainer_ray import PPOTrainerRay
+
+            resolved_workers = config.num_ray_workers or max(1, torch.cuda.device_count())
+            logger.info("Using Ray rollouts with %d workers", resolved_workers)
+            ppo_trainer = PPOTrainerRay(
+                config=config,
+                policy_model=policy,
+                value_model=value,
+                tokenizer=tokenizer,
+                reference_questions=reference_questions,
+                num_workers=resolved_workers,
+            )
+        else:
+            ppo_trainer = PPOTrainer(
+                policy_model=policy,
+                value_model=value,
+                tokenizer=tokenizer,
+                learning_rate=config.learning_rate,
+                ppo_epochs=config.ppo_epochs,
+                batch_size=config.batch_size,
+                clip_range=config.clip_range,
+                clip_range_vf=config.clip_range_vf,
+                vf_coef=config.vf_coef,
+                ent_coef=config.ent_coef,
+                max_grad_norm=config.max_grad_norm,
+                target_kl=config.target_kl,
+            )
 
         if args.skip_initial_eval:
             logger.info("\n%s\nSKIPPING INITIAL EVALUATION (use --skip-initial-eval)\n%s", "=" * 80, "=" * 80)
@@ -458,7 +480,46 @@ def main():
             )
 
             rollout_start = time.perf_counter()
-            if config.use_multi_gpu_rollouts:
+            if config.use_ray:
+                _ = ppo_trainer.collect_rollouts(
+                    num_rollouts=config.num_rollouts_per_iter,
+                    curriculum_state_dict=math_env.curriculum_manager.get_curriculum_stats(),
+                )
+                fresh_trajectories = list(getattr(ppo_trainer, "latest_trajectories", []))
+                for trajectory in fresh_trajectories:
+                    trajectory.metadata["rollout_source"] = "fresh"
+                    trajectory.metadata["question_generation_backend"] = "ray"
+                    trajectory.metadata["question_transitions_logged"] = True
+                    math_env._sync_curriculum_from_metadata(trajectory)
+                    math_env._admit_to_main_replay_buffer(trajectory)
+
+                replay_ratio = math_env._get_adaptive_replay_ratio()
+                num_replay = int(config.num_rollouts_per_iter * replay_ratio)
+                num_replay = min(num_replay, len(math_env.replay_buffer))
+                replay_trajectories = math_env.replay_buffer.sample_replay_batch(
+                    num_replay, diversity_sample=True
+                )
+                for trajectory in replay_trajectories:
+                    trajectory.metadata["rollout_source"] = "replay"
+
+                trajectories = fresh_trajectories + replay_trajectories
+                random.shuffle(trajectories)
+
+                math_env.last_replay_ratio = replay_ratio
+                math_env.last_rollout_mix = {
+                    "fresh": len(fresh_trajectories),
+                    "replay": len(replay_trajectories),
+                }
+                math_env.last_parallel_rollout_details = {
+                    "backend": "ray",
+                    "num_workers": getattr(ppo_trainer, "num_workers", 0),
+                }
+                math_env.curriculum_manager.increment_iteration()
+                math_env.curriculum_manager.save_state(
+                    iteration=math_env.curriculum_manager.current_iteration,
+                    rollout=None,
+                )
+            elif config.use_multi_gpu_rollouts:
                 trajectories = math_env.collect_rollouts_parallel(
                     num_trajectories=config.num_rollouts_per_iter,
                     num_gpus=config.num_rollout_gpus,
@@ -509,7 +570,9 @@ def main():
 
             sync_metrics = {"workers_synced": 0}
             sync_seconds = 0.0
-            if config.use_multi_gpu_rollouts:
+            if config.use_ray:
+                sync_metrics = {"workers_synced": int(getattr(ppo_trainer, "num_workers", 0)), "backend": "ray"}
+            elif config.use_multi_gpu_rollouts:
                 sync_start = time.perf_counter()
                 try:
                     sync_metrics = math_env.sync_parallel_rollout_workers()
@@ -635,6 +698,11 @@ def main():
 
         logger_csv.finish()
     finally:
+        if ppo_trainer is not None and hasattr(ppo_trainer, "shutdown"):
+            try:
+                ppo_trainer.shutdown()
+            except Exception as exc:
+                logger.warning("Failed to shutdown Ray trainer cleanly: %s", exc)
         if math_env is not None:
             math_env.shutdown_parallel_rollout_workers()
         sys.stdout = original_stdout
