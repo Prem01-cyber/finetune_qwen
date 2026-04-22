@@ -68,13 +68,13 @@ class PPOTrainerDeepSpeed:
         for param in policy_model.parameters():
             param.requires_grad = True
         
-        policy_params = [p for p in policy_model.parameters() if p.requires_grad]
-        logger.info(f"Policy model has {len(policy_params)} trainable parameters")
+        trainable_count = sum(1 for p in policy_model.parameters() if p.requires_grad)
+        logger.info(f"Policy model has {trainable_count} trainable parameters")
         
         logger.info("Initializing policy DeepSpeed engine (ZeRO-3)")
+        # Don't pass model_parameters - let DeepSpeed handle all parameters
         self.policy_engine, self.policy_optimizer, _, _ = deepspeed.initialize(
             model=policy_model,
-            model_parameters=policy_params,
             config=ds_cfg,
         )
         
