@@ -190,49 +190,49 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
                 sys.modules['transformers.integrations.tensor_parallel'] = mock_module
             
             # Load and merge adapter (only on rank 0 for DeepSpeed)
-            # Always load on GPU with controlled memory, then DeepSpeed will shard
-            max_memory = {}
-            for i in range(torch.cuda.device_count()):
-                total_memory = torch.cuda.get_device_properties(i).total_memory
-                max_memory[i] = int(total_memory * max_gpu_memory_utilization)
-            max_memory["cpu"] = "100GB"  # Allow CPU offload if needed
-            
-            target_memory_gb = max_memory[0] / (1024**3)
-            logger.info(
-                "Loading model with %.1f%% GPU memory limit (~%.1f GB on GPU 0)",
-                max_gpu_memory_utilization * 100,
-                target_memory_gb,
-            )
-            
-            # Use low_cpu_mem_usage to prevent 90% GPU allocation
-            # Load on CPU first, then move controlled amount to GPU
-            base_model = AutoModelForCausalLM.from_pretrained(
-                base_model_name,
-                torch_dtype=torch.bfloat16,
-                device_map={"": "cpu"},  # Force CPU loading
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-            )
-            
-            # Now move to GPU with strict memory constraint
-            logger.info(f"Moving model to GPU with {target_memory_gb:.1f}GB limit")
-            base_model = base_model.to("cuda:0")
-            log_gpu_memory("After base model loading")
-            
-            policy = PeftModel.from_pretrained(base_model, config.base_model)
-            policy = policy.merge_and_unload()
-            
-            log_gpu_memory("After adapter merge")
-            
             if use_deepspeed:
-                # Move to CPU before DeepSpeed init to free GPU memory
-                # DeepSpeed will reload and shard across GPUs
-                logger.info("Moving merged model to CPU for DeepSpeed re-initialization")
-                policy = policy.cpu()
-                torch.cuda.empty_cache()
-                log_gpu_memory("After moving to CPU and clearing cache")
+                # For DeepSpeed: load directly on CPU, never touch GPU
+                logger.info("Loading model on CPU for DeepSpeed (0% GPU allocation)")
+                base_model = AutoModelForCausalLM.from_pretrained(
+                    base_model_name,
+                    torch_dtype=torch.bfloat16,
+                    device_map={"": "cpu"},
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                )
+                log_gpu_memory("After base model loading on CPU")
+                
+                policy = PeftModel.from_pretrained(base_model, config.base_model)
+                policy = policy.merge_and_unload()
+                log_gpu_memory("After adapter merge on CPU")
             else:
-                logger.info("Policy model loaded on GPU with controlled memory")
+                # For standard training: load on GPU with controlled memory
+                max_memory = {}
+                for i in range(torch.cuda.device_count()):
+                    total_memory = torch.cuda.get_device_properties(i).total_memory
+                    max_memory[i] = int(total_memory * max_gpu_memory_utilization)
+                max_memory["cpu"] = "100GB"
+                
+                target_memory_gb = max_memory[0] / (1024**3)
+                logger.info(
+                    "Loading model with %.1f%% GPU memory limit (~%.1f GB on GPU 0)",
+                    max_gpu_memory_utilization * 100,
+                    target_memory_gb,
+                )
+                
+                base_model = AutoModelForCausalLM.from_pretrained(
+                    base_model_name,
+                    torch_dtype=torch.bfloat16,
+                    device_map={"": "cpu"},
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                )
+                base_model = base_model.to("cuda:0")
+                log_gpu_memory("After base model loading")
+                
+                policy = PeftModel.from_pretrained(base_model, config.base_model)
+                policy = policy.merge_and_unload()
+                log_gpu_memory("After adapter merge")
         else:
             # Non-main ranks: load base architecture without weights (DeepSpeed will sync)
             logger.info("Rank %s: Loading model architecture only", os.environ.get("LOCAL_RANK"))
@@ -240,15 +240,17 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
             config_obj = AutoConfig.from_pretrained(base_model_name, trust_remote_code=True)
             policy = AutoModelForCausalLM.from_config(config_obj, torch_dtype=torch.bfloat16)
 
-        # ValueHead: always load on GPU with controlled memory
-        max_memory = {}
-        for i in range(torch.cuda.device_count()):
-            total_memory = torch.cuda.get_device_properties(i).total_memory
-            max_memory[i] = int(total_memory * max_gpu_memory_utilization)
-        max_memory["cpu"] = "100GB"
-        value = ValueHead(base_model_name, model_device_map="auto", max_memory=max_memory)
-        
-        log_gpu_memory("After ValueHead loading")
+        # ValueHead: load on CPU for DeepSpeed (never touch GPU), load on GPU for standard
+        if use_deepspeed:
+            logger.info("Loading ValueHead on CPU for DeepSpeed (0% GPU allocation)")
+            value = ValueHead(base_model_name, model_device_map={"": "cpu"})
+            log_gpu_memory("After ValueHead loading on CPU")
+        else:
+            logger.info("Loading ValueHead on GPU with controlled memory")
+            value = ValueHead(base_model_name, model_device_map={"": "cpu"})
+            value.backbone = value.backbone.to("cuda:0")
+            value.value_head = value.value_head.to("cuda:0")
+            log_gpu_memory("After ValueHead loading on GPU")
     else:
         logger.info("Loading full model: %s", config.base_model)
         tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
@@ -256,38 +258,41 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
             tokenizer.pad_token = tokenizer.eos_token
         
         if is_main_process or not use_deepspeed:
-            # Calculate max memory per GPU based on utilization percentage
-            max_memory = {}
-            for i in range(torch.cuda.device_count()):
-                total_memory = torch.cuda.get_device_properties(i).total_memory
-                max_memory[i] = int(total_memory * max_gpu_memory_utilization)
-            max_memory["cpu"] = "100GB"
-            
-            target_memory_gb = max_memory[0] / (1024**3)
-            logger.info(
-                "Loading model with %.1f%% GPU memory limit (~%.1f GB on GPU 0)",
-                max_gpu_memory_utilization * 100,
-                target_memory_gb,
-            )
-            
-            # Use low_cpu_mem_usage to prevent 90% GPU allocation
-            policy = AutoModelForCausalLM.from_pretrained(
-                config.base_model,
-                torch_dtype=torch.bfloat16,
-                device_map={"": "cpu"},  # Force CPU loading
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-            )
-            
-            logger.info(f"Moving model to GPU with {target_memory_gb:.1f}GB limit")
-            policy = policy.to("cuda:0")
-            
             if use_deepspeed:
-                # Move to CPU before DeepSpeed init to free GPU memory
-                logger.info("Moving model to CPU for DeepSpeed re-initialization")
-                policy = policy.cpu()
+                # For DeepSpeed: load on CPU only
+                logger.info("Loading full model on CPU for DeepSpeed (0% GPU allocation)")
+                policy = AutoModelForCausalLM.from_pretrained(
+                    config.base_model,
+                    torch_dtype=torch.bfloat16,
+                    device_map={"": "cpu"},
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                )
+                log_gpu_memory("After full model loading on CPU")
             else:
-                logger.info("Policy model loaded with controlled GPU memory")
+                # For standard training: load on GPU with controlled memory
+                max_memory = {}
+                for i in range(torch.cuda.device_count()):
+                    total_memory = torch.cuda.get_device_properties(i).total_memory
+                    max_memory[i] = int(total_memory * max_gpu_memory_utilization)
+                max_memory["cpu"] = "100GB"
+                
+                target_memory_gb = max_memory[0] / (1024**3)
+                logger.info(
+                    "Loading model with %.1f%% GPU memory limit (~%.1f GB on GPU 0)",
+                    max_gpu_memory_utilization * 100,
+                    target_memory_gb,
+                )
+                
+                policy = AutoModelForCausalLM.from_pretrained(
+                    config.base_model,
+                    torch_dtype=torch.bfloat16,
+                    device_map={"": "cpu"},
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                )
+                policy = policy.to("cuda:0")
+                log_gpu_memory("After model loading")
         else:
             # Non-main ranks: load architecture only
             logger.info("Rank %s: Loading model architecture only", os.environ.get("LOCAL_RANK"))
@@ -295,13 +300,17 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
             config_obj = AutoConfig.from_pretrained(config.base_model, trust_remote_code=True)
             policy = AutoModelForCausalLM.from_config(config_obj, torch_dtype=torch.bfloat16)
         
-        # ValueHead: always load on GPU with controlled memory
-        max_memory = {}
-        for i in range(torch.cuda.device_count()):
-            total_memory = torch.cuda.get_device_properties(i).total_memory
-            max_memory[i] = int(total_memory * max_gpu_memory_utilization)
-        max_memory["cpu"] = "100GB"
-        value = ValueHead(config.base_model, model_device_map="auto", max_memory=max_memory)
+        # ValueHead: load on CPU for DeepSpeed, GPU for standard
+        if use_deepspeed:
+            logger.info("Loading ValueHead on CPU for DeepSpeed (0% GPU allocation)")
+            value = ValueHead(config.base_model, model_device_map={"": "cpu"})
+            log_gpu_memory("After ValueHead loading on CPU")
+        else:
+            logger.info("Loading ValueHead on GPU with controlled memory")
+            value = ValueHead(config.base_model, model_device_map={"": "cpu"})
+            value.backbone = value.backbone.to("cuda:0")
+            value.value_head = value.value_head.to("cuda:0")
+            log_gpu_memory("After ValueHead loading on GPU")
 
     policy_device = getattr(policy, "device", "sharded")
     logger.info("Policy loaded on device: %s", policy_device)

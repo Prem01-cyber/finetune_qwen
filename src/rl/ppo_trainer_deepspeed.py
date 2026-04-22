@@ -85,7 +85,13 @@ class PPOTrainerDeepSpeed:
         )
         
         # Move value network to same device as policy
-        self.value = value_model.to(self.policy_engine.device)
+        # Manually move submodules to avoid triggering accelerate's device_map
+        target_device = self.policy_engine.device
+        logger.info(f"Moving value network to device: {target_device}")
+        value_model.backbone = value_model.backbone.to(target_device)
+        value_model.value_head = value_model.value_head.to(target_device)
+        
+        self.value = value_model
         self.value_optimizer = torch.optim.AdamW(
             [p for p in value_model.parameters() if p.requires_grad],
             lr=learning_rate,
