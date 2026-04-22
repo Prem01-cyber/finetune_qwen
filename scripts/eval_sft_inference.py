@@ -45,6 +45,7 @@ from datasets import load_dataset
 from peft import PeftModel
 from sympy import simplify
 from sympy.parsing.sympy_parser import parse_expr
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from scripts.convert_gsm8k_to_sft import parse_gsm8k_answer
@@ -149,15 +150,19 @@ def _generate(
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    # HuggingFace warns once-per-call when `temperature`/`top_p` are passed
+    # alongside `do_sample=False`.  Skip those kwargs entirely in greedy mode
+    # so long eval loops don't spam the log.
+    gen_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": not greedy,
+        "pad_token_id": tokenizer.pad_token_id,
+    }
+    if not greedy:
+        gen_kwargs["temperature"] = temperature
+        gen_kwargs["top_p"] = top_p
     with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=not greedy,
-            pad_token_id=tokenizer.pad_token_id,
-        )
+        out = model.generate(**inputs, **gen_kwargs)
     gen_ids = out[0, inputs["input_ids"].shape[1] :]
     return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
@@ -363,7 +368,18 @@ def evaluate_gsm8k(
     correct = 0
     total = len(rows)
 
-    for i, row in enumerate(rows):
+    # tqdm gives us a live progress bar with ETA; the `postfix` surfaces the
+    # running accuracy so long runs are interpretable mid-flight.  Falls back
+    # gracefully in non-TTY environments (tqdm.auto picks notebook vs plain).
+    pbar = tqdm(
+        rows,
+        total=total,
+        desc="GSM8K eval",
+        unit="q",
+        dynamic_ncols=True,
+        leave=True,
+    )
+    for i, row in enumerate(pbar):
         try:
             pred_text = _generate(
                 model=model,
@@ -381,6 +397,13 @@ def evaluate_gsm8k(
                 correct += 1
         except Exception as exc:
             _logger.debug(f"Sample {i} error: {exc}")
+
+        done = i + 1
+        pbar.set_postfix(
+            acc=f"{correct / done:.1%}",
+            correct=f"{correct}/{done}",
+            refresh=False,
+        )
 
     accuracy = correct / total if total > 0 else 0.0
     return {
