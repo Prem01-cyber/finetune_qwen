@@ -5,6 +5,7 @@ Ray-backed PPO trainer for distributed rollout collection.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import ray
@@ -83,22 +84,38 @@ class PPOTrainerRay:
         self.latest_trajectories: List[Trajectory] = []
 
         if not ray.is_initialized():
+            import os
+            os.environ.setdefault("RAY_DISABLE_DOCKER_CPU_WARNING", "1")
             ray.init(
                 num_gpus=self.num_workers,
                 ignore_reinit_error=True,
                 include_dashboard=False,
                 log_to_driver=False,
+                _system_config={
+                    "object_spilling_config": None,
+                },
             )
+            logger.info("Ray initialized with %d GPUs", self.num_workers)
+            time.sleep(2)  # Give Ray cluster time to stabilize
 
         worker_cfg = dict(config.__dict__)
         worker_cfg["reference_questions"] = list(reference_questions or [])
         worker_cfg["use_multi_gpu_rollouts"] = False
         worker_cfg["use_vllm_rollouts"] = bool(getattr(config, "use_vllm_rollouts", False))
 
+        logger.info("Creating %d Ray workers...", self.num_workers)
         self.workers = [
             RolloutWorker.remote(config_dict=worker_cfg, worker_id=i)
             for i in range(self.num_workers)
         ]
+
+        logger.info("Waiting for workers to initialize...")
+        try:
+            health_checks = ray.get([worker.ping.remote() for worker in self.workers], timeout=60.0)
+            logger.info("All %d workers ready: %s", len(health_checks), health_checks)
+        except Exception as exc:
+            logger.error("Worker initialization failed: %s", exc)
+            raise
 
         self.central_trainer = PPOTrainer(
             policy_model=policy_model,
@@ -115,7 +132,9 @@ class PPOTrainerRay:
             target_kl=config.target_kl,
         )
 
+        logger.info("Syncing initial policy to workers...")
         self._sync_workers()
+        logger.info("PPOTrainerRay initialization complete")
 
     def collect_rollouts(
         self,
@@ -172,12 +191,20 @@ class PPOTrainerRay:
         return metrics
 
     def _sync_workers(self) -> None:
-        policy_state_dict = {
-            key: value.detach().cpu()
-            for key, value in self.central_trainer.policy.state_dict().items()
-        }
-        state_ref = ray.put(policy_state_dict)
-        ray.get([worker.update_policy.remote(state_ref) for worker in self.workers])
+        try:
+            policy_state_dict = {
+                key: value.detach().cpu()
+                for key, value in self.central_trainer.policy.state_dict().items()
+            }
+            logger.debug("Syncing %d policy parameters to workers", len(policy_state_dict))
+            
+            state_ref = ray.put(policy_state_dict)
+            futures = [worker.update_policy.remote(state_ref) for worker in self.workers]
+            ray.get(futures, timeout=120.0)
+            logger.debug("Policy sync completed")
+        except Exception as exc:
+            logger.error("Worker sync failed: %s", exc)
+            raise
 
     def save_checkpoint(self, path: str) -> None:
         self.central_trainer.save_checkpoint(path)
