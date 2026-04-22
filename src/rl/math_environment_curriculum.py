@@ -20,6 +20,7 @@ from src.rl.quality_filter import QualityFilter
 from src.rl.question_quality_evaluator import QuestionQualityEvaluator
 from src.rl.replay_buffer import GenerationalReplayBuffer
 from src.rl.value_network import ValueHead
+from src.rl.vllm_generator import VLLMQuestionGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,9 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         temperature: float = 0.7,
         top_p: float = 0.9,
         consensus_temperature: float = 0.7,
+        use_vllm: bool = False,
+        vllm_tensor_parallel_size: int = 1,
+        vllm_batch_size: int = 16,
     ):
         super().__init__(
             policy_model=policy_model,
@@ -103,6 +107,25 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         self.quality_filter = QualityFilter(novelty_threshold=0.5)  # Relaxed from 0.7
         self.last_replay_ratio: float = 0.0
         self.last_rollout_mix: Dict[str, int] = {"fresh": 0, "replay": 0}
+        self.vllm_batch_size = max(1, int(vllm_batch_size))
+        self.vllm_generator: Optional[VLLMQuestionGenerator] = None
+
+        if use_vllm:
+            model_name_or_path = str(getattr(getattr(policy_model, "config", None), "_name_or_path", ""))
+            model_name_or_path = model_name_or_path or str(
+                getattr(getattr(policy_model, "config", None), "name_or_path", "")
+            )
+            if model_name_or_path:
+                try:
+                    self.vllm_generator = VLLMQuestionGenerator(
+                        model_path=model_name_or_path,
+                        tensor_parallel_size=vllm_tensor_parallel_size,
+                    )
+                    logger.info("Enabled vLLM question generation with batch size=%d", self.vllm_batch_size)
+                except Exception as exc:
+                    logger.warning("Failed to initialize vLLM generator: %s. Falling back to HF generation.", exc)
+            else:
+                logger.warning("Could not determine model path for vLLM; using HF generation.")
 
     def sample_instruction(self) -> Tuple[str, str, float]:
         topic, difficulty = self.curriculum_manager.select_topic_and_difficulty()
@@ -179,8 +202,6 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         }
 
     def rollout_trajectory(self) -> Trajectory:
-        trajectory = Trajectory()
-
         instruction, target_topic, target_difficulty = self.sample_instruction()
         question_prompt = self.format_question_generation_prompt(instruction)
         generated_question, question_transitions = self.generate_with_logging(
@@ -188,6 +209,24 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             max_tokens=self.max_question_tokens,
             phase="question_generation",
         )
+        return self._build_trajectory_from_question(
+            instruction=instruction,
+            target_topic=target_topic,
+            target_difficulty=target_difficulty,
+            generated_question=generated_question,
+            question_transitions=question_transitions,
+        )
+
+    def _build_trajectory_from_question(
+        self,
+        instruction: str,
+        target_topic: str,
+        target_difficulty: float,
+        generated_question: str,
+        question_transitions: Optional[List] = None,
+    ) -> Trajectory:
+        trajectory = Trajectory()
+        question_transitions = question_transitions or []
 
         solution_prompt = self.format_solution_prompt(generated_question)
         generated_solution, solution_transitions = self.generate_with_logging(
@@ -363,6 +402,95 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 len(fresh_trajectories),
                 len(replay_trajectories),
                 replay_ratio,
+                len(self.replay_buffer),
+                float(buffer_stats.get("buffer_health", 0.0)),
+            )
+
+        self.curriculum_manager.increment_iteration()
+        self.curriculum_manager.save_state(iteration=self.curriculum_manager.current_iteration, rollout=None)
+        return trajectories
+
+    def collect_rollouts_batched(
+        self,
+        num_trajectories: int,
+        batch_size: Optional[int] = None,
+        verbose: bool = True,
+    ) -> List[Trajectory]:
+        """
+        Collect rollouts with optional batched vLLM question generation.
+
+        Solution generation remains token-level in PyTorch to preserve PPO
+        transition logging (state/action/logprob/value) for training.
+        """
+        if num_trajectories <= 0:
+            return []
+
+        replay_ratio = self._get_adaptive_replay_ratio()
+        num_replay = int(num_trajectories * replay_ratio)
+        num_replay = min(num_replay, len(self.replay_buffer))
+        num_fresh = max(0, num_trajectories - num_replay)
+        effective_batch_size = max(1, int(batch_size or self.vllm_batch_size))
+
+        fresh_trajectories: List[Trajectory] = []
+        if self.vllm_generator is None:
+            fresh_trajectories = [self.rollout_trajectory() for _ in range(num_fresh)]
+        else:
+            remaining = num_fresh
+            while remaining > 0:
+                current_batch = min(remaining, effective_batch_size)
+                sampled = [self.sample_instruction() for _ in range(current_batch)]
+                question_prompts = [
+                    self.format_question_generation_prompt(instruction)
+                    for instruction, _, _ in sampled
+                ]
+                generated_questions = self.vllm_generator.generate_questions_batch(
+                    prompts=question_prompts,
+                    max_tokens=self.max_question_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                )
+
+                for generated_question, (instruction, target_topic, target_difficulty) in zip(
+                    generated_questions, sampled
+                ):
+                    trajectory = self._build_trajectory_from_question(
+                        instruction=instruction,
+                        target_topic=target_topic,
+                        target_difficulty=target_difficulty,
+                        generated_question=generated_question.strip(),
+                        question_transitions=[],
+                    )
+                    fresh_trajectories.append(trajectory)
+                remaining -= current_batch
+
+        replay_trajectories = self.replay_buffer.sample_replay_batch(num_replay, diversity_sample=True)
+        for trajectory in replay_trajectories:
+            trajectory.metadata["rollout_source"] = "replay"
+        for trajectory in fresh_trajectories:
+            trajectory.metadata["rollout_source"] = "fresh"
+            if self.vllm_generator is not None:
+                trajectory.metadata["question_generation_backend"] = "vllm"
+                trajectory.metadata["question_transitions_logged"] = False
+            else:
+                trajectory.metadata["question_generation_backend"] = "hf"
+                trajectory.metadata["question_transitions_logged"] = True
+
+        trajectories = fresh_trajectories + replay_trajectories
+        random.shuffle(trajectories)
+
+        self.last_replay_ratio = replay_ratio
+        self.last_rollout_mix = {"fresh": len(fresh_trajectories), "replay": len(replay_trajectories)}
+
+        if verbose:
+            buffer_stats = self.replay_buffer.get_buffer_stats(
+                current_iteration=self.curriculum_manager.current_iteration
+            )
+            logger.info(
+                "Batched rollout mix: %d fresh + %d replay (ratio=%.2f, backend=%s, buffer_size=%d, health=%.3f)",
+                len(fresh_trajectories),
+                len(replay_trajectories),
+                replay_ratio,
+                "vllm" if self.vllm_generator is not None else "hf",
                 len(self.replay_buffer),
                 float(buffer_stats.get("buffer_health", 0.0)),
             )

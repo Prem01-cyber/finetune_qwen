@@ -54,8 +54,12 @@ class CurriculumTrainingConfig:
     consensus_temperature = 0.5  # Lowered from 0.7 for higher consensus rate
 
     num_iterations = 10
-    eval_every = 1
+    eval_every = 5  # Reduced from 1 to save 80% of eval time
     save_every = 1
+    use_torch_compile = True  # Enable torch.compile for faster inference
+    use_vllm_rollouts = False
+    rollout_batch_size = 16
+    vllm_tensor_parallel_size = 1
 
     output_dir = "checkpoints/ppo_training_curriculum"
     curriculum_checkpoint_dir = "checkpoints/ppo_training_curriculum/curriculum"
@@ -133,6 +137,15 @@ def initialize_models(config: CurriculumTrainingConfig):
         value = ValueHead(config.base_model).to(policy.device)
 
     logger.info("Policy loaded on device: %s", policy.device)
+    
+    if config.use_torch_compile:
+        try:
+            logger.info("Compiling policy model with torch.compile (may take 2-3 min on first run)...")
+            policy = torch.compile(policy, mode="reduce-overhead")
+            logger.info("Policy model compiled successfully")
+        except Exception as e:
+            logger.warning("torch.compile failed: %s. Continuing without compilation.", e)
+    
     return policy, value, tokenizer
 
 
@@ -275,6 +288,9 @@ def main():
     parser.add_argument("--gsm8k-reference-data", type=str, default="data/sft/gsm8k_sft.jsonl")
     parser.add_argument("--skip-initial-eval", action="store_true")
     parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument("--use-vllm-rollouts", action="store_true")
+    parser.add_argument("--rollout-batch-size", type=int, default=16)
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     args = parser.parse_args()
 
     config = CurriculumTrainingConfig()
@@ -286,6 +302,9 @@ def main():
     config.gsm8k_reference_data = args.gsm8k_reference_data
     config.curriculum_checkpoint_dir = str(Path(args.output_dir) / "curriculum")
     config.use_wandb = not args.no_wandb
+    config.use_vllm_rollouts = args.use_vllm_rollouts
+    config.rollout_batch_size = max(1, int(args.rollout_batch_size))
+    config.vllm_tensor_parallel_size = max(1, int(args.vllm_tensor_parallel_size))
 
     if config.use_wandb:
         try:
@@ -314,6 +333,9 @@ def main():
         temperature=config.temperature,
         top_p=config.top_p,
         consensus_temperature=config.consensus_temperature,
+        use_vllm=config.use_vllm_rollouts,
+        vllm_tensor_parallel_size=config.vllm_tensor_parallel_size,
+        vllm_batch_size=config.rollout_batch_size,
     )
 
     ppo_trainer = PPOTrainer(
@@ -348,10 +370,17 @@ def main():
             current_phase.name,
             current_phase.description,
         )
-        trajectories = math_env.collect_rollouts(
-            num_trajectories=config.num_rollouts_per_iter,
-            verbose=True,
-        )
+        if config.use_vllm_rollouts:
+            trajectories = math_env.collect_rollouts_batched(
+                num_trajectories=config.num_rollouts_per_iter,
+                batch_size=config.rollout_batch_size,
+                verbose=True,
+            )
+        else:
+            trajectories = math_env.collect_rollouts(
+                num_trajectories=config.num_rollouts_per_iter,
+                verbose=True,
+            )
 
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
         rollout_buffer = RolloutBuffer(
