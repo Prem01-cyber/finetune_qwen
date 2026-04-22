@@ -63,7 +63,7 @@ class CurriculumTrainingConfig:
     gsm8k_reference_data = "data/sft/gsm8k_sft.jsonl"
 
     use_wandb = True
-    wandb_project = "math-self-improvement-curriculum"
+    wandb_project = "math-ppo-curriculum"
     wandb_run_name = None
 
 
