@@ -98,5 +98,4 @@ wandb
 wcwidth==0.6.0
 xxhash==3.6.0
 yarl==1.23.0
-ray[default]
 vllm

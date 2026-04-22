@@ -16,6 +16,8 @@ from src.rl.curriculum_manager import CurriculumManager
 from src.rl.expert_panel import SimulatedExpertPanel
 from src.rl.math_environment_consensus import ConsensusMathEnvironment
 from src.rl.mdp_components import Trajectory
+from src.rl.multi_gpu_coordinator import MultiGPUCoordinator
+from src.rl.multi_gpu_rollout_worker import WorkerRuntimeConfig
 from src.rl.quality_filter import QualityFilter
 from src.rl.question_quality_evaluator import QuestionQualityEvaluator
 from src.rl.replay_buffer import GenerationalReplayBuffer
@@ -85,6 +87,9 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         use_vllm: bool = False,
         vllm_tensor_parallel_size: int = 1,
         vllm_batch_size: int = 16,
+        vllm_gpu_memory_utilization: float = 0.9,
+        base_model_path: Optional[str] = None,
+        parallel_worker_timeout_seconds: float = 900.0,
     ):
         super().__init__(
             policy_model=policy_model,
@@ -97,6 +102,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             consensus_temperature=consensus_temperature,
         )
         self.reference_questions = reference_questions or []
+        self.consensus_temperature = consensus_temperature
         self.curriculum_manager = CurriculumManager(checkpoint_dir=curriculum_checkpoint_dir)
         self.curriculum_manager.initialize(bootstrap_questions=self.reference_questions)
         self.curriculum_manager.load_checkpoint_safe()
@@ -107,19 +113,27 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         self.quality_filter = QualityFilter(novelty_threshold=0.5)  # Relaxed from 0.7
         self.last_replay_ratio: float = 0.0
         self.last_rollout_mix: Dict[str, int] = {"fresh": 0, "replay": 0}
+        self.last_parallel_rollout_details: Dict[str, object] = {}
         self.vllm_batch_size = max(1, int(vllm_batch_size))
+        self.vllm_gpu_memory_utilization = float(vllm_gpu_memory_utilization)
+        self.base_model_path = base_model_path
+        self.parallel_worker_timeout_seconds = float(parallel_worker_timeout_seconds)
         self.vllm_generator: Optional[VLLMQuestionGenerator] = None
+        self.parallel_rollout_coordinator: Optional[MultiGPUCoordinator] = None
+        self._parallel_rollout_num_gpus: Optional[int] = None
 
         if use_vllm:
             model_name_or_path = str(getattr(getattr(policy_model, "config", None), "_name_or_path", ""))
             model_name_or_path = model_name_or_path or str(
                 getattr(getattr(policy_model, "config", None), "name_or_path", "")
             )
+            model_name_or_path = model_name_or_path or str(base_model_path or "")
             if model_name_or_path:
                 try:
                     self.vllm_generator = VLLMQuestionGenerator(
                         model_path=model_name_or_path,
                         tensor_parallel_size=vllm_tensor_parallel_size,
+                        gpu_memory_utilization=self.vllm_gpu_memory_utilization,
                     )
                     logger.info("Enabled vLLM question generation with batch size=%d", self.vllm_batch_size)
                 except Exception as exc:
@@ -370,6 +384,134 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             return 0.25
         return 0.2
 
+    def collect_fresh_rollouts_batched(
+        self,
+        num_trajectories: int,
+        batch_size: Optional[int] = None,
+        verbose: bool = True,
+    ) -> List[Trajectory]:
+        if num_trajectories <= 0:
+            return []
+
+        effective_batch_size = max(1, int(batch_size or self.vllm_batch_size))
+        fresh_trajectories: List[Trajectory] = []
+        if self.vllm_generator is None:
+            fresh_trajectories = [self.rollout_trajectory() for _ in range(num_trajectories)]
+        else:
+            remaining = num_trajectories
+            while remaining > 0:
+                current_batch = min(remaining, effective_batch_size)
+                sampled = [self.sample_instruction() for _ in range(current_batch)]
+                question_prompts = [
+                    self.format_question_generation_prompt(instruction)
+                    for instruction, _, _ in sampled
+                ]
+                generated_questions = self.vllm_generator.generate_questions_batch(
+                    prompts=question_prompts,
+                    max_tokens=self.max_question_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                )
+
+                for generated_question, (instruction, target_topic, target_difficulty) in zip(
+                    generated_questions, sampled
+                ):
+                    trajectory = self._build_trajectory_from_question(
+                        instruction=instruction,
+                        target_topic=target_topic,
+                        target_difficulty=target_difficulty,
+                        generated_question=generated_question.strip(),
+                        question_transitions=[],
+                    )
+                    fresh_trajectories.append(trajectory)
+                remaining -= current_batch
+        for trajectory in fresh_trajectories:
+            trajectory.metadata["rollout_source"] = "fresh"
+            if self.vllm_generator is not None:
+                trajectory.metadata["question_generation_backend"] = "vllm"
+                trajectory.metadata["question_transitions_logged"] = False
+            else:
+                trajectory.metadata["question_generation_backend"] = "hf"
+                trajectory.metadata["question_transitions_logged"] = True
+        if verbose:
+            logger.info("Collected %d fresh trajectories (backend=%s)", len(fresh_trajectories), "vllm" if self.vllm_generator is not None else "hf")
+        return fresh_trajectories
+
+    def _ensure_parallel_rollout_coordinator(self, num_gpus: Optional[int]) -> MultiGPUCoordinator:
+        requested_gpus = int(num_gpus) if num_gpus is not None else None
+        if (
+            self.parallel_rollout_coordinator is not None
+            and self._parallel_rollout_num_gpus == requested_gpus
+        ):
+            return self.parallel_rollout_coordinator
+
+        self.shutdown_parallel_rollout_workers()
+        worker_base_model = str(self.base_model_path or getattr(getattr(self.policy, "config", None), "_name_or_path", ""))
+        if not worker_base_model:
+            raise RuntimeError("Cannot initialize parallel rollout workers without a base model path.")
+        worker_cfg = WorkerRuntimeConfig(
+            base_model=worker_base_model,
+            reference_questions=self.reference_questions,
+            curriculum_checkpoint_dir=str(self.curriculum_manager.checkpoint_dir / "parallel_workers"),
+            max_question_tokens=self.max_question_tokens,
+            max_solution_tokens=self.max_solution_tokens,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            consensus_temperature=self.consensus_temperature,
+            use_vllm=self.vllm_generator is not None,
+            vllm_batch_size=self.vllm_batch_size,
+            vllm_tensor_parallel_size=1,
+            vllm_gpu_memory_utilization=self.vllm_gpu_memory_utilization,
+        )
+        self.parallel_rollout_coordinator = MultiGPUCoordinator(
+            worker_config=worker_cfg,
+            num_gpus=requested_gpus,
+            worker_timeout_seconds=self.parallel_worker_timeout_seconds,
+        )
+        self._parallel_rollout_num_gpus = requested_gpus
+        return self.parallel_rollout_coordinator
+
+    def _sync_curriculum_from_metadata(self, trajectory: Trajectory) -> None:
+        meta = trajectory.metadata
+        try:
+            solution_success = bool(meta.get("consensus_achieved", False)) and bool(
+                meta.get("primary_matches_majority", False)
+            )
+            self.curriculum_manager.update_from_trajectory(
+                topic=str(meta.get("target_topic", "unknown")),
+                question_reward=float(meta.get("question_reward", 0.0)),
+                solution_success=solution_success,
+                combined_reward=float(meta.get("combined_reward", 0.0)),
+                measured_difficulty=float(meta.get("estimated_difficulty", meta.get("target_difficulty", 0.5))),
+            )
+        except Exception as exc:
+            logger.warning("Failed syncing curriculum update from worker trajectory metadata: %s", exc)
+
+    def _admit_to_main_replay_buffer(self, trajectory: Trajectory) -> None:
+        metadata = trajectory.metadata
+        is_candidate, reason = self.quality_filter.meets_replay_criteria(metadata)
+        metadata["replay_candidate"] = bool(is_candidate)
+
+        if not is_candidate:
+            metadata["replay_novelty"] = 0.0
+            metadata["replay_added"] = False
+            metadata["replay_reject_reason"] = reason
+            return
+
+        novelty_score = self.quality_filter.check_novelty(trajectory, self.replay_buffer.buffer)
+        metadata["replay_novelty"] = float(novelty_score)
+        if self.quality_filter.is_novel_enough(novelty_score):
+            quality_score = self.quality_filter.compute_quality_score(metadata)
+            self.replay_buffer.add_trajectory(
+                trajectory=trajectory,
+                metadata=metadata,
+                iteration=self.curriculum_manager.current_iteration,
+                quality_score=quality_score,
+            )
+            metadata["replay_added"] = True
+        else:
+            metadata["replay_added"] = False
+
     def collect_rollouts(self, num_trajectories: int, verbose: bool = True) -> List[Trajectory]:
         replay_ratio = self._get_adaptive_replay_ratio()
         num_replay = int(num_trajectories * replay_ratio)
@@ -431,49 +573,17 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         num_fresh = max(0, num_trajectories - num_replay)
         effective_batch_size = max(1, int(batch_size or self.vllm_batch_size))
 
-        fresh_trajectories: List[Trajectory] = []
-        if self.vllm_generator is None:
-            fresh_trajectories = [self.rollout_trajectory() for _ in range(num_fresh)]
-        else:
-            remaining = num_fresh
-            while remaining > 0:
-                current_batch = min(remaining, effective_batch_size)
-                sampled = [self.sample_instruction() for _ in range(current_batch)]
-                question_prompts = [
-                    self.format_question_generation_prompt(instruction)
-                    for instruction, _, _ in sampled
-                ]
-                generated_questions = self.vllm_generator.generate_questions_batch(
-                    prompts=question_prompts,
-                    max_tokens=self.max_question_tokens,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                )
-
-                for generated_question, (instruction, target_topic, target_difficulty) in zip(
-                    generated_questions, sampled
-                ):
-                    trajectory = self._build_trajectory_from_question(
-                        instruction=instruction,
-                        target_topic=target_topic,
-                        target_difficulty=target_difficulty,
-                        generated_question=generated_question.strip(),
-                        question_transitions=[],
-                    )
-                    fresh_trajectories.append(trajectory)
-                remaining -= current_batch
+        fresh_trajectories = self.collect_fresh_rollouts_batched(
+            num_trajectories=num_fresh,
+            batch_size=effective_batch_size,
+            verbose=False,
+        )
 
         replay_trajectories = self.replay_buffer.sample_replay_batch(num_replay, diversity_sample=True)
         for trajectory in replay_trajectories:
             trajectory.metadata["rollout_source"] = "replay"
         for trajectory in fresh_trajectories:
             trajectory.metadata["rollout_source"] = "fresh"
-            if self.vllm_generator is not None:
-                trajectory.metadata["question_generation_backend"] = "vllm"
-                trajectory.metadata["question_transitions_logged"] = False
-            else:
-                trajectory.metadata["question_generation_backend"] = "hf"
-                trajectory.metadata["question_transitions_logged"] = True
 
         trajectories = fresh_trajectories + replay_trajectories
         random.shuffle(trajectories)
@@ -498,3 +608,94 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         self.curriculum_manager.increment_iteration()
         self.curriculum_manager.save_state(iteration=self.curriculum_manager.current_iteration, rollout=None)
         return trajectories
+
+    def collect_rollouts_parallel(
+        self,
+        num_trajectories: int,
+        num_gpus: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        verbose: bool = True,
+    ) -> List[Trajectory]:
+        if num_trajectories <= 0:
+            return []
+
+        replay_ratio = self._get_adaptive_replay_ratio()
+        num_replay = int(num_trajectories * replay_ratio)
+        num_replay = min(num_replay, len(self.replay_buffer))
+        num_fresh = max(0, num_trajectories - num_replay)
+
+        effective_batch_size = max(1, int(batch_size or self.vllm_batch_size))
+        fresh_trajectories: List[Trajectory] = []
+        worker_details: Dict[str, object] = {}
+        if num_fresh > 0:
+            try:
+                coordinator = self._ensure_parallel_rollout_coordinator(num_gpus=num_gpus)
+                rollout_result = coordinator.collect_rollouts_parallel(
+                    total_rollouts=num_fresh,
+                    batch_size=effective_batch_size,
+                    verbose=verbose,
+                )
+                fresh_trajectories = list(rollout_result["trajectories"])
+                worker_details = {
+                    "elapsed_seconds": float(rollout_result.get("elapsed_seconds", 0.0)),
+                    "per_worker_timings": dict(rollout_result.get("per_worker_timings", {})),
+                    "per_worker_counts": dict(rollout_result.get("per_worker_counts", {})),
+                    "num_gpus": coordinator.num_gpus,
+                }
+            except Exception as exc:
+                logger.error("Parallel rollout collection failed (%s); falling back to local batched generation.", exc)
+                fresh_trajectories = self.collect_fresh_rollouts_batched(
+                    num_trajectories=num_fresh,
+                    batch_size=effective_batch_size,
+                    verbose=verbose,
+                )
+                worker_details = {"fallback": "local_batched"}
+
+        for trajectory in fresh_trajectories:
+            trajectory.metadata["rollout_source"] = "fresh"
+            trajectory.metadata["question_generation_backend"] = "vllm" if self.vllm_generator is not None else "hf"
+            trajectory.metadata["question_transitions_logged"] = self.vllm_generator is None
+            self._sync_curriculum_from_metadata(trajectory)
+            self._admit_to_main_replay_buffer(trajectory)
+
+        replay_trajectories = self.replay_buffer.sample_replay_batch(num_replay, diversity_sample=True)
+        for trajectory in replay_trajectories:
+            trajectory.metadata["rollout_source"] = "replay"
+
+        trajectories = fresh_trajectories + replay_trajectories
+        random.shuffle(trajectories)
+        self.last_replay_ratio = replay_ratio
+        self.last_rollout_mix = {"fresh": len(fresh_trajectories), "replay": len(replay_trajectories)}
+        self.last_parallel_rollout_details = worker_details
+
+        if verbose:
+            buffer_stats = self.replay_buffer.get_buffer_stats(
+                current_iteration=self.curriculum_manager.current_iteration
+            )
+            logger.info(
+                "Parallel rollout mix: %d fresh + %d replay (ratio=%.2f, buffer_size=%d, health=%.3f, worker_details=%s)",
+                len(fresh_trajectories),
+                len(replay_trajectories),
+                replay_ratio,
+                len(self.replay_buffer),
+                float(buffer_stats.get("buffer_health", 0.0)),
+                worker_details,
+            )
+
+        self.curriculum_manager.increment_iteration()
+        self.curriculum_manager.save_state(iteration=self.curriculum_manager.current_iteration, rollout=None)
+        return trajectories
+
+    def sync_parallel_rollout_workers(self) -> Dict[str, object]:
+        if self.parallel_rollout_coordinator is None:
+            return {"workers_synced": 0}
+        return self.parallel_rollout_coordinator.sync_weights(
+            policy_model=self.policy,
+            value_model=self.value,
+        )
+
+    def shutdown_parallel_rollout_workers(self) -> None:
+        if self.parallel_rollout_coordinator is not None:
+            self.parallel_rollout_coordinator.shutdown()
+            self.parallel_rollout_coordinator = None
+            self._parallel_rollout_num_gpus = None

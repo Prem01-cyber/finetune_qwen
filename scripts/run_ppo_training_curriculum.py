@@ -6,9 +6,10 @@ import argparse
 import json
 import logging
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import wandb
@@ -19,8 +20,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.eval_sft_inference import evaluate_gsm8k
 from src.rl.math_environment_curriculum import CurriculumMathEnvironment
+from src.rl.checkpoint_manager import CheckpointManager
 from src.rl.ppo_trainer import PPOTrainer
 from src.rl.rollout_buffer import RolloutBuffer
+from src.rl.training_monitor import TrainingMonitor
 from src.rl.value_network import ValueHead
 
 
@@ -57,9 +60,13 @@ class CurriculumTrainingConfig:
     eval_every = 5  # Reduced from 1 to save 80% of eval time
     save_every = 1
     use_torch_compile = True  # Enable torch.compile for faster inference
+    use_multi_gpu_rollouts = True
     use_vllm_rollouts = False
+    num_rollout_gpus: Optional[int] = None
     rollout_batch_size = 16
     vllm_tensor_parallel_size = 1
+    vllm_gpu_memory_utilization = 0.85
+    worker_timeout_seconds = 900.0
 
     output_dir = "checkpoints/ppo_training_curriculum"
     curriculum_checkpoint_dir = "checkpoints/ppo_training_curriculum/curriculum"
@@ -69,6 +76,10 @@ class CurriculumTrainingConfig:
     use_wandb = True
     wandb_project = "math-ppo-curriculum"
     wandb_run_name = None
+    disk_warning_gb = 5.0
+    checkpoint_keep_last = 2
+    checkpoint_keep_every = 100
+    compress_old_logs = True
 
 
 def load_reference_questions(path: str) -> List[str]:
@@ -288,9 +299,17 @@ def main():
     parser.add_argument("--gsm8k-reference-data", type=str, default="data/sft/gsm8k_sft.jsonl")
     parser.add_argument("--skip-initial-eval", action="store_true")
     parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument("--disable-multi-gpu-rollouts", action="store_true")
     parser.add_argument("--use-vllm-rollouts", action="store_true")
+    parser.add_argument("--num-rollout-gpus", type=int, default=None)
     parser.add_argument("--rollout-batch-size", type=int, default=16)
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--worker-timeout-seconds", type=float, default=900.0)
+    parser.add_argument("--disk-warning-gb", type=float, default=5.0)
+    parser.add_argument("--checkpoint-keep-last", type=int, default=2)
+    parser.add_argument("--checkpoint-keep-every", type=int, default=100)
+    parser.add_argument("--no-compress-old-logs", action="store_true")
     args = parser.parse_args()
 
     config = CurriculumTrainingConfig()
@@ -302,9 +321,17 @@ def main():
     config.gsm8k_reference_data = args.gsm8k_reference_data
     config.curriculum_checkpoint_dir = str(Path(args.output_dir) / "curriculum")
     config.use_wandb = not args.no_wandb
+    config.use_multi_gpu_rollouts = not args.disable_multi_gpu_rollouts
     config.use_vllm_rollouts = args.use_vllm_rollouts
+    config.num_rollout_gpus = args.num_rollout_gpus
     config.rollout_batch_size = max(1, int(args.rollout_batch_size))
     config.vllm_tensor_parallel_size = max(1, int(args.vllm_tensor_parallel_size))
+    config.vllm_gpu_memory_utilization = float(args.vllm_gpu_memory_utilization)
+    config.worker_timeout_seconds = float(args.worker_timeout_seconds)
+    config.disk_warning_gb = float(args.disk_warning_gb)
+    config.checkpoint_keep_last = max(1, int(args.checkpoint_keep_last))
+    config.checkpoint_keep_every = max(1, int(args.checkpoint_keep_every))
+    config.compress_old_logs = not args.no_compress_old_logs
 
     if config.use_wandb:
         try:
@@ -336,6 +363,19 @@ def main():
         use_vllm=config.use_vllm_rollouts,
         vllm_tensor_parallel_size=config.vllm_tensor_parallel_size,
         vllm_batch_size=config.rollout_batch_size,
+        vllm_gpu_memory_utilization=config.vllm_gpu_memory_utilization,
+        base_model_path=config.base_model,
+        parallel_worker_timeout_seconds=config.worker_timeout_seconds,
+    )
+    training_monitor = TrainingMonitor(
+        output_dir=config.output_dir,
+        disk_warning_gb=config.disk_warning_gb,
+    )
+    checkpoint_manager = CheckpointManager(
+        output_dir=config.output_dir,
+        keep_last_n=config.checkpoint_keep_last,
+        keep_every_n=config.checkpoint_keep_every,
+        compress_old_logs=config.compress_old_logs,
     )
 
     ppo_trainer = PPOTrainer(
@@ -362,128 +402,208 @@ def main():
         initial_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
         best_accuracy = float(initial_eval["accuracy"])
 
-    for iteration in range(1, config.num_iterations + 1):
-        logger.info("\n%s\nITERATION %d/%d\n%s", "=" * 80, iteration, config.num_iterations, "=" * 80)
-        current_phase = math_env.expert_panel.get_current_expert(math_env.curriculum_manager.current_iteration)
-        logger.info(
-            "Active expert phase: %s (%s)",
-            current_phase.name,
-            current_phase.description,
-        )
-        if config.use_vllm_rollouts:
-            trajectories = math_env.collect_rollouts_batched(
-                num_trajectories=config.num_rollouts_per_iter,
-                batch_size=config.rollout_batch_size,
-                verbose=True,
-            )
-        else:
-            trajectories = math_env.collect_rollouts(
-                num_trajectories=config.num_rollouts_per_iter,
-                verbose=True,
+    try:
+        for iteration in range(1, config.num_iterations + 1):
+            iteration_start = time.perf_counter()
+            logger.info("\n%s\nITERATION %d/%d\n%s", "=" * 80, iteration, config.num_iterations, "=" * 80)
+            current_phase = math_env.expert_panel.get_current_expert(math_env.curriculum_manager.current_iteration)
+            logger.info(
+                "Active expert phase: %s (%s)",
+                current_phase.name,
+                current_phase.description,
             )
 
-        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
-        rollout_buffer = RolloutBuffer(
-            gamma=config.gamma,
-            gae_lambda=config.gae_lambda,
-            pad_token_id=int(pad_id),
-        )
-        for trajectory in trajectories:
-            rollout_buffer.add_trajectory(trajectory)
+            rollout_start = time.perf_counter()
+            if config.use_multi_gpu_rollouts:
+                trajectories = math_env.collect_rollouts_parallel(
+                    num_trajectories=config.num_rollouts_per_iter,
+                    num_gpus=config.num_rollout_gpus,
+                    batch_size=config.rollout_batch_size,
+                    verbose=True,
+                )
+            elif config.use_vllm_rollouts:
+                trajectories = math_env.collect_rollouts_batched(
+                    num_trajectories=config.num_rollouts_per_iter,
+                    batch_size=config.rollout_batch_size,
+                    verbose=True,
+                )
+            else:
+                trajectories = math_env.collect_rollouts(
+                    num_trajectories=config.num_rollouts_per_iter,
+                    verbose=True,
+                )
+            rollout_seconds = time.perf_counter() - rollout_start
 
-        buffer_stats = rollout_buffer.get_stats()
-        curriculum_stats = aggregate_curriculum_metrics(trajectories)
-        replay_stats = math_env.replay_buffer.get_buffer_stats(
-            current_iteration=math_env.curriculum_manager.current_iteration
-        )
-        logger.info("Running PPO update...")
-        training_metrics = ppo_trainer.train_step(rollout_buffer)
-        logger.info(
-            "PPO update metrics: policy_loss=%.4f value_loss=%.4f entropy=%.4f "
-            "approx_kl=%.4f clip_fraction=%.4f update_steps=%d",
-            training_metrics["policy_loss"],
-            training_metrics["value_loss"],
-            training_metrics["entropy"],
-            training_metrics["approx_kl"],
-            training_metrics["clip_fraction"],
-            int(training_metrics.get("update_steps", 0.0)),
-        )
+            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+            rollout_buffer = RolloutBuffer(
+                gamma=config.gamma,
+                gae_lambda=config.gae_lambda,
+                pad_token_id=int(pad_id),
+            )
+            for trajectory in trajectories:
+                rollout_buffer.add_trajectory(trajectory)
 
-        if iteration % config.eval_every == 0:
-            eval_results = evaluate_policy(policy, tokenizer, config.eval_data_path)
-            best_accuracy = max(best_accuracy, float(eval_results["accuracy"]))
-        else:
-            eval_results = {}
+            buffer_stats = rollout_buffer.get_stats()
+            curriculum_stats = aggregate_curriculum_metrics(trajectories)
+            replay_stats = math_env.replay_buffer.get_buffer_stats(
+                current_iteration=math_env.curriculum_manager.current_iteration
+            )
+            logger.info("Running PPO update...")
+            train_start = time.perf_counter()
+            training_metrics = ppo_trainer.train_step(rollout_buffer)
+            train_seconds = time.perf_counter() - train_start
+            logger.info(
+                "PPO update metrics: policy_loss=%.4f value_loss=%.4f entropy=%.4f "
+                "approx_kl=%.4f clip_fraction=%.4f update_steps=%d",
+                training_metrics["policy_loss"],
+                training_metrics["value_loss"],
+                training_metrics["entropy"],
+                training_metrics["approx_kl"],
+                training_metrics["clip_fraction"],
+                int(training_metrics.get("update_steps", 0.0)),
+            )
 
-        all_metrics = {
-            "iteration": iteration,
-            "buffer": buffer_stats,
-            "curriculum": curriculum_stats,
-            "training": training_metrics,
-            "eval": eval_results,
-            "curriculum_state": math_env.curriculum_manager.get_curriculum_stats(),
-            "replay_buffer": replay_stats,
-            "rollout_mix": dict(math_env.last_rollout_mix),
-            "replay_ratio": math_env.last_replay_ratio,
-        }
-        save_iteration_results(iteration, trajectories, all_metrics, config)
+            sync_metrics = {"workers_synced": 0}
+            sync_seconds = 0.0
+            if config.use_multi_gpu_rollouts:
+                sync_start = time.perf_counter()
+                try:
+                    sync_metrics = math_env.sync_parallel_rollout_workers()
+                except Exception as exc:
+                    logger.error("Failed to sync rollout workers: %s", exc)
+                    sync_metrics = {"workers_synced": 0, "error": str(exc)}
+                sync_seconds = time.perf_counter() - sync_start
 
-        if config.use_wandb:
-            wandb_metrics = {
-                "iteration": iteration,
-                "buffer/mean_reward": buffer_stats["mean_episode_reward"],
-                "buffer/mean_episode_length": buffer_stats["mean_episode_length"],
-                "training/policy_loss": training_metrics["policy_loss"],
-                "training/value_loss": training_metrics["value_loss"],
-                "training/entropy": training_metrics["entropy"],
-                "training/approx_kl": training_metrics["approx_kl"],
-                "training/clip_fraction": training_metrics["clip_fraction"],
-                "curriculum/num_topics_in_sweet_spot": curriculum_stats["topics_in_sweet_spot"],
-                "curriculum/avg_topic_match": curriculum_stats["avg_topic_match"],
-                "curriculum/avg_difficulty_match": curriculum_stats["avg_difficulty_match"],
-                "curriculum/avg_clarity": curriculum_stats["avg_clarity"],
-                "curriculum/avg_solvability": curriculum_stats["avg_solvability"],
-                "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
-                "reward/question_component": curriculum_stats["avg_question_reward"],
-                "reward/solution_component": curriculum_stats["avg_solution_reward"],
-                "reward/combined": curriculum_stats["avg_combined_reward"],
-                "reward/pre_expert": curriculum_stats["avg_pre_expert_reward"],
-                "reward/expert_modifier": curriculum_stats["avg_expert_modifier"],
-                "reward/fresh_mean": curriculum_stats["fresh_mean_reward"],
-                "reward/replay_mean": curriculum_stats["replay_mean_reward"],
-                "expert/phase_counts/pedagogy": curriculum_stats["expert_phase_counts"].get("pedagogy", 0),
-                "expert/phase_counts/accuracy": curriculum_stats["expert_phase_counts"].get("accuracy", 0),
-                "expert/phase_counts/challenge": curriculum_stats["expert_phase_counts"].get("challenge", 0),
-                "replay/ratio": math_env.last_replay_ratio,
-                "replay/fresh_rollouts": math_env.last_rollout_mix.get("fresh", 0),
-                "replay/replayed_rollouts": math_env.last_rollout_mix.get("replay", 0),
-                "replay/new_admissions": curriculum_stats["replay_added_count"],
-                "replay/buffer_size": replay_stats.get("buffer_size", 0.0),
-                "replay/avg_quality": replay_stats.get("avg_quality", 0.0),
-                "replay/quality_variance": replay_stats.get("quality_variance", 0.0),
-                "replay/staleness": replay_stats.get("staleness", 0.0),
-                "replay/topic_entropy": replay_stats.get("topic_entropy", 0.0),
-                "replay/replay_success_rate": replay_stats.get("replay_success_rate", 0.0),
-                "replay/buffer_turnover_rate": replay_stats.get("buffer_turnover_rate", 0.0),
-                "replay/topics_in_buffer": replay_stats.get("topics_in_buffer", 0.0),
-                "replay/buffer_health": replay_stats.get("buffer_health", 0.0),
+            eval_start = time.perf_counter()
+            if iteration % config.eval_every == 0:
+                eval_results = evaluate_policy(policy, tokenizer, config.eval_data_path)
+                best_accuracy = max(best_accuracy, float(eval_results["accuracy"]))
+            else:
+                eval_results = {}
+            eval_seconds = time.perf_counter() - eval_start
+
+            save_start = time.perf_counter()
+            cleanup_metrics = {"deleted_checkpoints": 0, "compressed_logs": 0}
+            if iteration % config.save_every == 0:
+                checkpoint_manager.save_checkpoint(iteration=iteration, trainer=ppo_trainer)
+                cleanup_metrics = checkpoint_manager.cleanup_old_checkpoints(current_iteration=iteration)
+            save_seconds = time.perf_counter() - save_start
+
+            total_seconds = time.perf_counter() - iteration_start
+            timing_metrics = {
+                "rollout_seconds": float(rollout_seconds),
+                "train_seconds": float(train_seconds),
+                "sync_seconds": float(sync_seconds),
+                "eval_seconds": float(eval_seconds),
+                "save_seconds": float(save_seconds),
+                "total_seconds": float(total_seconds),
+                "num_rollouts": float(len(trajectories)),
+                "estimated_tokens_generated": float(
+                    len(trajectories) * (config.max_question_tokens + 4 * config.max_solution_tokens)
+                ),
             }
-            for topic, success in curriculum_stats["per_topic_success"].items():
-                wandb_metrics[f"curriculum/topic_success/{topic}"] = success
-            for topic, difficulty in curriculum_stats["per_topic_difficulty"].items():
-                wandb_metrics[f"curriculum/topic_difficulty/{topic}"] = difficulty
-            if eval_results:
-                wandb_metrics["eval/accuracy"] = eval_results["accuracy"]
-            try:
-                wandb.log(wandb_metrics)
-            except Exception as e:
-                logger.error("Failed to log metrics to W&B at iteration %d: %s", iteration, e)
-                config.use_wandb = False
+            throughput_metrics = training_monitor.log_iteration_timing(iteration=iteration, timings=timing_metrics)
+            disk_metrics = training_monitor.check_disk_space()
+            gpu_metrics = training_monitor.log_gpu_utilization(
+                gpu_ids=list(range(config.num_rollout_gpus))
+                if config.num_rollout_gpus is not None
+                else list(range(torch.cuda.device_count()))
+            )
+            logger.info(
+                "Timing breakdown: rollout=%.1fs train=%.1fs sync=%.1fs eval=%.1fs save=%.1fs total=%.1fs",
+                timing_metrics["rollout_seconds"],
+                timing_metrics["train_seconds"],
+                timing_metrics["sync_seconds"],
+                timing_metrics["eval_seconds"],
+                timing_metrics["save_seconds"],
+                timing_metrics["total_seconds"],
+            )
 
-        if iteration % config.save_every == 0:
-            checkpoint_path = Path(config.output_dir) / f"iteration_{iteration:03d}" / "checkpoint.pt"
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            ppo_trainer.save_checkpoint(str(checkpoint_path))
+            all_metrics = {
+                "iteration": iteration,
+                "buffer": buffer_stats,
+                "curriculum": curriculum_stats,
+                "training": training_metrics,
+                "eval": eval_results,
+                "timing": timing_metrics,
+                "throughput": throughput_metrics,
+                "disk": disk_metrics,
+                "gpu": gpu_metrics,
+                "sync": sync_metrics,
+                "checkpoint_cleanup": cleanup_metrics,
+                "parallel_rollout_details": dict(math_env.last_parallel_rollout_details),
+                "curriculum_state": math_env.curriculum_manager.get_curriculum_stats(),
+                "replay_buffer": replay_stats,
+                "rollout_mix": dict(math_env.last_rollout_mix),
+                "replay_ratio": math_env.last_replay_ratio,
+            }
+            save_iteration_results(iteration, trajectories, all_metrics, config)
+
+            if config.use_wandb:
+                wandb_metrics = {
+                    "iteration": iteration,
+                    "buffer/mean_reward": buffer_stats["mean_episode_reward"],
+                    "buffer/mean_episode_length": buffer_stats["mean_episode_length"],
+                    "training/policy_loss": training_metrics["policy_loss"],
+                    "training/value_loss": training_metrics["value_loss"],
+                    "training/entropy": training_metrics["entropy"],
+                    "training/approx_kl": training_metrics["approx_kl"],
+                    "training/clip_fraction": training_metrics["clip_fraction"],
+                    "timing/rollout_seconds": timing_metrics["rollout_seconds"],
+                    "timing/train_seconds": timing_metrics["train_seconds"],
+                    "timing/sync_seconds": timing_metrics["sync_seconds"],
+                    "timing/eval_seconds": timing_metrics["eval_seconds"],
+                    "timing/save_seconds": timing_metrics["save_seconds"],
+                    "timing/total_seconds": timing_metrics["total_seconds"],
+                    "throughput/rollouts_per_second": throughput_metrics["rollouts_per_second"],
+                    "throughput/tokens_per_second": throughput_metrics["tokens_per_second"],
+                    "sync/workers_synced": float(sync_metrics.get("workers_synced", 0)),
+                    "disk/free_gb": disk_metrics.get("free_gb", 0.0),
+                    "disk/used_percent": disk_metrics.get("used_percent", 0.0),
+                    "curriculum/num_topics_in_sweet_spot": curriculum_stats["topics_in_sweet_spot"],
+                    "curriculum/avg_topic_match": curriculum_stats["avg_topic_match"],
+                    "curriculum/avg_difficulty_match": curriculum_stats["avg_difficulty_match"],
+                    "curriculum/avg_clarity": curriculum_stats["avg_clarity"],
+                    "curriculum/avg_solvability": curriculum_stats["avg_solvability"],
+                    "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
+                    "reward/question_component": curriculum_stats["avg_question_reward"],
+                    "reward/solution_component": curriculum_stats["avg_solution_reward"],
+                    "reward/combined": curriculum_stats["avg_combined_reward"],
+                    "reward/pre_expert": curriculum_stats["avg_pre_expert_reward"],
+                    "reward/expert_modifier": curriculum_stats["avg_expert_modifier"],
+                    "reward/fresh_mean": curriculum_stats["fresh_mean_reward"],
+                    "reward/replay_mean": curriculum_stats["replay_mean_reward"],
+                    "expert/phase_counts/pedagogy": curriculum_stats["expert_phase_counts"].get("pedagogy", 0),
+                    "expert/phase_counts/accuracy": curriculum_stats["expert_phase_counts"].get("accuracy", 0),
+                    "expert/phase_counts/challenge": curriculum_stats["expert_phase_counts"].get("challenge", 0),
+                    "replay/ratio": math_env.last_replay_ratio,
+                    "replay/fresh_rollouts": math_env.last_rollout_mix.get("fresh", 0),
+                    "replay/replayed_rollouts": math_env.last_rollout_mix.get("replay", 0),
+                    "replay/new_admissions": curriculum_stats["replay_added_count"],
+                    "replay/buffer_size": replay_stats.get("buffer_size", 0.0),
+                    "replay/avg_quality": replay_stats.get("avg_quality", 0.0),
+                    "replay/quality_variance": replay_stats.get("quality_variance", 0.0),
+                    "replay/staleness": replay_stats.get("staleness", 0.0),
+                    "replay/topic_entropy": replay_stats.get("topic_entropy", 0.0),
+                    "replay/replay_success_rate": replay_stats.get("replay_success_rate", 0.0),
+                    "replay/buffer_turnover_rate": replay_stats.get("buffer_turnover_rate", 0.0),
+                    "replay/topics_in_buffer": replay_stats.get("topics_in_buffer", 0.0),
+                    "replay/buffer_health": replay_stats.get("buffer_health", 0.0),
+                }
+                for topic, success in curriculum_stats["per_topic_success"].items():
+                    wandb_metrics[f"curriculum/topic_success/{topic}"] = success
+                for topic, difficulty in curriculum_stats["per_topic_difficulty"].items():
+                    wandb_metrics[f"curriculum/topic_difficulty/{topic}"] = difficulty
+                if eval_results:
+                    wandb_metrics["eval/accuracy"] = eval_results["accuracy"]
+                wandb_metrics.update(gpu_metrics)
+                try:
+                    wandb.log(wandb_metrics)
+                except Exception as e:
+                    logger.error("Failed to log metrics to W&B at iteration %d: %s", iteration, e)
+                    config.use_wandb = False
+    finally:
+        math_env.shutdown_parallel_rollout_workers()
 
     final_eval = evaluate_policy(policy, tokenizer, config.eval_data_path)
     logger.info(
