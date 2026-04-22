@@ -49,6 +49,14 @@ class TeeStream:
     def flush(self) -> None:
         self.primary.flush()
         self.secondary.flush()
+    
+    def isatty(self) -> bool:
+        """Check if primary stream is a TTY (for colored output detection)."""
+        return getattr(self.primary, 'isatty', lambda: False)()
+    
+    def fileno(self) -> int:
+        """Return file descriptor of primary stream."""
+        return self.primary.fileno()
 
 
 class CurriculumTrainingConfig:
