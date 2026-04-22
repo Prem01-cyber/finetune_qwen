@@ -137,7 +137,7 @@ def load_reference_questions(path: str) -> List[str]:
     return questions
 
 
-def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = False):
+def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = False, max_gpu_memory_utilization: float = 0.15):
     model_path = Path(config.base_model)
     is_adapter = (model_path / "adapter_config.json").exists()
     
@@ -175,19 +175,45 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
                 sys.modules['transformers.integrations.tensor_parallel'] = mock_module
             
             # Load and merge adapter (only on rank 0 for DeepSpeed)
+            # For DeepSpeed: load directly on CPU with low_cpu_mem_usage to avoid GPU allocation
+            # For standard: use device_map="auto" with max_memory constraint
+            if use_deepspeed:
+                load_kwargs = {
+                    "torch_dtype": torch.bfloat16,
+                    "device_map": "cpu",
+                    "low_cpu_mem_usage": True,
+                    "trust_remote_code": True,
+                }
+            else:
+                # Calculate max memory per GPU based on utilization percentage
+                max_memory = {}
+                for i in range(torch.cuda.device_count()):
+                    total_memory = torch.cuda.get_device_properties(i).total_memory
+                    max_memory[i] = int(total_memory * max_gpu_memory_utilization)
+                max_memory["cpu"] = "100GB"  # Allow CPU offload if needed
+                
+                logger.info(
+                    "Loading model with %.1f%% GPU memory per device (~%.1f GB on GPU 0)",
+                    max_gpu_memory_utilization * 100,
+                    max_memory[0] / (1024**3),
+                )
+                load_kwargs = {
+                    "torch_dtype": torch.bfloat16,
+                    "device_map": "auto",
+                    "max_memory": max_memory,
+                    "trust_remote_code": True,
+                }
+            
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                trust_remote_code=True,
+                **load_kwargs,
             )
             policy = PeftModel.from_pretrained(base_model, config.base_model)
             policy = policy.merge_and_unload()
             
-            # For DeepSpeed, move merged model to CPU so DeepSpeed can manage placement
-            if use_deepspeed:
-                logger.info("Moving merged model to CPU for DeepSpeed initialization")
-                policy = policy.cpu()
+            # Already on CPU if use_deepspeed=True
+            if not use_deepspeed:
+                logger.info("Policy model loaded on GPU with device_map='auto'")
         else:
             # Non-main ranks: load base architecture without weights (DeepSpeed will sync)
             logger.info("Rank %s: Loading model architecture only", os.environ.get("LOCAL_RANK"))
@@ -203,17 +229,40 @@ def initialize_models(config: CurriculumTrainingConfig, use_deepspeed: bool = Fa
             tokenizer.pad_token = tokenizer.eos_token
         
         if is_main_process or not use_deepspeed:
+            if use_deepspeed:
+                load_kwargs = {
+                    "torch_dtype": torch.bfloat16,
+                    "device_map": "cpu",
+                    "low_cpu_mem_usage": True,
+                    "trust_remote_code": True,
+                }
+            else:
+                # Calculate max memory per GPU based on utilization percentage
+                max_memory = {}
+                for i in range(torch.cuda.device_count()):
+                    total_memory = torch.cuda.get_device_properties(i).total_memory
+                    max_memory[i] = int(total_memory * max_gpu_memory_utilization)
+                max_memory["cpu"] = "100GB"
+                
+                logger.info(
+                    "Loading model with %.1f%% GPU memory per device (~%.1f GB on GPU 0)",
+                    max_gpu_memory_utilization * 100,
+                    max_memory[0] / (1024**3),
+                )
+                load_kwargs = {
+                    "torch_dtype": torch.bfloat16,
+                    "device_map": "auto",
+                    "max_memory": max_memory,
+                    "trust_remote_code": True,
+                }
+            
             policy = AutoModelForCausalLM.from_pretrained(
                 config.base_model,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                trust_remote_code=True,
+                **load_kwargs,
             )
             
-            # For DeepSpeed, move model to CPU so DeepSpeed can manage placement
-            if use_deepspeed:
-                logger.info("Moving model to CPU for DeepSpeed initialization")
-                policy = policy.cpu()
+            if not use_deepspeed:
+                logger.info("Policy model loaded with controlled GPU memory")
         else:
             # Non-main ranks: load architecture only
             logger.info("Rank %s: Loading model architecture only", os.environ.get("LOCAL_RANK"))
@@ -400,6 +449,12 @@ def main():
         help="Path to DeepSpeed config JSON",
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank used by DeepSpeed launcher")
+    parser.add_argument(
+        "--max-gpu-memory-utilization",
+        type=float,
+        default=0.15,
+        help="Max GPU memory fraction for model loading (e.g., 0.15 = 15%%, ignored when using DeepSpeed)",
+    )
     args = parser.parse_args()
 
     # NOTE: Do NOT initialize distributed here if using adapters
@@ -446,7 +501,11 @@ def main():
 
     math_env = None
     try:
-        policy, value, tokenizer = initialize_models(config, use_deepspeed=args.use_deepspeed)
+        policy, value, tokenizer = initialize_models(
+            config,
+            use_deepspeed=args.use_deepspeed,
+            max_gpu_memory_utilization=args.max_gpu_memory_utilization,
+        )
         reference_questions = load_reference_questions(config.gsm8k_reference_data)
 
         math_env = CurriculumMathEnvironment(

@@ -11,6 +11,7 @@ from typing import Dict, Optional
 
 import deepspeed
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -39,7 +40,6 @@ class PPOTrainerDeepSpeed:
         target_kl: float = 0.01,
         ds_config: Optional[str] = None,
     ) -> None:
-        del learning_rate, max_grad_norm  # DeepSpeed config controls these.
 
         self.tokenizer = tokenizer
         self.ppo_epochs = ppo_epochs
@@ -49,6 +49,7 @@ class PPOTrainerDeepSpeed:
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef
         self.target_kl = target_kl
+        self.max_grad_norm = max_grad_norm
 
         config_path = ds_config or "configs/deepspeed_zero3_rl.json"
         with open(config_path, "r", encoding="utf-8") as handle:
@@ -60,24 +61,25 @@ class PPOTrainerDeepSpeed:
         ds_cfg["train_micro_batch_size_per_gpu"] = int(micro_batch)
         ds_cfg["gradient_accumulation_steps"] = 1
 
+        # Only wrap policy in DeepSpeed (it's 1.5B params)
+        # Keep value network in standard PyTorch (it's tiny ~few MB)
         policy_params = [p for p in policy_model.parameters() if p.requires_grad]
-        value_params = [p for p in value_model.parameters() if p.requires_grad]
-
+        
         logger.info("Initializing policy DeepSpeed engine (ZeRO-3)")
         self.policy_engine, self.policy_optimizer, _, _ = deepspeed.initialize(
             model=policy_model,
             model_parameters=policy_params,
             config=ds_cfg,
         )
-        logger.info("Initializing value DeepSpeed engine (ZeRO-3)")
-        self.value_engine, self.value_optimizer, _, _ = deepspeed.initialize(
-            model=value_model,
-            model_parameters=value_params,
-            config=ds_cfg,
+        
+        # Move value network to same device as policy
+        self.value = value_model.to(self.policy_engine.device)
+        self.value_optimizer = torch.optim.AdamW(
+            [p for p in value_model.parameters() if p.requires_grad],
+            lr=learning_rate,
         )
 
         self.policy = self.policy_engine.module
-        self.value = self.value_engine.module
         self.device = self.policy_engine.device
         self._last_checkpoint_meta: Dict[str, str] = {}
 
@@ -105,11 +107,11 @@ class PPOTrainerDeepSpeed:
     def _value_estimates(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        return self.value_engine(input_ids=input_ids, attention_mask=attention_mask).float()
+        return self.value(input_ids=input_ids, attention_mask=attention_mask).float()
 
     def train_step(self, rollout_buffer: RolloutBuffer) -> Dict[str, float]:
         self.policy_engine.train()
-        self.value_engine.train()
+        self.value.train()
 
         stats: Dict[str, list] = {
             "policy_loss": [],
@@ -169,13 +171,17 @@ class PPOTrainerDeepSpeed:
                 vf_loss_clipped = (values_clipped - returns) ** 2
                 value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
 
+                # Policy update (DeepSpeed)
                 policy_objective = policy_loss - self.ent_coef * entropy
-                value_objective = self.vf_coef * value_loss
-
                 self.policy_engine.backward(policy_objective)
                 self.policy_engine.step()
-                self.value_engine.backward(value_objective)
-                self.value_engine.step()
+                
+                # Value update (standard PyTorch)
+                self.value_optimizer.zero_grad()
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.value.parameters(), self.max_grad_norm)
+                self.value_optimizer.step()
+                
                 update_steps += 1
 
                 stats["policy_loss"].append(policy_loss.item())
@@ -202,16 +208,20 @@ class PPOTrainerDeepSpeed:
         os.makedirs(iteration_dir, exist_ok=True)
 
         policy_dir = os.path.join(iteration_dir, "policy_ds")
-        value_dir = os.path.join(iteration_dir, "value_ds")
-
+        
         self.policy_engine.save_checkpoint(policy_dir)
-        self.value_engine.save_checkpoint(value_dir)
         self.tokenizer.save_pretrained(os.path.join(iteration_dir, "policy_tokenizer"))
+        
+        # Save value network (standard PyTorch)
+        value_checkpoint = {
+            "value_head_state_dict": self.value.value_head.state_dict(),
+            "value_optimizer_state_dict": self.value_optimizer.state_dict(),
+        }
+        torch.save(value_checkpoint, os.path.join(iteration_dir, "value.pt"))
 
         meta = {
             "format": "deepspeed_zero3",
             "policy_dir": policy_dir,
-            "value_dir": value_dir,
         }
         torch.save(meta, path)
         self._last_checkpoint_meta = meta
@@ -222,12 +232,17 @@ class PPOTrainerDeepSpeed:
         if os.path.exists(path):
             meta = torch.load(path, map_location="cpu")
             policy_dir = meta.get("policy_dir")
-            value_dir = meta.get("value_dir")
         else:
             iteration_dir = os.path.dirname(path)
             policy_dir = os.path.join(iteration_dir, "policy_ds")
-            value_dir = os.path.join(iteration_dir, "value_ds")
 
         self.policy_engine.load_checkpoint(policy_dir)
-        self.value_engine.load_checkpoint(value_dir)
+        
+        # Load value network (standard PyTorch)
+        value_path = os.path.join(os.path.dirname(path), "value.pt")
+        if os.path.exists(value_path):
+            checkpoint = torch.load(value_path, map_location=self.device)
+            self.value.value_head.load_state_dict(checkpoint["value_head_state_dict"])
+            self.value_optimizer.load_state_dict(checkpoint["value_optimizer_state_dict"])
+        
         logger.info("DeepSpeed checkpoint loaded from %s", os.path.dirname(path))
