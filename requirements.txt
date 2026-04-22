@@ -90,7 +90,7 @@ outlines-core==0.1.26
 packaging==26.1
 pandas==3.0.2
 partial-json-parser==0.2.1.1.post7
-peft==0.13.2
+peft==0.19.1
 pillow==12.2.0
 platformdirs==4.9.6
 prometheus-client==0.25.0
