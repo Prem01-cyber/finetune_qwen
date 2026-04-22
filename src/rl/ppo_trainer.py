@@ -209,6 +209,7 @@ class PPOTrainer:
         }
 
         early_stopped = False
+        update_steps = 0
 
         for epoch in range(self.ppo_epochs):
             if early_stopped:
@@ -268,6 +269,7 @@ class PPOTrainer:
                     _params.extend(g["params"])
                 nn.utils.clip_grad_norm_(_params, self.max_grad_norm)
                 self.optimiser.step()
+                update_steps += 1
 
                 stats["policy_loss"].append(policy_loss.item())
                 stats["value_loss"].append(value_loss.item())
@@ -275,7 +277,16 @@ class PPOTrainer:
                 stats["approx_kl"].append(pg_info["approx_kl"])
                 stats["clip_fraction"].append(pg_info["clip_fraction"])
 
-        return {k: float(sum(v) / max(len(v), 1)) for k, v in stats.items()}
+        if update_steps == 0:
+            logger.warning(
+                "PPO train_step performed 0 optimizer updates. "
+                "Likely immediate KL early-stop (target_kl=%.4f).",
+                self.target_kl,
+            )
+
+        metrics = {k: float(sum(v) / max(len(v), 1)) for k, v in stats.items()}
+        metrics["update_steps"] = float(update_steps)
+        return metrics
 
     # ------------------------------------------------------------------
     # Checkpointing

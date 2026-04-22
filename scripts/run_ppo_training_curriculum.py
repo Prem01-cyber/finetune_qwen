@@ -361,7 +361,18 @@ def main():
         replay_stats = math_env.replay_buffer.get_buffer_stats(
             current_iteration=math_env.curriculum_manager.current_iteration
         )
+        logger.info("Running PPO update...")
         training_metrics = ppo_trainer.train_step(rollout_buffer)
+        logger.info(
+            "PPO update metrics: policy_loss=%.4f value_loss=%.4f entropy=%.4f "
+            "approx_kl=%.4f clip_fraction=%.4f update_steps=%d",
+            training_metrics["policy_loss"],
+            training_metrics["value_loss"],
+            training_metrics["entropy"],
+            training_metrics["approx_kl"],
+            training_metrics["clip_fraction"],
+            int(training_metrics.get("update_steps", 0.0)),
+        )
 
         if iteration % config.eval_every == 0:
             eval_results = evaluate_policy(policy, tokenizer, config.eval_data_path)
