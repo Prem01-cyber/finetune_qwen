@@ -48,6 +48,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Global GPU performance knobs.  These are free speed on Ampere/Hopper:
+#
+#   * TF32 matmul ("high") -> ~2x faster fp32 matmuls, negligible quality
+#     impact for RL training.  Silences the inductor warning too.
+#   * cudnn.benchmark -> lets cuDNN autotune the fastest algo for each
+#     conv/input shape.  Safe because our shapes are repeatable.
+#   * allow_tf32 on cudnn -> same idea on convs.
+#
+# Must be set before any CUDA kernel runs, so we do it at import time.
+# ---------------------------------------------------------------------------
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+
 class TeeStream:
     """Write stream output to both terminal and a log file."""
 
