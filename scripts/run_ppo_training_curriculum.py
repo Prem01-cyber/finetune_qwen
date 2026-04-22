@@ -288,11 +288,17 @@ def main():
     config.use_wandb = not args.no_wandb
 
     if config.use_wandb:
-        wandb.init(
-            project=config.wandb_project,
-            name=config.wandb_run_name or f"ppo_curriculum_{datetime.now():%Y%m%d_%H%M%S}",
-            config=vars(config),
-        )
+        try:
+            wandb.init(
+                project=config.wandb_project,
+                name=config.wandb_run_name or f"ppo_curriculum_{datetime.now():%Y%m%d_%H%M%S}",
+                config=vars(config),
+            )
+            logger.info("W&B initialized successfully: project=%s", config.wandb_project)
+        except Exception as e:
+            logger.error("Failed to initialize W&B: %s", e, exc_info=True)
+            logger.warning("Continuing without W&B logging")
+            config.use_wandb = False
 
     policy, value, tokenizer = initialize_models(config)
     reference_questions = load_reference_questions(config.gsm8k_reference_data)
@@ -439,7 +445,11 @@ def main():
                 wandb_metrics[f"curriculum/topic_difficulty/{topic}"] = difficulty
             if eval_results:
                 wandb_metrics["eval/accuracy"] = eval_results["accuracy"]
-            wandb.log(wandb_metrics)
+            try:
+                wandb.log(wandb_metrics)
+            except Exception as e:
+                logger.error("Failed to log metrics to W&B at iteration %d: %s", iteration, e)
+                config.use_wandb = False
 
         if iteration % config.save_every == 0:
             checkpoint_path = Path(config.output_dir) / f"iteration_{iteration:03d}" / "checkpoint.pt"
@@ -455,7 +465,11 @@ def main():
     )
 
     if config.use_wandb:
-        wandb.finish()
+        try:
+            wandb.finish()
+            logger.info("W&B run finished successfully")
+        except Exception as e:
+            logger.error("Failed to finish W&B run: %s", e)
 
 
 if __name__ == "__main__":
