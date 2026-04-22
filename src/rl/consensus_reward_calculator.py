@@ -53,78 +53,125 @@ class ConsensusRewardCalculator:
     def _compute_sympy_score(self, sympy_verification: Dict[str, Any]) -> float:
         """
         Compute SymPy arithmetic verification score.
-        
+
+        Old formula halved the score (×0.5) if *any* step failed, turning
+        9/10 correct steps into 0.45 while 10/10 → 1.0 — a 0.55 cliff for
+        a single arithmetic slip.  On multi-step problems that cliff made
+        the signal extremely noisy.
+
+        New formula is proportional:
+
+            step_score = steps_ok / steps_total - 0.3 * (steps_failed / steps_total)
+
+        then we add a small bonus for producing a parseable final-answer
+        line (``final_answer == "ok"``) so that solutions which are arithmetically
+        self-consistent *and* commit to a clear final answer are scored higher
+        than ones that dodge the last line.
+
+            sympy = clamp( step_score + 0.1 * final_ok,  0, 1 )
+
         Args:
             sympy_verification: Summary dict from verify_solution_text()
-        
+
         Returns:
             Score in [0, 1]
         """
-        steps_total = sympy_verification.get("steps_total", 0)
-        steps_verified_ok = sympy_verification.get("steps_verified_ok", 0)
-        steps_failed = sympy_verification.get("steps_failed", 0)
-        
+        steps_total = int(sympy_verification.get("steps_total", 0))
+        steps_verified_ok = int(sympy_verification.get("steps_verified_ok", 0))
+        steps_failed = int(sympy_verification.get("steps_failed", 0))
+        final_answer = sympy_verification.get("final_answer", "")
+
         if steps_total == 0:
-            # No steps to verify
             return 0.0
-        
-        # Base score: fraction of steps verified
-        base_score = steps_verified_ok / steps_total
-        
-        # Penalty if any steps failed
-        if steps_failed > 0:
-            base_score *= 0.5
-        
-        return base_score
+
+        ok_ratio = steps_verified_ok / steps_total
+        fail_ratio = steps_failed / steps_total
+        step_score = ok_ratio - 0.3 * fail_ratio
+
+        final_bonus = 0.1 if final_answer == "ok" else 0.0
+        return max(0.0, min(1.0, step_score + final_bonus))
     
     def _compute_consensus_score(self, consensus: Dict[str, Any]) -> float:
         """
         Compute consensus voting score.
-        
+
+        With 3 verifier samples, ``consensus_strength`` is either 0.5
+        (2/3 agree) or 1.0 (3/3 agree).  The old formula added a flat
+        ``+0.3`` when the primary matched the majority, which ceiling-
+        clipped both 0.5 and 1.0 to 1.0 — the model saw no reason to
+        push from "just enough" agreement to "robust" agreement.  We
+        now return raw ``consensus_strength`` so the gradient actually
+        rewards unanimity.
+
+        Scoring:
+          * primary matches majority  →  consensus_strength   (0.5 or 1.0)
+          * primary is the outlier    →  0.1  (small floor to avoid NaN advantages)
+          * no majority at all        →  0.1
+
         Args:
             consensus: Consensus dict from TripleVerifier
-        
+
         Returns:
             Score in [0, 1]
         """
         has_majority = consensus.get("has_majority", False)
-        consensus_strength = consensus.get("consensus_strength", 0.0)
+        consensus_strength = float(consensus.get("consensus_strength", 0.0))
         primary_matches_majority = consensus.get("primary_matches_majority", False)
-        
+
         if not has_majority:
-            # No consensus (all 3 different) - question likely ambiguous
             return 0.1
-        
+
         if primary_matches_majority:
-            # Primary solution matches majority - good!
-            # Bonus for matching majority
-            score = min(1.0, consensus_strength + 0.3)
-            return score
-        else:
-            # Primary is the outlier - bad!
-            # Even if there's a majority, primary didn't match it
-            return 0.2
+            return max(0.0, min(1.0, consensus_strength))
+
+        return 0.1
     
     def _compute_format_score(self, sympy_verification: Dict[str, Any]) -> float:
         """
         Compute format compliance score.
-        
+
+        The old implementation was ``0.5·has_any_step + 0.5·has_final_answer``,
+        which saturated at 1.0 as soon as the SFT-primed model wrote one
+        ``Step N:`` line and one ``Final Answer:`` line.  That made format a
+        constant 0.2 offset on the combined solution reward — a dead gradient.
+
+        New formula (still in [0, 1]) rewards *quality* of structure:
+
+          * equation_ratio = steps_with_equation / total_step_lines
+              — penalises steps that are prose with no parseable ``LHS = RHS``
+          * final_ok = 1 if final-answer line parses as a number, else 0
+          * length_bonus: 0.0 / 0.5 / 1.0 for 0 / 1 / ≥2 steps.
+              — discourages one-line hand-waves; rewards multi-step reasoning
+
+          format = 0.5·equation_ratio + 0.3·final_ok + 0.2·length_bonus
+
         Args:
             sympy_verification: Summary dict from verify_solution_text()
-        
+
         Returns:
             Score in [0, 1]
         """
-        steps_total = sympy_verification.get("steps_total", 0)
+        steps_total = int(sympy_verification.get("steps_total", 0))
+        steps_skipped = int(sympy_verification.get("steps_skipped_no_equality", 0))
         final_answer = sympy_verification.get("final_answer", "")
-        
-        # 0.5 if has steps
-        has_steps = 0.5 if steps_total > 0 else 0.0
-        
-        # 0.5 if has final answer
-        has_final = 0.5 if final_answer == "ok" else 0.0
-        
-        return has_steps + has_final
+
+        total_step_lines = steps_total + steps_skipped
+        if total_step_lines == 0:
+            equation_ratio = 0.0
+        else:
+            equation_ratio = steps_total / total_step_lines
+
+        final_ok = 1.0 if final_answer == "ok" else 0.0
+
+        if steps_total >= 2:
+            length_bonus = 1.0
+        elif steps_total == 1:
+            length_bonus = 0.5
+        else:
+            length_bonus = 0.0
+
+        score = 0.5 * equation_ratio + 0.3 * final_ok + 0.2 * length_bonus
+        return max(0.0, min(1.0, score))
     
     def calculate_reward(
         self,

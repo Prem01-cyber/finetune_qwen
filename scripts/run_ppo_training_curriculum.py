@@ -91,15 +91,22 @@ class TeeStream:
 
 class CurriculumTrainingConfig:
     base_model = "checkpoints/dual_task_v1"
-    learning_rate = 1e-6
+    # Canonical RLHF-PPO settings (InstructGPT / TRL / open-rlhf defaults):
+    #   * lr 3e-6 is the sweet-spot for LoRA-style fine-tuning on 1-2B models;
+    #     1e-6 produced visibly sluggish learning and wastes compute.
+    #   * clip_range 0.2 and target_kl 0.03 are the values every stable RLHF
+    #     stack uses.  The previous 0.3 / 0.15 combo effectively disabled
+    #     early-stopping and allowed single-update policy collapse when an
+    #     outlier advantage showed up.
+    learning_rate = 3e-6
     ppo_epochs = 3
     batch_size = 32
-    clip_range = 0.3
-    clip_range_vf = 0.25
+    clip_range = 0.2
+    clip_range_vf = 0.2
     vf_coef = 0.5
     ent_coef = 0.02
     max_grad_norm = 0.5
-    target_kl = 0.15
+    target_kl = 0.03
 
     gamma = 1.0
     gae_lambda = 0.95
