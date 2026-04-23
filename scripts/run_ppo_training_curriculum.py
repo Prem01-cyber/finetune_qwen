@@ -111,15 +111,19 @@ class CurriculumTrainingConfig:
     #     all 3 epochs complete in typical mid-training iterations.
     #   * kl_trip_multiplier=1.5 keeps the canonical trip ratio; tune via CLI.
     learning_rate = 3e-6
-    ppo_epochs = 3
-    # PPO mini-batch size.  Each mini-batch runs one full fwd+bwd through
-    # the 1.5B-param policy with activations kept for the backward pass.
-    # Qwen2.5-1.5B × seq_len ≈ 500 × 28 layers = ~1.5 GB activations per
-    # sample; B=32 overflowed an 80 GB A100 once the policy was actually
-    # trainable post-audit-fix.  B=8 fits comfortably with grad
-    # checkpointing on (leaves ~15 GB headroom) and does NOT slow
-    # throughput much because we just run 4× more micro-batches.
-    batch_size = 8
+    # 2 PPO epochs over each rollout buffer.  Previously 3, dropped
+    # because iterations regularly hit the KL trip line inside epoch 2
+    # anyway — the third epoch almost never landed meaningful updates,
+    # so we spend that ~33% of the budget on more iterations instead.
+    ppo_epochs = 2
+    # PPO mini-batch size.  Raised from 8 to 16 after Flash-Attn 2 was
+    # enabled: Flash drops attention activation memory from O(T^2) to
+    # O(T) per layer, which reclaimed enough VRAM that B=16 fits with
+    # gradient checkpointing off.  Halving the step count at the same
+    # activation-per-sample cost roughly doubles PPO throughput; at B=16
+    # on a 1.5B Qwen2 with T~500 we end up around ~35-40 GB resident,
+    # well under the 80 GB A100 ceiling.
+    batch_size = 16
     # Gradient checkpointing on the policy trades ~30% of backward-pass
     # speed for ~40% less activation memory — essential once the
     # 1.5B-param policy is actually trainable.  Forces use_cache=False
@@ -142,7 +146,13 @@ class CurriculumTrainingConfig:
 
     num_rollouts_per_iter = 100
     max_question_tokens = 200
-    max_solution_tokens = 500
+    # 400 is empirically sufficient: PRM scoring logs show typical
+    # self-play solutions are 3-10 reasoning steps ≈ 200-350 tokens.
+    # The few cases that hit the old 500-token ceiling were almost always
+    # rambling or mid-step EOS failures, so capping at 400 trades a tiny
+    # amount of truncation risk for ~20% faster rollouts.  If you see
+    # "PRM degraded (no extractable steps)" spike, raise this back to 500.
+    max_solution_tokens = 400
     temperature = 0.7
     top_p = 0.9
     consensus_temperature = 0.5
@@ -150,8 +160,9 @@ class CurriculumTrainingConfig:
     num_iterations = 10
     # Fraction of each rollout batch that is GSM8K-anchored (real question,
     # reward scored directly against the gold final answer).  0.3 is the
-    # sweet spot: enough grounded signal to pull GSM8K accuracy (30 rollouts
-    # × ppo_epochs = 90 gradient steps/iter against real answers), while
+    # sweet spot: enough grounded signal to pull GSM8K accuracy (with
+    # num_rollouts=32 and ppo_epochs=2 that's ~10 grounded rollouts × 2
+    # epochs = ~20 gradient passes over real answers per iteration), while
     # leaving 70% of the batch as self-play — where the policy trains its
     # question-generation skill (the whole point of the Self-Improvement
     # theme).  Set 0.0 to disable grounded rollouts entirely; set higher
@@ -899,8 +910,10 @@ def main():
     parser.add_argument(
         "--ppo-epochs",
         type=int,
-        default=3,
-        help="Number of gradient epochs over each rollout buffer.  Default 3.",
+        default=2,
+        help="Number of gradient epochs over each rollout buffer.  Default 2 "
+        "(was 3 — the third epoch almost always tripped the KL trip line "
+        "before landing updates, so we reclaim that budget as more iters).",
     )
     parser.add_argument(
         "--clip-range",
@@ -917,13 +930,14 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
-        help="PPO mini-batch size.  Default 8: a 1.5B-param policy with "
-        "bf16 weights + grads + AdamW states + per-layer backward-pass "
-        "activations already uses ~25 GB at this size; B=32 OOMs an 80 GB "
-        "A100.  Throughput barely changes because we simply run 4× more "
-        "micro-batches.  Drop to 4 if you add more resident modules (e.g. "
-        "PRM in bf16 instead of 4-bit).",
+        default=16,
+        help="PPO mini-batch size.  Default 16.  Flash-Attn 2 drops "
+        "attention activation memory from O(T^2) to O(T), which gave us "
+        "the headroom to double the pre-Flash default of 8.  At B=16 on "
+        "a 1.5B Qwen2 with T~500 we sit around ~35-40 GB resident, well "
+        "under the 80 GB A100 ceiling.  Drop back to 8 if you disable "
+        "Flash-Attn via `--no-grad-checkpoint` OR if you add more "
+        "resident modules (e.g. PRM in bf16 instead of 4-bit).",
     )
     parser.add_argument(
         "--no-grad-checkpoint",

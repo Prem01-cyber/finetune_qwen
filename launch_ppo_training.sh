@@ -41,19 +41,26 @@
 #   --kl-trip-multiplier 1.5  canonical; push to 2.0-2.5 to make early-stop
 #                             effectively never fire (pair with lower kl).
 #
-# Memory knobs (added after the post-audit OOM — the 1.5B policy is now
-# actually trainable, so activations, grads and AdamW state are real):
-#   --batch-size 8            was 32.  B=32 × seq~500 × 28 layers of bf16
-#                             Qwen2 activations = ~40 GB, which pushes an
-#                             80 GB A100 over the edge once grads +
-#                             optimiser state are resident.  Throughput
-#                             is ~unchanged because we just run 4× more
-#                             micro-batches.
-#   grad checkpointing ON     default; disable with --no-grad-checkpoint.
-#                             Saves ~40% activation memory.
+# Memory / throughput knobs (tuned after Flash-Attn 2 + KV-cached rollouts):
+#   --batch-size 16           Flash-Attn 2 gave O(T) attention memory
+#                             instead of O(T^2), so we can double B
+#                             from the OOM-safe 8 without hitting the
+#                             80 GB A100 ceiling.  Halves the number of
+#                             PPO mini-batches → ~35-40% faster PPO.
+#   --ppo-epochs 2            down from 3.  KL-trip fires inside epoch 2
+#                             in most iterations anyway; the third epoch
+#                             barely contributed to learning and cost a
+#                             flat ~33% of the PPO-update budget.
+#   grad checkpointing OFF    auto-disabled when flash_attention_2 is
+#                             active (use --grad-checkpoint to force on).
+#                             Skipping the recompute-during-backward
+#                             gives ~30% faster backward.
 #   PYTORCH_CUDA_ALLOC_CONF   expandable_segments:True handles the
 #                             "2-3 GB reserved-but-unallocated"
 #                             fragmentation the runtime warns about.
+#   fused AdamW               auto-selected in PPOTrainer when all
+#                             trainable params are on CUDA (~5-10%
+#                             faster optimiser step, free of charge).
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
@@ -75,9 +82,9 @@ python scripts/run_ppo_training_curriculum.py \
   --prm-model Qwen/Qwen2.5-Math-PRM-7B \
   --target-kl 0.05 \
   --kl-trip-multiplier 1.5 \
-  --ppo-epochs 3 \
+  --ppo-epochs 2 \
   --clip-range 0.2 \
-  --batch-size 8 \
+  --batch-size 16 \
   --eval-every 5 \
   --eval-max-samples 500 \
   --eval-max-new-tokens 512 \

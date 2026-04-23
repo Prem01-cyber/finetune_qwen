@@ -200,7 +200,35 @@ class PPOTrainer:
         )
 
         trainable_params = policy_trainable + value_trainable
-        self.optimiser = AdamW(trainable_params, lr=learning_rate)
+
+        # Use the fused AdamW kernel when we're on CUDA.  Fused AdamW is a
+        # single CUDA kernel that performs all the per-tensor ops (decay,
+        # momentum, division, update) at once instead of one kernel per
+        # op — typically 5-10% faster on modern hardware and free on
+        # correctness.  Falls back to the un-fused path on CPU or on
+        # PyTorch builds that lack the fused kernel.
+        use_fused = False
+        try:
+            if torch.cuda.is_available() and all(
+                p.is_cuda for p in trainable_params
+            ):
+                use_fused = True
+        except Exception:
+            use_fused = False
+
+        try:
+            self.optimiser = AdamW(
+                trainable_params, lr=learning_rate, fused=use_fused
+            )
+            if use_fused:
+                logger.info("Using fused AdamW optimiser (CUDA).")
+        except (TypeError, RuntimeError) as exc:
+            # `fused=` kwarg not supported on this torch build, or the
+            # fused kernel refused at construction time — fall back.
+            logger.info(
+                "Fused AdamW unavailable (%s); using standard AdamW.", exc
+            )
+            self.optimiser = AdamW(trainable_params, lr=learning_rate)
 
         self.device = next(policy_model.parameters()).device
 

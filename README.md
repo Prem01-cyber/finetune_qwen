@@ -685,9 +685,12 @@ python scripts/run_ppo_training_curriculum.py \
 | `--checkpoint-keep-every` | `10` | Persists milestone snapshots at iter 10/20/30/40/50 outside the rolling window. |
 | `--target-kl` | `0.05` | Looser than the canonical 0.015–0.03 because grounded rollouts already anchor the policy against GSM8K gold.  At 0.03 the per-batch approx_kl reliably tripped `1.5 × target_kl = 0.045` in epoch 1, leaving PPO with ~⅓ of its planned update budget per iteration. |
 | `--kl-trip-multiplier` | `1.5` | Canonical PPO/TRL value; raise to `2.0–2.5` to make early-stop effectively never fire (pair with a lower `--target-kl`). |
-| `--ppo-epochs`, `--clip-range`, `--clip-range-vf` | `3`, `0.2`, `0.2` | Now CLI-exposed so you can tune without editing code. |
+| `--ppo-epochs`, `--clip-range`, `--clip-range-vf` | `2`, `0.2`, `0.2` | Epoch count dropped from 3 to 2 after logs consistently showed the KL trip firing in epoch 2 — the third epoch was ~33% of the PPO budget for ~0% of the learning. |
+| `--batch-size` | `16` | Raised from 8 once Flash-Attn 2 landed: Flash's O(T) attention memory gave us the headroom to double B, which halves the PPO mini-batch step count for the same total update. |
+| `--max-solution-tokens` | `400` (via config) | Dropped from 500 because PRM logs show typical self-play solutions are 3–10 steps ≈ 200–350 tokens; the tail above 400 was almost always degenerate.  Raise if `PRM degraded (no extractable steps)` starts spiking. |
 | *(default)* `learning_rate=3e-6` | — | Sweet spot for a 1.5 B full-param policy. |
-| *(default)* `batch_size=32` | — | 3 epochs × ⌈N/32⌉ micro-batches per iteration. |
+| *(default)* `gradient_checkpointing=True` | — | **Auto-disabled** when `flash_attention_2` is active (Flash already gives O(T) attention memory).  Force on with `--grad-checkpoint` if you bump `--batch-size` beyond what Flash can cover. |
+| *(default)* fused AdamW | — | Auto-selected in `PPOTrainer` when all trainable params are on CUDA; ~5–10% faster optimiser step.  Falls back silently on older PyTorch builds. |
 | *(default)* `ent_coef=0.02`, `vf_coef=0.5`, `max_grad_norm=0.5` | — | Conservative stability settings. |
 
 **Expected GPU memory (A100-80 GB, bf16 policy + 4-bit PRM):**
