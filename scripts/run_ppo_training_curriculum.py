@@ -40,6 +40,7 @@ from src.rl.prm_scorer import ProcessRewardScorer
 from src.rl.rollout_buffer import RolloutBuffer
 from src.rl.training_monitor import TrainingMonitor
 from src.rl.value_network import ValueHead
+from src.utils.attn_backend import select_attn_implementation
 from src.utils.csv_logger import CSVLogger
 
 
@@ -349,11 +350,22 @@ def initialize_models(config: CurriculumTrainingConfig):
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    # Pick the fastest attention backend the container supports.
+    # flash_attention_2 is ~1.5-2.5x faster than SDPA on Ampere/Hopper
+    # AND turns attention memory from O(T^2) to O(T) per layer — which
+    # is what lets us optionally turn gradient checkpointing OFF (see
+    # the "gradient_checkpointing" block below) and claw back the ~30%
+    # backward-pass slowdown it introduces.  Falls back to SDPA if the
+    # flash-attn wheel is not on the container, so this flag is always
+    # safe to set.
+    attn_impl = select_attn_implementation()
+
     policy_load_kwargs = {
         "torch_dtype": torch.bfloat16,
         "low_cpu_mem_usage": True,
         "trust_remote_code": True,
         "device_map": {"": "cpu"},
+        "attn_implementation": attn_impl,
     }
 
     if is_adapter:
@@ -409,7 +421,25 @@ def initialize_models(config: CurriculumTrainingConfig):
     #   2. use_cache=False on every forward — cache + checkpointing is
     #      incompatible (we already force this in _policy_logits_at_state
     #      and in rollouts).
-    if getattr(config, "gradient_checkpointing", True):
+    #
+    # Smart default: when flash_attention_2 is active, attention memory
+    # is already O(T) instead of O(T^2), which buys back most of what
+    # gradient checkpointing saves.  In that case we leave it OFF by
+    # default so we don't pay the ~30% backward-pass cost.  The user
+    # can still force it on/off via --grad-checkpoint / --no-grad-checkpoint.
+    flash_active = attn_impl == "flash_attention_2"
+    grad_ckpt_requested = getattr(config, "gradient_checkpointing", True)
+    if grad_ckpt_requested and not args.grad_checkpoint_explicit and flash_active:
+        grad_ckpt_effective = False
+        logger.info(
+            "Flash-Attn 2 active — leaving gradient checkpointing OFF by "
+            "default (Flash already gives O(T) attention memory).  Pass "
+            "--grad-checkpoint to force it on if you hit OOM."
+        )
+    else:
+        grad_ckpt_effective = grad_ckpt_requested
+
+    if grad_ckpt_effective:
         policy.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
@@ -420,7 +450,9 @@ def initialize_models(config: CurriculumTrainingConfig):
             "(use_reentrant=False, use_cache=False)."
         )
     else:
-        logger.info("Gradient checkpointing DISABLED on policy (--no-grad-checkpoint).")
+        logger.info(
+            "Gradient checkpointing DISABLED on policy (attn=%s).", attn_impl
+        )
 
     log_gpu_memory("After policy loaded")
 
@@ -876,8 +908,19 @@ def main():
         action="store_false",
         default=True,
         help="Disable gradient checkpointing on the policy.  Default: ON "
-        "(saves ~40%% activation memory for ~30%% slower backward).  Only "
-        "disable if you have very large VRAM headroom and want the speed.",
+        "(saves ~40%% activation memory for ~30%% slower backward).  "
+        "With flash_attention_2 active, checkpointing is ALSO auto-disabled "
+        "because Flash already gives O(T) attention memory — use "
+        "--grad-checkpoint to force it back on if you still OOM.",
+    )
+    parser.add_argument(
+        "--grad-checkpoint",
+        dest="grad_checkpoint_explicit",
+        action="store_true",
+        default=False,
+        help="Explicitly force gradient checkpointing on even when "
+        "flash_attention_2 is active.  Useful if you bump --batch-size "
+        "high enough that Flash alone isn't enough.",
     )
     parser.add_argument(
         "--use-prm",

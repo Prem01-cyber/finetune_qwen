@@ -35,6 +35,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 from src.sft.solution_format import _step_bodies, extract_final_answer_numeric_str
+from src.utils.attn_backend import select_attn_implementation
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,10 @@ class ProcessRewardScorer:
         load_kwargs: Dict[str, Any] = {
             "trust_remote_code": True,
             "torch_dtype": dtype,
+            # PRM forward is eval-only but sequences can be 1-2k tokens
+            # when the policy writes a lot of steps; flash-attn 2 cuts the
+            # scoring forward by ~2x at those lengths.  Falls back to SDPA.
+            "attn_implementation": select_attn_implementation(),
         }
         if load_in_4bit and torch.cuda.is_available():
             try:

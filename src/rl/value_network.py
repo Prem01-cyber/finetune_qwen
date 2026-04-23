@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
 
+from src.utils.attn_backend import select_attn_implementation
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,8 +72,9 @@ class ValueHead(nn.Module):
             "device_map": model_device_map,
             "low_cpu_mem_usage": True,
             "trust_remote_code": True,
+            "attn_implementation": select_attn_implementation(),
         }
-        
+
         self.backbone = AutoModel.from_pretrained(
             base_model_path,
             **load_kwargs,
@@ -123,4 +126,64 @@ class ValueHead(nn.Module):
         cls_hidden = last_hidden[b, last_idx].to(self.value_head[0].weight.dtype)
 
         values = self.value_head(cls_hidden).squeeze(-1)  # [B]
+        return values
+
+    @torch.no_grad()
+    def values_at_positions(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute V(s_t) for many states in a SINGLE backbone forward pass.
+
+        The naive rollout loop calls ``self.value(...)`` once per generated
+        token, which does one full backbone forward over the growing
+        sequence each step — that's O(T^2) work for T tokens.  This helper
+        lets the caller run the backbone exactly once on the full
+        trajectory and then pluck hidden states at the positions that
+        correspond to each state s_t.
+
+        For a trajectory with prompt length P and T generated tokens,
+        state s_t (= prompt + generated[:t], t=0..T-1) is a "last token"
+        at position P + t - 1 in the full sequence, so callers pass
+        ``positions = torch.arange(P - 1, P + T - 1)``.
+
+        Args:
+            input_ids:
+                [1, L] full trajectory (prompt + generated).  A single
+                un-padded sequence — callers that need batched different-
+                length trajectories should loop over them (cheap because
+                each call is O(L), not O(L^2)).
+            positions:
+                [N] long tensor of indices into the L-axis.  Hidden states
+                at these positions will be fed through the value MLP.
+            attention_mask:
+                Optional [1, L] mask.  Defaults to all-ones.
+
+        Returns:
+            values: [N] scalar value estimates, one per requested position,
+                on the same device as ``input_ids`` and already in float32
+                (so callers can safely ``.tolist()`` them for the buffer).
+        """
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        hidden = outputs.last_hidden_state  # [1, L, H]
+
+        positions = positions.to(device=hidden.device, dtype=torch.long)
+        # Clamp just in case the caller requests an out-of-range position
+        # (e.g. T=0 edge cases).  clamp is a no-op for valid indices.
+        positions = positions.clamp(min=0, max=hidden.size(1) - 1)
+
+        # Gather → [N, H].  Cast to the value_head's weight dtype so
+        # bf16 backbone + fp32 head works regardless of how torch
+        # autocast is configured on the caller side.
+        gathered = hidden[0, positions].to(self.value_head[0].weight.dtype)
+        values = self.value_head(gathered).squeeze(-1).float()  # [N]
         return values

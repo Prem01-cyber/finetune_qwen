@@ -13,12 +13,24 @@
 #   bash launch_ppo_training.sh --num-iterations 50 --rollouts-per-iter 32
 #   bash launch_ppo_training.sh --no-prm   # skip the 7B PRM download
 #   bash launch_ppo_training.sh --grounded-ratio 0.0  # pure self-play
-#bash launch_ppo_training.sh \
-  --num-iterations 3 \
-  --rollouts-per-iter 16 \
-  --skip-initial-eval \
-  --run-name "smoke_postfix2_$(date +%Y%m%d_%H%M)"
-
+#
+# Smoke test (3 iters, 16 rollouts, no initial eval) — verifies the
+# speed-path changes end-to-end without committing to a long run:
+#   bash launch_ppo_training.sh \
+#       --num-iterations 3 --rollouts-per-iter 16 --skip-initial-eval \
+#       --run-name "smoke_$(date +%Y%m%d_%H%M)"
+#
+# Speed path (active by default, no flags needed):
+#   * Flash-Attn 2 on policy + value + PRM when `flash-attn` is installed,
+#     auto-fallback to SDPA otherwise.  Expect ~1.5-2.5x faster attention
+#     and O(T) attention memory — which is why gradient checkpointing is
+#     auto-disabled when Flash is active (force on with --grad-checkpoint).
+#   * KV-cached rollouts via HF generate(output_logits=True).  The old
+#     custom loop re-forwarded the whole growing sequence every step
+#     (O(T^2)); this is O(T).  Expect rollouts ~4-5x faster at T=500.
+#   * Batched value computation: one backbone forward over the full
+#     trajectory, all T value estimates gathered from hidden states.
+#
 # PPO KL knobs (see run_ppo_training_curriculum.py for full docs):
 #   --target-kl 0.05          looser than canonical 0.015-0.03 on purpose —
 #                             grounded rollouts bound collapse risk and a

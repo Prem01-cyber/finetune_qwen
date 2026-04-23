@@ -161,163 +161,219 @@ class MathEnvironment:
         phase: str,
     ) -> Tuple[str, List[Transition]]:
         """
-        Generate text while logging all transitions for PPO.
+        Generate text with PPO-grade per-step logging — fast path.
 
-        This is the core interaction loop:
-        For t = 0 to T:
-            1. Observe state s_t
-            2. Compute V(s_t) from critic
-            3. Sample action a_t ~ π(·|s_t)
-            4. Compute log π(a_t|s_t)
-            5. Transition to s_{t+1} = s_t ⊕ a_t
-            6. Store transition (s_t, a_t, V(s_t))
+        Design
+        ------
+        The old loop ran one FULL model forward over the entire growing
+        sequence at every step (re-doing all previous tokens' attention
+        from scratch), plus a second full ValueHead forward.  For T=500
+        that was ~500*500/2 ≈ 125 000 token-forwards — the single
+        biggest bottleneck in the training pipeline.
+
+        This rewrite does the same math in O(T) instead of O(T^2):
+
+        1. One call to HuggingFace ``generate(use_cache=True)``.  KV-cache
+           keeps attention cost constant per step, and ``output_logits=True``
+           returns the RAW pre-processor logit at each step — which is
+           exactly the distribution ``PPOTrainer._policy_logits_at_state``
+           re-computes during the update.  That keeps the PPO importance
+           ratio ``exp(new - old)`` mathematically valid.
+
+        2. One call to ``value.values_at_positions(...)`` that runs the
+           value backbone once over the full trajectory and plucks the
+           ``T`` hidden states we need, instead of T separate forwards.
+
+        3. A plain Python loop builds the ``Transition`` objects.  This
+           is cheap — just pointer moves and one log_prob gather — it
+           does not re-enter the model.
+
+        PPO correctness notes
+        ---------------------
+        * ``old_log_prob`` and ``entropy`` are computed from RAW logits
+          (no temperature, no top-p).  Sampling is done inside
+          ``generate()`` using temperature + top-p.  These are two
+          different things: we WANT sampling to explore but we WANT the
+          stored log-prob to match the un-tempered policy that the PPO
+          re-forward sees.  The old loop made exactly the same split
+          manually — we are just moving the manual loop into ``generate``.
+
+        * HF's ``output_logits`` (added in transformers 4.38) returns
+          the pre-LogitsProcessor logits, not the post-processor scores.
+          That is the critical distinction — ``output_scores`` would
+          have been wrong because those have been divided by
+          temperature and have top-p ``-inf`` masks baked in.
 
         Args:
-            initial_prompt: Starting state s_0
-            max_tokens: Maximum generation length T
-            phase: "question_generation" or "solution"
+            initial_prompt: Starting state s_0 (plain text).
+            max_tokens: Generation budget in new tokens.
+            phase: "question_generation" or "solution" (carried through
+                into every ``State`` for reward routing).
 
         Returns:
-            generated_text: Complete generated text
-            transitions: List of (s_t, a_t, r_t=0, s_{t+1}, V(s_t))
+            generated_text: Decoded newly-generated tokens (no prompt,
+                special tokens stripped).
+            transitions: ``[Transition]`` of length ``<= max_tokens``,
+                ending at EOS if the model emitted one.
         """
-        transitions = []
-
-        # Tokenize initial state
-        current_text = initial_prompt
-        current_ids = self.tokenizer.encode(
-            current_text, return_tensors="pt"
+        # Tokenize prompt.  encode() returns [1, P] already on self.device.
+        prompt_ids = self.tokenizer.encode(
+            initial_prompt, return_tensors="pt"
         ).to(self.device)
-        
-        # Track prompt length to strip it later
-        prompt_length = current_ids.shape[1]
+        prompt_length = prompt_ids.shape[1]
+        prompt_attn = torch.ones_like(prompt_ids)
 
-        # Create initial state
-        current_state = State(
-            text=current_text,
-            input_ids=current_ids[0],
-            attention_mask=torch.ones_like(current_ids[0]),
-            phase=phase,
+        # HF generate requires temperature strictly > 0 when do_sample=True.
+        # We still want to expose temperature=0 externally as "greedy",
+        # so map very low temperatures onto do_sample=False.
+        temperature = float(self.temperature)
+        do_sample = temperature > 1e-4
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = eos_id
+
+        gen_kwargs = dict(
+            input_ids=prompt_ids,
+            attention_mask=prompt_attn,
+            max_new_tokens=max_tokens,
+            do_sample=do_sample,
+            use_cache=True,
+            output_logits=True,
+            return_dict_in_generate=True,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
+        )
+        if do_sample:
+            gen_kwargs["temperature"] = max(temperature, 1e-6)
+            gen_kwargs["top_p"] = float(self.top_p)
+
+        with torch.no_grad():
+            try:
+                gen_out = self.policy.generate(**gen_kwargs)
+            except TypeError as e:
+                # Older transformers (<4.38) don't accept output_logits.
+                # Fall back to output_scores — that is technically the
+                # processor-modified distribution (temperature+top-p
+                # already applied), which breaks PPO importance ratios.
+                # We make this a loud error rather than a silent fallback
+                # so the operator knows to upgrade transformers.
+                if "output_logits" in str(e):
+                    raise RuntimeError(
+                        "transformers<4.38 does not support output_logits; "
+                        "upgrade transformers to >=4.38 — PPO correctness "
+                        "requires RAW (pre-temperature, pre-top-p) logits "
+                        "from generate()."
+                    ) from e
+                raise
+
+        full_ids = gen_out.sequences  # [1, prompt_length + T_gen]
+        T_gen = int(full_ids.shape[1] - prompt_length)
+        if T_gen <= 0:
+            logger.debug(
+                "Phase %s produced zero tokens (prompt_len=%d)",
+                phase, prompt_length,
+            )
+            return "", []
+
+        # Raw per-step logits.  gen_out.logits is a tuple of length T_gen,
+        # each element [1, V].  Stack → [T_gen, V].  Cast to fp32 for
+        # numerically stable log_softmax.
+        raw_logits_per_step = torch.stack(
+            [lg[0] for lg in gen_out.logits], dim=0
+        ).float()  # [T_gen, V]
+
+        sampled_tokens = full_ids[0, prompt_length:]  # [T_gen]
+
+        raw_log_probs = F.log_softmax(raw_logits_per_step, dim=-1)  # [T_gen, V]
+        chosen_log_probs = raw_log_probs.gather(
+            1, sampled_tokens.unsqueeze(1)
+        ).squeeze(1)  # [T_gen]
+        # Entropy of the RAW policy (logging only; PPO computes its own).
+        entropies = -(raw_log_probs.exp() * raw_log_probs).sum(dim=-1)  # [T_gen]
+
+        # Batched V(s_t) — ONE backbone forward over the full trajectory.
+        # State s_t's "last token" is at index prompt_length + t - 1 in
+        # full_ids, for t = 0..T_gen-1, so positions = [P-1, P, ..., P+T-2].
+        positions = torch.arange(
+            prompt_length - 1,
+            prompt_length + T_gen - 1,
+            device=self.device,
+        )
+        full_attn = torch.ones_like(full_ids)
+        values = self.value.values_at_positions(
+            input_ids=full_ids,
+            positions=positions,
+            attention_mask=full_attn,
+        )  # [T_gen] float32
+
+        # Incremental text fragments (O(T) decode, not O(T^2)).
+        #
+        # Why: downstream ``State.text`` is used for logging and for
+        # debug inspection only; the PPO update uses ``input_ids``.  We
+        # accumulate single-token decodes to build per-state text in
+        # linear time rather than re-decoding the growing sequence T
+        # times (which tokenizers do NOT amortize internally).
+        piece_by_piece: List[str] = self.tokenizer.batch_decode(
+            [[tok.item()] for tok in sampled_tokens],
+            skip_special_tokens=False,
         )
 
-        # Generation loop
-        for step in range(max_tokens):
-            # Compute value V(s_t)
-            with torch.no_grad():
-                value_estimate = self.value(
-                    input_ids=current_ids,
-                    attention_mask=torch.ones_like(current_ids),
-                ).item()
-
-            # Forward through policy to get action distribution
-            with torch.no_grad():
-                outputs = self.policy(
-                    input_ids=current_ids,
-                    attention_mask=torch.ones_like(current_ids),
-                    return_dict=True,
-                )
-
-            # CRITICAL for PPO correctness: the stored log_prob / entropy
-            # MUST come from the same distribution the PPO re-forward uses
-            # during update, otherwise the importance ratio exp(new - old)
-            # is a ratio between two different distributions and the
-            # surrogate-objective math is invalid.  PPOTrainer's re-forward
-            # uses raw logits (no temperature, no top-p), so we mirror that
-            # here when computing log_prob/entropy and ONLY apply
-            # temperature + top-p to the *sampling* distribution below.
-            raw_logits = outputs.logits[0, -1, :].float()  # [vocab_size]
-            raw_log_probs = F.log_softmax(raw_logits, dim=-1)
-
-            # Sampling-time distribution: temperature + nucleus truncation.
-            # Temperature is clamped away from 0 to avoid div-by-zero when
-            # callers pass temperature=0 for "greedy" (use argmax path
-            # below instead in that case).
-            temperature = max(float(self.temperature), 1e-6)
-            scaled_logits = raw_logits / temperature
-
-            # Top-p (nucleus) sampling with the canonical HuggingFace shift:
-            # mark for removal everything whose cumulative prob exceeds p,
-            # then shift the mask right by one so the FIRST token that
-            # crosses p is kept (otherwise we truncate a token too early).
-            sorted_logits, sorted_indices = torch.sort(
-                scaled_logits, descending=True
-            )
-            cumulative_probs = torch.cumsum(
-                F.softmax(sorted_logits, dim=-1), dim=-1
-            )
-            sorted_indices_to_remove = cumulative_probs > self.top_p
-            sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
-            sorted_indices_to_remove[0] = False
-
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            scaled_logits = scaled_logits.clone()
-            scaled_logits[indices_to_remove] = float("-inf")
-
-            # Sample from the truncated/tempered distribution.
-            sampling_probs = F.softmax(scaled_logits, dim=-1)
-            action_token = torch.multinomial(sampling_probs, num_samples=1).item()
-
-            # log π_θ(a|s) under the RAW (not tempered / truncated) policy —
-            # this is what PPOTrainer re-computes during the update pass.
-            log_prob = float(raw_log_probs[action_token].item())
-
-            # Entropy of the RAW policy (used only for logging; PPO recomputes
-            # its own entropy in train_step).
-            entropy = float(-(raw_log_probs.exp() * raw_log_probs).sum().item())
-
-            # Create action
-            action = Action(
-                token_id=action_token,
-                log_prob=log_prob,
-                entropy=entropy,
-            )
-
-            # Transition to next state s_{t+1} = s_t ⊕ a_t
-            next_ids = torch.cat(
-                [current_ids, torch.tensor([[action_token]], device=self.device)],
-                dim=1,
-            )
-
-            next_text = self.tokenizer.decode(
-                next_ids[0], skip_special_tokens=False
-            )
-
-            next_state = State(
-                text=next_text,
-                input_ids=next_ids[0],
-                attention_mask=torch.ones_like(next_ids[0]),
+        transitions: List[Transition] = []
+        running_text = initial_prompt
+        for t in range(T_gen):
+            state_input_ids = full_ids[0, : prompt_length + t]
+            current_state = State(
+                text=running_text,
+                input_ids=state_input_ids,
+                attention_mask=torch.ones_like(state_input_ids),
                 phase=phase,
             )
 
-            # Store transition (reward will be set later — sparse)
-            transition = Transition(
-                state=current_state,
-                action=action,
-                reward=0.0,
-                next_state=next_state,
-                value=value_estimate,
-                done=False,
+            action_token = int(sampled_tokens[t].item())
+            action = Action(
+                token_id=action_token,
+                log_prob=float(chosen_log_probs[t].item()),
+                entropy=float(entropies[t].item()),
             )
 
-            transitions.append(transition)
+            next_text = running_text + piece_by_piece[t]
+            next_input_ids = full_ids[0, : prompt_length + t + 1]
+            next_state = State(
+                text=next_text,
+                input_ids=next_input_ids,
+                attention_mask=torch.ones_like(next_input_ids),
+                phase=phase,
+            )
 
-            # Update current state
-            current_state = next_state
-            current_ids = next_ids
-            current_text = next_text
+            is_done = eos_id is not None and action_token == eos_id
+            transitions.append(
+                Transition(
+                    state=current_state,
+                    action=action,
+                    reward=0.0,
+                    next_state=next_state,
+                    value=float(values[t].item()),
+                    done=is_done,
+                )
+            )
 
-            # Check for EOS token
-            if action_token == self.tokenizer.eos_token_id:
-                transitions[-1].done = True
+            running_text = next_text
+            if is_done:
                 break
 
-        # Decode only the newly generated tokens (skip the prompt)
-        generated_ids = current_ids[0][prompt_length:]
+        # Decoded generated text (specials stripped, trimmed).  Only the
+        # tokens up to (and including) the stop reason count — if we
+        # broke on EOS partway through, truncate accordingly.
+        generated_ids = full_ids[0, prompt_length : prompt_length + len(transitions)]
         generated_text = self.tokenizer.decode(
             generated_ids, skip_special_tokens=True
         ).strip()
-        
-        logger.debug(f"Generated text for phase {phase} (len={len(generated_text)}): {generated_text[:150]}...")
+
+        logger.debug(
+            "Generated text for phase %s (len=%d, tokens=%d): %s...",
+            phase, len(generated_text), len(transitions), generated_text[:150],
+        )
 
         return generated_text, transitions
 
