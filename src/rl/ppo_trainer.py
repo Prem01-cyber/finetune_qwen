@@ -212,18 +212,54 @@ class PPOTrainer:
         """
         Logits for the next-token distribution at the last non-pad position.
 
+        Memory-efficient path: PPO needs exactly one logit row per sample
+        (the one predicting the action token).  The naive call
+        ``self.policy(input_ids, ...)`` materialises the full
+        ``[B, T, vocab]`` logits tensor before we index into it — for
+        Qwen2.5 (vocab ≈ 152 K) with B=32, T≈500 that's a ~5 GB
+        allocation inside ``lm_head`` that OOMs on an 80 GB A100 once
+        policy + AdamW states + activations are already resident.
+
+        Instead we run only the transformer backbone (``self.policy.model``)
+        to get hidden states, slice out the last-non-pad position per
+        sample, and then apply ``lm_head`` on the ``[B, H]`` tensor.  The
+        resulting logits are ``[B, vocab]`` — ~20 MB at bf16 — a ~250×
+        memory reduction over the naive path with zero math change.
+
         Returns:
             logits_last: [batch, vocab_size] float32
         """
+        # Qwen2ForCausalLM exposes the bare transformer as .model; run
+        # without KV-cache (we re-forward from scratch every PPO step)
+        # and skip hidden-state / attention outputs.
+        backbone = getattr(self.policy, "model", None)
+        lm_head = getattr(self.policy, "lm_head", None)
+        last_idx = attention_mask.long().sum(dim=1) - 1
+        last_idx = last_idx.clamp(min=0)
+        b = torch.arange(input_ids.size(0), device=input_ids.device)
+
+        if backbone is not None and lm_head is not None:
+            backbone_out = backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            hidden_states = backbone_out.last_hidden_state  # [B, T, H]
+            last_hidden = hidden_states[b, last_idx]         # [B, H]
+            logits_last = lm_head(last_hidden).float()       # [B, vocab]
+            return logits_last
+
+        # Fallback for a policy that doesn't expose .model / .lm_head
+        # (e.g. a wrapped model from a different architecture).  Slower
+        # and uses more memory, but always correct.
         out = self.policy(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            use_cache=False,
             return_dict=True,
         )
         logits = out.logits.float()
-        last_idx = attention_mask.long().sum(dim=1) - 1
-        last_idx = last_idx.clamp(min=0)
-        b = torch.arange(logits.size(0), device=logits.device)
         return logits[b, last_idx]
 
     # ------------------------------------------------------------------
