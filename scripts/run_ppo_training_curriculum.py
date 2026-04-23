@@ -360,11 +360,23 @@ def initialize_models(config: CurriculumTrainingConfig):
     # safe to set.
     attn_impl = select_attn_implementation()
 
+    # Flash-Attn 2 refuses to initialise on a CPU-dispatched model
+    # ("You are attempting to use Flash Attention 2.0 with a model
+    #  dispatched on CPU or disk").  The old load-on-CPU-then-.to(device)
+    # dance was a relic of the DeepSpeed era; with a single 80 GB A100
+    # and low_cpu_mem_usage=True, loading the 1.5 B-param bf16 policy
+    # directly on GPU costs ~3 GB — totally fine.  We only drop back to
+    # CPU dispatch when there is no CUDA device at all.
+    if torch.cuda.is_available():
+        load_device_map = {"": "cuda:0"}
+    else:
+        load_device_map = {"": "cpu"}
+
     policy_load_kwargs = {
         "torch_dtype": torch.bfloat16,
         "low_cpu_mem_usage": True,
         "trust_remote_code": True,
-        "device_map": {"": "cpu"},
+        "device_map": load_device_map,
         "attn_implementation": attn_impl,
     }
 
@@ -410,6 +422,9 @@ def initialize_models(config: CurriculumTrainingConfig):
             "be treated as the SFT baseline, not a PPO-improved policy."
         )
 
+    # With device_map={"": "cuda:0"}, weights already live on the GPU,
+    # so this .to(device) is a harmless no-op.  We still call it to cover
+    # the (rare) CPU-only fallback path where load_device_map was cpu.
     policy = policy.to(device)
 
     # Gradient checkpointing: drop intermediate activations on the forward
@@ -456,8 +471,11 @@ def initialize_models(config: CurriculumTrainingConfig):
 
     log_gpu_memory("After policy loaded")
 
-    value = ValueHead(base_model_name, model_device_map={"": "cpu"})
-    value.backbone = value.backbone.to(device)
+    # Same rationale as the policy: Flash-Attn 2 can't dispatch on CPU,
+    # and our 1.5 B-param bf16 backbone fits trivially on the A100.
+    value = ValueHead(base_model_name, model_device_map=load_device_map)
+    # value_head MLP is always created on CPU by nn.Sequential construction;
+    # move it to the target device explicitly.
     value.value_head = value.value_head.to(device)
     log_gpu_memory("After ValueHead loaded")
 
