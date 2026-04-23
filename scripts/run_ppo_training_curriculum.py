@@ -31,10 +31,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from scripts.convert_gsm8k_to_sft import parse_gsm8k_answer
 from scripts.eval_sft_inference import evaluate_gsm8k
 from src.rl.checkpoint_manager import CheckpointManager
 from src.rl.math_environment_curriculum import CurriculumMathEnvironment
 from src.rl.ppo_trainer import PPOTrainer
+from src.rl.prm_scorer import ProcessRewardScorer
 from src.rl.rollout_buffer import RolloutBuffer
 from src.rl.training_monitor import TrainingMonitor
 from src.rl.value_network import ValueHead
@@ -119,6 +121,21 @@ class CurriculumTrainingConfig:
     consensus_temperature = 0.5
 
     num_iterations = 10
+    # Fraction of each rollout batch that is GSM8K-anchored (real question,
+    # reward scored directly against the gold final answer).  Defaults to
+    # 0.5 — enough to dominate the gradient without drowning out self-play.
+    # Set to 0.0 to disable grounded rollouts entirely.
+    grounded_ratio = 0.5
+
+    # Process Reward Model (Qwen2.5-Math-PRM) replaces the TripleVerifier
+    # consensus signal on self-play rollouts.  PRM gives per-step correctness
+    # probabilities against the actual question — a strictly stronger signal
+    # than "do three same-model samples agree?" (they often agree on wrong
+    # answers; groupthink).  Loaded in 4-bit to stay comfortably under 7 GB.
+    use_prm = True
+    prm_model = "Qwen/Qwen2.5-Math-PRM-7B"
+    prm_load_in_4bit = True
+
     eval_every = 5
     # GSM8K eval at 1.5B runs at ~1 problem/s greedy, so 500 samples ≈ 8-10 min.
     # Override from CLI with --eval-max-samples / --eval-max-new-tokens if you
@@ -170,6 +187,72 @@ def load_reference_questions(path: str) -> List[str]:
                     questions.append(content.strip())
                 break
     return questions
+
+
+def load_grounded_qa_pairs(path: str) -> List[Dict[str, str]]:
+    """
+    Parse a GSM8K-style JSONL into ``[{"question": ..., "gold_final": ...}]``.
+
+    Accepts two shapes:
+      * Raw GSM8K rows: ``{"question": ..., "answer": "...#### 42"}``.
+      * SFT-converted rows: ``{"messages": [...]}`` where the user turn
+        contains ``Problem:\\n<question>`` and the assistant turn ends with
+        ``Final Answer: <n>``.
+
+    The second shape is what ``data/sft/gsm8k_sft.jsonl`` contains; the
+    first shape is the upstream HuggingFace layout.
+    """
+    from src.sft.solution_format import extract_final_answer_numeric_str
+
+    file_path = Path(path)
+    if not file_path.exists():
+        logger.warning(
+            "Grounded QA data %s not found; grounded rollouts will be disabled",
+            path,
+        )
+        return []
+
+    qa_pairs: List[Dict[str, str]] = []
+    with file_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            question = ""
+            gold_final = ""
+
+            if "question" in record and "answer" in record:
+                question = str(record["question"]).strip()
+                _, gold_final = parse_gsm8k_answer(str(record["answer"]))
+
+            elif "messages" in record:
+                user_text = ""
+                asst_text = ""
+                for msg in record["messages"]:
+                    role = msg.get("role")
+                    if role == "user" and not user_text:
+                        user_text = str(msg.get("content", "")).strip()
+                    elif role == "assistant" and not asst_text:
+                        asst_text = str(msg.get("content", ""))
+                if "Problem:" in user_text:
+                    question = user_text.split("Problem:", 1)[1].strip()
+                else:
+                    question = user_text
+                gold_final = extract_final_answer_numeric_str(asst_text) or ""
+
+            if question and gold_final:
+                qa_pairs.append(
+                    {"question": question, "gold_final": str(gold_final).strip()}
+                )
+
+    logger.info("Loaded %d grounded (question, gold_final) pairs from %s",
+                len(qa_pairs), path)
+    return qa_pairs
 
 
 def log_gpu_memory(stage: str) -> None:
@@ -276,6 +359,46 @@ def initialize_models(config: CurriculumTrainingConfig):
     return policy, value, tokenizer, device
 
 
+def _policy_weight_fingerprint(policy) -> Dict[str, float]:
+    """
+    Return a cheap fingerprint of the live policy weights so we can
+    confirm from logs that eval is hitting the *updated* model and not a
+    stale copy.  We hash two tensors — the embedding matrix (changes when
+    token-level gradients land) and the last transformer block's weight
+    (changes under PPO policy-loss backprop) — and also return their L2
+    norms.  Any movement between iterations proves the optimizer step
+    actually mutated the weights eval sees.
+    """
+    import hashlib
+
+    fingerprint: Dict[str, float] = {}
+    try:
+        embed = policy.get_input_embeddings().weight.detach()
+        fingerprint["embed_l2"] = float(embed.float().norm().item())
+        fingerprint["embed_sha8"] = int(
+            hashlib.sha1(
+                embed.float().cpu().contiguous().numpy().tobytes()[:4096]
+            ).hexdigest()[:8],
+            16,
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug("embed fingerprint failed: %s", exc)
+
+    try:
+        # Last named parameter usually sits in the final transformer block.
+        last_name, last_param = None, None
+        for name, param in policy.named_parameters():
+            last_name, last_param = name, param
+        if last_param is not None:
+            w = last_param.detach().float()
+            fingerprint["last_param_name"] = last_name  # type: ignore[assignment]
+            fingerprint["last_param_l2"] = float(w.norm().item())
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug("last-param fingerprint failed: %s", exc)
+
+    return fingerprint
+
+
 def evaluate_policy(
     policy,
     tokenizer,
@@ -288,6 +411,17 @@ def evaluate_policy(
         max_samples,
         max_new_tokens,
     )
+    fp = _policy_weight_fingerprint(policy)
+    if fp:
+        logger.info(
+            "Eval policy fingerprint: embed_l2=%.4f embed_sha8=%08x "
+            "last_param=%s l2=%.4f  (same object being updated by PPO; "
+            "these values should drift across iterations)",
+            fp.get("embed_l2", float("nan")),
+            int(fp.get("embed_sha8", 0)),
+            fp.get("last_param_name", "?"),
+            fp.get("last_param_l2", float("nan")),
+        )
     results = evaluate_gsm8k(
         model=policy,
         tokenizer=tokenizer,
@@ -322,6 +456,11 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
     expert_phase_counts: Dict[str, int] = {}
     source_counts: Dict[str, int] = {}
     replay_added_count = 0
+    prm_mean_scores: List[float] = []
+    prm_min_scores: List[float] = []
+    prm_final_scores: List[float] = []
+    prm_degraded_count = 0
+    prm_sample_count = 0
 
     for trajectory in trajectories:
         meta = trajectory.metadata
@@ -353,6 +492,35 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
         source = str(meta.get("rollout_source", "fresh"))
         source_counts[source] = source_counts.get(source, 0) + 1
         replay_added_count += int(bool(meta.get("replay_added", False)))
+
+        # PRM stats live inside reward_breakdown on grounded rollouts and
+        # inside reward_breakdown["solution_metrics"] on self-play rollouts.
+        rb = meta.get("reward_breakdown", {})
+        prm_mean = None
+        prm_min = None
+        prm_final = None
+        prm_degraded = None
+        if isinstance(rb, dict):
+            if "prm_mean_score" in rb:
+                prm_mean = float(rb.get("prm_mean_score", 0.0))
+                prm_degraded = bool(rb.get("prm_degraded", True))
+            sol = rb.get("solution_metrics", {}) if isinstance(
+                rb.get("solution_metrics"), dict
+            ) else {}
+            if "prm_mean_score" in sol:
+                prm_mean = float(sol.get("prm_mean_score", prm_mean or 0.0))
+                prm_min = float(sol.get("prm_min_score", 0.0))
+                prm_final = float(sol.get("prm_final_score", 0.0))
+                prm_degraded = bool(sol.get("prm_degraded", prm_degraded or False))
+        if prm_mean is not None:
+            prm_sample_count += 1
+            prm_mean_scores.append(prm_mean)
+            if prm_min is not None:
+                prm_min_scores.append(prm_min)
+            if prm_final is not None:
+                prm_final_scores.append(prm_final)
+            if prm_degraded:
+                prm_degraded_count += 1
 
     per_topic_success = {
         topic: (topic_successes.get(topic, 0) / max(1, count))
@@ -400,6 +568,20 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
         "replay_added_count": replay_added_count,
         "fresh_mean_reward": _mean_reward_for("fresh"),
         "replay_mean_reward": _mean_reward_for("replay"),
+        "prm_sample_count": prm_sample_count,
+        "prm_degraded_count": prm_degraded_count,
+        "prm_mean_of_means": (
+            float(sum(prm_mean_scores) / len(prm_mean_scores))
+            if prm_mean_scores else 0.0
+        ),
+        "prm_mean_of_mins": (
+            float(sum(prm_min_scores) / len(prm_min_scores))
+            if prm_min_scores else 0.0
+        ),
+        "prm_mean_of_finals": (
+            float(sum(prm_final_scores) / len(prm_final_scores))
+            if prm_final_scores else 0.0
+        ),
     }
 
 
@@ -476,6 +658,42 @@ def main():
         "broken with HF .generate(); off by default).",
     )
     parser.add_argument(
+        "--grounded-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of each rollout batch that is GSM8K-anchored "
+        "(real question, reward from gold final answer).  Default 0.5.  "
+        "Set 0 to disable and go pure self-play.",
+    )
+    parser.add_argument(
+        "--use-prm",
+        dest="use_prm",
+        action="store_true",
+        default=True,
+        help="Use Qwen2.5-Math-PRM as the self-play correctness signal "
+        "(replaces TripleVerifier consensus).  Default: on.",
+    )
+    parser.add_argument(
+        "--no-prm",
+        dest="use_prm",
+        action="store_false",
+        help="Disable the PRM and fall back to the legacy consensus-based "
+        "self-play reward.",
+    )
+    parser.add_argument(
+        "--prm-model",
+        type=str,
+        default="Qwen/Qwen2.5-Math-PRM-7B",
+        help="HuggingFace repo id of the Process Reward Model.",
+    )
+    parser.add_argument(
+        "--prm-no-4bit",
+        dest="prm_load_in_4bit",
+        action="store_false",
+        default=True,
+        help="Load the PRM in full bf16 (~14 GB) instead of 4-bit (~5 GB).",
+    )
+    parser.add_argument(
         "--run-name", type=str, default=None, help="Optional run name for logging"
     )
     args = parser.parse_args()
@@ -496,6 +714,10 @@ def main():
     config.eval_every = max(1, int(args.eval_every))
     config.eval_max_samples = max(1, int(args.eval_max_samples))
     config.eval_max_new_tokens = max(32, int(args.eval_max_new_tokens))
+    config.grounded_ratio = max(0.0, min(1.0, float(args.grounded_ratio)))
+    config.use_prm = bool(args.use_prm)
+    config.prm_model = str(args.prm_model)
+    config.prm_load_in_4bit = bool(args.prm_load_in_4bit)
     if args.torch_compile:
         config.use_torch_compile = True
 
@@ -522,12 +744,44 @@ def main():
     try:
         policy, value, tokenizer, device = initialize_models(config)
         reference_questions = load_reference_questions(config.gsm8k_reference_data)
+        grounded_qa_pairs = (
+            load_grounded_qa_pairs(config.gsm8k_reference_data)
+            if config.grounded_ratio > 0.0
+            else []
+        )
+        if config.grounded_ratio > 0.0 and not grounded_qa_pairs:
+            logger.warning(
+                "grounded_ratio=%.2f requested but no QA pairs were loaded from %s; "
+                "falling back to pure self-play",
+                config.grounded_ratio, config.gsm8k_reference_data,
+            )
+            config.grounded_ratio = 0.0
+
+        prm_scorer = None
+        if config.use_prm:
+            try:
+                log_gpu_memory("Before PRM load")
+                prm_scorer = ProcessRewardScorer(
+                    model_name=config.prm_model,
+                    device=device,
+                    load_in_4bit=config.prm_load_in_4bit,
+                )
+                log_gpu_memory("After PRM load")
+            except Exception as exc:
+                logger.error(
+                    "PRM load failed (%s); falling back to legacy "
+                    "consensus-based self-play reward.  To silence this, "
+                    "pass --no-prm.", exc,
+                )
+                prm_scorer = None
 
         math_env = CurriculumMathEnvironment(
             policy_model=policy,
             value_model=value,
             tokenizer=tokenizer,
             reference_questions=reference_questions,
+            grounded_qa_pairs=grounded_qa_pairs,
+            prm_scorer=prm_scorer,
             curriculum_checkpoint_dir=config.curriculum_checkpoint_dir,
             max_question_tokens=config.max_question_tokens,
             max_solution_tokens=config.max_solution_tokens,
@@ -607,7 +861,9 @@ def main():
 
             rollout_start = time.perf_counter()
             trajectories = math_env.collect_rollouts(
-                num_trajectories=config.num_rollouts_per_iter, verbose=True,
+                num_trajectories=config.num_rollouts_per_iter,
+                verbose=True,
+                grounded_ratio=config.grounded_ratio,
             )
             rollout_seconds = time.perf_counter() - rollout_start
 
@@ -720,6 +976,8 @@ def main():
                 "replay_buffer": replay_stats,
                 "rollout_mix": dict(math_env.last_rollout_mix),
                 "replay_ratio": math_env.last_replay_ratio,
+                "grounded_ratio": config.grounded_ratio,
+                "grounded_stats": dict(math_env.last_grounded_stats),
             }
             save_iteration_results(iteration, trajectories, all_metrics, config)
 
@@ -737,6 +995,18 @@ def main():
                 "curriculum/avg_difficulty": curriculum_stats["avg_difficulty"],
                 "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
                 "curriculum/replay_ratio": math_env.last_replay_ratio,
+                "grounded/ratio": config.grounded_ratio,
+                "grounded/count": math_env.last_grounded_stats.get("count", 0),
+                "grounded/correct": math_env.last_grounded_stats.get("correct", 0),
+                "grounded/accuracy": math_env.last_grounded_stats.get("accuracy", 0.0),
+                "grounded/mean_reward": math_env.last_grounded_stats.get(
+                    "mean_reward", 0.0
+                ),
+                "prm/mean_of_means": curriculum_stats.get("prm_mean_of_means", 0.0),
+                "prm/mean_of_mins": curriculum_stats.get("prm_mean_of_mins", 0.0),
+                "prm/mean_of_finals": curriculum_stats.get("prm_mean_of_finals", 0.0),
+                "prm/samples": curriculum_stats.get("prm_sample_count", 0),
+                "prm/degraded": curriculum_stats.get("prm_degraded_count", 0),
                 "perf/rollout_time": rollout_seconds,
                 "perf/train_time": train_seconds,
                 "perf/total_time": total_seconds,
