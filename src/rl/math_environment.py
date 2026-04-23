@@ -217,36 +217,53 @@ class MathEnvironment:
                     return_dict=True,
                 )
 
-            # Get logits for next token
-            next_token_logits = outputs.logits[0, -1, :]  # [vocab_size]
+            # CRITICAL for PPO correctness: the stored log_prob / entropy
+            # MUST come from the same distribution the PPO re-forward uses
+            # during update, otherwise the importance ratio exp(new - old)
+            # is a ratio between two different distributions and the
+            # surrogate-objective math is invalid.  PPOTrainer's re-forward
+            # uses raw logits (no temperature, no top-p), so we mirror that
+            # here when computing log_prob/entropy and ONLY apply
+            # temperature + top-p to the *sampling* distribution below.
+            raw_logits = outputs.logits[0, -1, :].float()  # [vocab_size]
+            raw_log_probs = F.log_softmax(raw_logits, dim=-1)
 
-            # Apply temperature
-            next_token_logits = next_token_logits / self.temperature
+            # Sampling-time distribution: temperature + nucleus truncation.
+            # Temperature is clamped away from 0 to avoid div-by-zero when
+            # callers pass temperature=0 for "greedy" (use argmax path
+            # below instead in that case).
+            temperature = max(float(self.temperature), 1e-6)
+            scaled_logits = raw_logits / temperature
 
-            # Apply top-p (nucleus) sampling
+            # Top-p (nucleus) sampling with the canonical HuggingFace shift:
+            # mark for removal everything whose cumulative prob exceeds p,
+            # then shift the mask right by one so the FIRST token that
+            # crosses p is kept (otherwise we truncate a token too early).
             sorted_logits, sorted_indices = torch.sort(
-                next_token_logits, descending=True
+                scaled_logits, descending=True
             )
             cumulative_probs = torch.cumsum(
                 F.softmax(sorted_logits, dim=-1), dim=-1
             )
-
-            # Remove tokens with cumulative probability above threshold
             sorted_indices_to_remove = cumulative_probs > self.top_p
-            sorted_indices_to_remove[0] = False  # Keep at least one token
+            sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+            sorted_indices_to_remove[0] = False
 
             indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            next_token_logits[indices_to_remove] = float("-inf")
+            scaled_logits = scaled_logits.clone()
+            scaled_logits[indices_to_remove] = float("-inf")
 
-            # Sample action a_t ~ π(·|s_t)
-            probs = F.softmax(next_token_logits, dim=-1)
-            action_token = torch.multinomial(probs, num_samples=1).item()
+            # Sample from the truncated/tempered distribution.
+            sampling_probs = F.softmax(scaled_logits, dim=-1)
+            action_token = torch.multinomial(sampling_probs, num_samples=1).item()
 
-            # Compute log probability log π(a_t|s_t)
-            log_prob = F.log_softmax(next_token_logits, dim=-1)[action_token].item()
+            # log π_θ(a|s) under the RAW (not tempered / truncated) policy —
+            # this is what PPOTrainer re-computes during the update pass.
+            log_prob = float(raw_log_probs[action_token].item())
 
-            # Compute entropy H(π(·|s_t))
-            entropy = -(probs * torch.log(probs + 1e-10)).sum().item()
+            # Entropy of the RAW policy (used only for logging; PPO recomputes
+            # its own entropy in train_step).
+            entropy = float(-(raw_log_probs.exp() * raw_log_probs).sum().item())
 
             # Create action
             action = Action(

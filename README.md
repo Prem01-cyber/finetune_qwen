@@ -21,6 +21,15 @@ Core innovation: the agent does not optimize against a fixed benchmark distribut
 - [Before/after demo](#13-beforeafter-demo)
 - [Hackathon alignment](HACKATHON.md)
 
+### ⚠ Runs produced **before** the fixes in `src/rl/ppo_trainer.py` + `scripts/run_ppo_training_curriculum.py` audit pass should be discarded.
+
+Two silent-but-devastating bugs were caught during a late-stage code audit:
+
+1. **Frozen-policy bug.** `PeftModel.from_pretrained(...).merge_and_unload()` leaves every base parameter with `requires_grad=False`.  The PPO optimizer therefore only ever updated the ~600 K-param value head — the 1.5 B-param policy itself was stone frozen.  `approx_kl` looked non-zero because of numerical drift between the rollout-time `.generate()` path and the update-time `.forward()` path, so the training loop *appeared* to converge while actually learning nothing.  Symptom: byte-identical `GSM8K 318/500` across many iterations.  Now re-enabled explicitly after `merge_and_unload` with a hard-fail assertion in `PPOTrainer.__init__` if `policy.parameters()` has zero `requires_grad=True` entries.
+2. **PPO importance-ratio bug.** Rollout generation applied temperature + top-p to the logits, then stored `log_softmax` of the *filtered* logits as `old_log_prob`.  PPO's re-forward used raw (un-tempered, un-truncated) logits.  The resulting `exp(new - old)` was a ratio between two different distributions — invalidating the clipped-surrogate objective.  The frozen-policy bug masked this; now that the policy actually trains, this had to be fixed first.  Rollout log-probs are now computed under the raw policy distribution, matching the update path exactly.
+
+All details (what was wrong, how it manifested, what to look for) are in the commit history and the `Monitoring` section below.  Any checkpoints under `checkpoints/ppo_curriculum/iteration_*` that predate these fixes are equivalent to the SFT baseline and should **not** be resumed from.
+
 ---
 
 ## 2. System Architecture
@@ -671,10 +680,11 @@ python scripts/run_ppo_training_curriculum.py \
 | `--eval-every` | `5` | GSM8K eval every 5 iterations; 10 eval points over the run. |
 | `--checkpoint-keep-last` | `5` | Lets you roll back 5 iterations if a phase transition spikes KL. |
 | `--checkpoint-keep-every` | `10` | Persists milestone snapshots at iter 10/20/30/40/50 outside the rolling window. |
-| *(default)* `learning_rate=3e-6` | — | Sweet spot for LoRA-style fine-tuning on 1–2 B policies. |
-| *(default)* `target_kl=0.03` | — | Canonical RLHF PPO early-stop threshold; matches TRL / OpenRLHF. |
-| *(default)* `clip_range=0.2`, `clip_range_vf=0.2` | — | Standard PPO clip. |
-| *(default)* `ppo_epochs=3`, `batch_size=32` | — | 3 epochs × ⌈N/32⌉ micro-batches per iteration. |
+| `--target-kl` | `0.05` | Looser than the canonical 0.015–0.03 because grounded rollouts already anchor the policy against GSM8K gold.  At 0.03 the per-batch approx_kl reliably tripped `1.5 × target_kl = 0.045` in epoch 1, leaving PPO with ~⅓ of its planned update budget per iteration. |
+| `--kl-trip-multiplier` | `1.5` | Canonical PPO/TRL value; raise to `2.0–2.5` to make early-stop effectively never fire (pair with a lower `--target-kl`). |
+| `--ppo-epochs`, `--clip-range`, `--clip-range-vf` | `3`, `0.2`, `0.2` | Now CLI-exposed so you can tune without editing code. |
+| *(default)* `learning_rate=3e-6` | — | Sweet spot for a 1.5 B full-param policy. |
+| *(default)* `batch_size=32` | — | 3 epochs × ⌈N/32⌉ micro-batches per iteration. |
 | *(default)* `ent_coef=0.02`, `vf_coef=0.5`, `max_grad_norm=0.5` | — | Conservative stability settings. |
 
 **Expected GPU memory (A100-80 GB, bf16 policy + 4-bit PRM):**
@@ -757,20 +767,24 @@ CSV + console metrics stream to `logs/ppo-curriculum/<run-name>/`:
 Per-iteration console summary (one line, easy to grep):
 
 ```
+Policy trainable params: 1,543,714,304/1,543,714,304 (100.0%) — before unfreeze: 0   ← first iteration only; proves PEFT merge didn't leave the base model frozen
+PPO trainable params: policy=1,543,714,304, value_head=591,873 (total=1,544,306,177)
 Rewards: Q_selfplay=0.412 (n=22, topic_entropy=2.18, topics=9)  Sol=0.573  Combined=0.531  grounded_acc=0.67
-PPO update metrics: policy_loss=-0.0123 value_loss=0.0841 entropy=1.82 approx_kl=0.0187 clip_fraction=0.12 update_steps=96
-Eval policy fingerprint: embed_l2=1234.56 embed_sha8=ab12cd34 last_param=model.layers.27.mlp.down_proj.weight l2=98.76
+PPO update metrics: policy_loss=-0.0123 value_loss=0.0841 entropy=1.82 approx_kl=0.0187 (trip@0.0750) clip_fraction=0.12 updates=96/96 (100% budget used) | full
+Eval policy fingerprint: embed_l2=1234.56 embed_sha8=ab12cd34 embed_trainable=True | trainable_probe=model.embed_tokens.weight l2=98.76
 ```
 
-The weight fingerprint lets you *visually confirm* that PPO updates are
-actually reaching the policy before each eval (values must drift
-iteration to iteration).
+**How to read these at a glance:**
+
+* `Policy trainable params` — if `before unfreeze: 0` appears on the first iteration, the codebase just saved you from the historical silent bug where `PeftModel.from_pretrained(...).merge_and_unload()` left every base parameter frozen and PPO ran for hours updating only the 600 K-param value head.  If it ever prints `0/1,543,…` *after* unfreeze, the trainer hard-fails with a `RuntimeError` rather than training nothing.
+* `updates=X/Y (Z% budget used) | full` — full budget means PPO completed all planned epochs.  `KL-stopped@epoch1/3` means the KL guard fired early; if that happens every iteration, raise `--target-kl` (or `--kl-trip-multiplier`) instead of tightening it.
+* `trainable_probe=<param_name>` — the fingerprint now deliberately picks a **trainable** parameter.  Its `l2` must drift across iterations.  If it doesn't, the optimizer isn't reaching that param and you should treat the run as broken before wasting more wall-clock.
 
 **Healthy run signatures:**
 
 | Signal | Target |
 |---|---|
-| `approx_kl` | stays below `0.045` (1.5 × `target_kl=0.03`); spikes trigger early stop |
+| `approx_kl` | stays below `0.075` (`kl_trip_multiplier × target_kl` = 1.5 × 0.05); spikes trigger early stop |
 | `clip_fraction` | `0.08–0.25` (too low = stale ratios, too high = collapsing policy) |
 | `curriculum/avg_question_reward_selfplay` | trends upward after ~5 iters |
 | `curriculum/selfplay_topic_entropy` | stays ≥ 1.5 (policy isn't collapsing onto one topic) |

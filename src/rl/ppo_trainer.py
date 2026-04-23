@@ -168,11 +168,38 @@ class PPOTrainer:
             ent_coef=ent_coef,
         )
 
-        # Single optimiser covers both policy LoRA params and value head MLP
-        trainable_params = list(
-            filter(lambda p: p.requires_grad, policy_model.parameters())
-        ) + list(value_model.value_head.parameters())
+        # Single optimiser covers both policy-side trainable params and
+        # the value-head MLP.  We assert here that the policy actually
+        # contributes trainable tensors: a silent zero (caused e.g. by
+        # PEFT.merge_and_unload leaving requires_grad=False on every
+        # param) produces a PPO loop that *appears* to run — non-zero
+        # approx_kl from train/.generate() path noise — but never moves
+        # the policy, yielding byte-identical eval accuracy across
+        # iterations.  Fail loudly instead of training the value head
+        # in isolation for hours.
+        policy_trainable = [
+            p for p in policy_model.parameters() if p.requires_grad
+        ]
+        value_trainable = list(value_model.value_head.parameters())
+        if len(policy_trainable) == 0:
+            raise RuntimeError(
+                "PPOTrainer received a policy with 0 trainable parameters. "
+                "This almost always means PeftModel.from_pretrained(...)."
+                "merge_and_unload() was called without restoring "
+                "requires_grad=True on the merged base model.  Fix in the "
+                "training script (call `for p in policy.parameters(): "
+                "p.requires_grad_(True)` right after merge_and_unload)."
+            )
+        n_policy = sum(p.numel() for p in policy_trainable)
+        n_value = sum(p.numel() for p in value_trainable)
+        logger.info(
+            "PPO trainable params: policy=%s, value_head=%s (total=%s)",
+            f"{n_policy:,}",
+            f"{n_value:,}",
+            f"{n_policy + n_value:,}",
+        )
 
+        trainable_params = policy_trainable + value_trainable
         self.optimiser = AdamW(trainable_params, lr=learning_rate)
 
         self.device = next(policy_model.parameters()).device

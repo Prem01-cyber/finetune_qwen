@@ -318,6 +318,13 @@ def initialize_models(config: CurriculumTrainingConfig):
     tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Force right-padding: the rollout buffer re-pads single-example state
+    # tensors right-aligned via _pad_2d, and PPOTrainer picks the "last
+    # non-pad" logit via attention_mask.sum(dim=1) - 1 — both assume right
+    # padding.  If any downstream call does tokenizer(..., padding=True)
+    # on a batch with the default left-padding, the last-token index
+    # picks a pad position and produces silently wrong log-probs.
+    tokenizer.padding_side = "right"
     if tokenizer.chat_template is None and is_adapter:
         logger.info("Chat template not found in adapter, loading from base model")
         base_tokenizer = AutoTokenizer.from_pretrained(
@@ -349,6 +356,36 @@ def initialize_models(config: CurriculumTrainingConfig):
             config.base_model, **policy_load_kwargs
         )
 
+    # CRITICAL: PeftModel.from_pretrained sets requires_grad=False on every
+    # base-model parameter (only the LoRA adapter stays trainable).
+    # merge_and_unload() folds the LoRA deltas back into the base weights
+    # and strips the wrapper, but it does NOT restore requires_grad.
+    # Without this loop, the PPO optimiser ends up holding zero policy
+    # parameters (only the value-head MLP), the policy never updates, and
+    # you get byte-identical eval accuracy across iterations — the exact
+    # failure mode we observed in the run that produced this fix.
+    trainable_before = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    for param in policy.parameters():
+        param.requires_grad_(True)
+    trainable_after = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in policy.parameters())
+    logger.info(
+        "Policy trainable params: %s/%s (%.1f%%) — before unfreeze: %s "
+        "[if this was 0, the policy was silently frozen before this fix]",
+        f"{trainable_after:,}",
+        f"{total_params:,}",
+        100.0 * trainable_after / max(total_params, 1),
+        f"{trainable_before:,}",
+    )
+    if trainable_before == 0 and trainable_after > 0:
+        logger.warning(
+            "Policy was loaded fully frozen (requires_grad=False on every "
+            "param) — this is the merge_and_unload + PEFT interaction bug. "
+            "Now fixed for this run, but any prior checkpoints from this "
+            "codebase were trained on value-head updates only and should "
+            "be treated as the SFT baseline, not a PPO-improved policy."
+        )
+
     policy = policy.to(device)
     log_gpu_memory("After policy loaded")
 
@@ -377,17 +414,27 @@ def _policy_weight_fingerprint(policy) -> Dict[str, float]:
     """
     Return a cheap fingerprint of the live policy weights so we can
     confirm from logs that eval is hitting the *updated* model and not a
-    stale copy.  We hash two tensors — the embedding matrix (changes when
-    token-level gradients land) and the last transformer block's weight
-    (changes under PPO policy-loss backprop) — and also return their L2
-    norms.  Any movement between iterations proves the optimizer step
-    actually mutated the weights eval sees.
+    stale copy.
+
+    Crucially we sample a **trainable** parameter (requires_grad=True) —
+    the previous implementation picked the last named parameter, which
+    under PEFT + merge_and_unload ends up being ``model.norm.weight`` or
+    ``lm_head.weight``, both of which can be frozen even while other
+    params train.  A fingerprint over a frozen param gives false "no
+    drift" readings even when PPO is learning correctly.
+
+    We also fingerprint the input embedding (usually trainable and large)
+    so drift shows up in both a small 1-D vector (fast) and a large 2-D
+    matrix (canonical).
     """
     import hashlib
 
     fingerprint: Dict[str, float] = {}
+
+    # 1) Input embedding — canonical "did anything change" tensor.
     try:
-        embed = policy.get_input_embeddings().weight.detach()
+        embed_param = policy.get_input_embeddings().weight
+        embed = embed_param.detach()
         fingerprint["embed_l2"] = float(embed.float().norm().item())
         fingerprint["embed_sha8"] = int(
             hashlib.sha1(
@@ -395,20 +442,32 @@ def _policy_weight_fingerprint(policy) -> Dict[str, float]:
             ).hexdigest()[:8],
             16,
         )
+        fingerprint["embed_requires_grad"] = float(embed_param.requires_grad)
     except Exception as exc:  # pragma: no cover - best effort
         logger.debug("embed fingerprint failed: %s", exc)
 
+    # 2) First *trainable* named parameter — guaranteed to move across
+    # iterations if PPO is actually updating the policy.  Falls back to
+    # the last named param only if nothing is trainable (which itself is
+    # a red flag worth logging).
     try:
-        # Last named parameter usually sits in the final transformer block.
-        last_name, last_param = None, None
+        picked_name, picked_param = None, None
         for name, param in policy.named_parameters():
-            last_name, last_param = name, param
-        if last_param is not None:
-            w = last_param.detach().float()
-            fingerprint["last_param_name"] = last_name  # type: ignore[assignment]
-            fingerprint["last_param_l2"] = float(w.norm().item())
+            if param.requires_grad:
+                picked_name, picked_param = name, param
+                break
+        if picked_param is None:
+            fingerprint["trainable_param_name"] = "<none_trainable>"
+            for name, param in policy.named_parameters():
+                picked_name, picked_param = name, param
+        if picked_param is not None:
+            w = picked_param.detach().float()
+            fingerprint["trainable_param_name"] = (  # type: ignore[assignment]
+                picked_name
+            )
+            fingerprint["trainable_param_l2"] = float(w.norm().item())
     except Exception as exc:  # pragma: no cover - best effort
-        logger.debug("last-param fingerprint failed: %s", exc)
+        logger.debug("trainable-param fingerprint failed: %s", exc)
 
     return fingerprint
 
@@ -425,16 +484,22 @@ def evaluate_policy(
         max_samples,
         max_new_tokens,
     )
+    # Ensure eval runs deterministically — HF models load in .train() mode
+    # by default, and we want dropout/BN-style state paths disabled even
+    # though Qwen2.5 currently has no dropout (future-proofing).
+    policy.eval()
     fp = _policy_weight_fingerprint(policy)
     if fp:
         logger.info(
             "Eval policy fingerprint: embed_l2=%.4f embed_sha8=%08x "
-            "last_param=%s l2=%.4f  (same object being updated by PPO; "
-            "these values should drift across iterations)",
+            "embed_trainable=%s | trainable_probe=%s l2=%.4f  "
+            "(live object; values should drift across iterations — if not, "
+            "the optimizer is not updating the eval'd model)",
             fp.get("embed_l2", float("nan")),
             int(fp.get("embed_sha8", 0)),
-            fp.get("last_param_name", "?"),
-            fp.get("last_param_l2", float("nan")),
+            bool(fp.get("embed_requires_grad", 0.0)),
+            fp.get("trainable_param_name", "?"),
+            fp.get("trainable_param_l2", float("nan")),
         )
     results = evaluate_gsm8k(
         model=policy,

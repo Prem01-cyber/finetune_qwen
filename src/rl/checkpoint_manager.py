@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import gzip
 import logging
+import shutil
 from pathlib import Path
 from typing import Dict, List
 
@@ -35,6 +36,7 @@ class CheckpointManager:
 
     def cleanup_old_checkpoints(self, current_iteration: int) -> Dict[str, int]:
         deleted_checkpoints = 0
+        deleted_policy_dirs = 0
         compressed_logs = 0
         for iteration_dir in self._list_iteration_dirs():
             iteration = self._parse_iteration(iteration_dir.name)
@@ -50,11 +52,24 @@ class CheckpointManager:
                 checkpoint_path.unlink()
                 deleted_checkpoints += 1
 
+            # Also remove the HF-format policy snapshot (~3 GB per
+            # iteration for Qwen-1.5B).  Previously only checkpoint.pt
+            # was deleted, so 50-iteration runs accumulated ~135 GB of
+            # zombie policy weights that keep_last_n was supposed to
+            # prevent.  The currently-live policy on disk is whichever
+            # iteration still satisfies keep_due_to_recent or
+            # keep_due_to_milestone — those are skipped above.
+            policy_dir = iteration_dir / "policy"
+            if policy_dir.is_dir():
+                shutil.rmtree(policy_dir)
+                deleted_policy_dirs += 1
+
             if self.compress_old_logs:
                 compressed_logs += self._compress_log_files(iteration_dir)
 
         return {
             "deleted_checkpoints": deleted_checkpoints,
+            "deleted_policy_dirs": deleted_policy_dirs,
             "compressed_logs": compressed_logs,
         }
 

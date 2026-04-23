@@ -840,6 +840,15 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         if num_trajectories <= 0:
             return []
 
+        # Defensive .eval() on both policy and value before any generation.
+        # PPOTrainer.train_step restores eval mode at its tail, but on the
+        # very first iteration rollouts run right after model load (HF
+        # default is .train()).  Qwen2.5 has zero dropout so this is
+        # currently cosmetic, but cheap insurance against any future
+        # model swap that has real stochastic layers.
+        self.policy.eval()
+        self.value.eval()
+
         # Grounded rollouts: only if we actually have QA pairs loaded.
         if grounded_ratio > 0.0 and self.grounded_qa_pairs:
             num_grounded = int(round(num_trajectories * grounded_ratio))
