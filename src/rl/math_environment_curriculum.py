@@ -223,7 +223,11 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         question_reward = float(question_result["overall_score"])
         solution_reward = float(solution_result["combined_score"])
-        base_combined_score = 0.3 * question_reward + 0.7 * solution_reward
+        # Q/Sol = 0.4/0.6 (was 0.3/0.7): gives the policy nearly 2× more
+        # gradient on question-generation without sacrificing the solution
+        # signal.  This is the "Self-Improvement" half of the loop — the
+        # model must learn to produce good problems, not just solve them.
+        base_combined_score = 0.4 * question_reward + 0.6 * solution_reward
         expert_adjustment = self.expert_panel.apply_expert_preferences(
             base_reward=base_combined_score,
             question_metrics=question_result,
@@ -286,13 +290,16 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         Reward shape:
             R_sol = 0.55·PRM_mean + 0.20·PRM_min + 0.15·SymPy + 0.10·Format
-            R     = 0.3·R_q + 0.7·R_sol      (then expert-panel modifier)
+            R     = 0.4·R_q + 0.6·R_sol      (then expert-panel modifier)
 
         * ``PRM_mean`` is the primary smooth gradient.
         * ``PRM_min`` amplifies the weakest step — pushes the model to fix
           individual broken steps instead of averaging them out.
         * SymPy and format keep the arithmetic-consistency and structure
           pressures we already had.
+        * The 0.4/0.6 Q/Sol split (vs the historical 0.3/0.7) boosts the
+          gradient flowing to question-generation without starving the
+          solution-correctness signal — key for the self-improvement loop.
         """
         assert self.prm_scorer is not None, "caller must check self.prm_scorer"
 
@@ -348,7 +355,10 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         )
         question_reward = float(question_result["overall_score"])
 
-        base_combined_score = 0.3 * question_reward + 0.7 * solution_reward
+        # Q/Sol = 0.4/0.6 — see note in compute_reward (non-PRM path).
+        # The self-improvement theme requires the policy to be graded on
+        # the quality of the questions it generates, not just on solutions.
+        base_combined_score = 0.4 * question_reward + 0.6 * solution_reward
         expert_adjustment = self.expert_panel.apply_expert_preferences(
             base_reward=base_combined_score,
             question_metrics=question_result,
@@ -623,6 +633,11 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             "steps_verified_ok": int(summary.get("steps_verified_ok", 0)),
             "steps_failed": int(summary.get("steps_failed", 0)),
             "final_answer_ok": str(summary.get("final_answer", "")) == "ok",
+            # Grounded rollouts do not generate a question — we feed a
+            # real GSM8K problem directly.  Pinning question_reward to 0
+            # is the honest signal: "no question-gen credit was earned",
+            # so aggregate metrics can exclude these rollouts and still
+            # reflect the true per-iteration question-gen performance.
             "question_reward": 0.0,
             "solution_reward": terminal_reward,
             "pre_expert_reward": terminal_reward,

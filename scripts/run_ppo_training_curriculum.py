@@ -122,10 +122,14 @@ class CurriculumTrainingConfig:
 
     num_iterations = 10
     # Fraction of each rollout batch that is GSM8K-anchored (real question,
-    # reward scored directly against the gold final answer).  Defaults to
-    # 0.5 — enough to dominate the gradient without drowning out self-play.
-    # Set to 0.0 to disable grounded rollouts entirely.
-    grounded_ratio = 0.5
+    # reward scored directly against the gold final answer).  0.3 is the
+    # sweet spot: enough grounded signal to pull GSM8K accuracy (30 rollouts
+    # × ppo_epochs = 90 gradient steps/iter against real answers), while
+    # leaving 70% of the batch as self-play — where the policy trains its
+    # question-generation skill (the whole point of the Self-Improvement
+    # theme).  Set 0.0 to disable grounded rollouts entirely; set higher
+    # if you want to sacrifice question-gen training for faster GSM8K gains.
+    grounded_ratio = 0.3
 
     # Process Reward Model (Qwen2.5-Math-PRM) replaces the TripleVerifier
     # consensus signal on self-play rollouts.  PRM gives per-step correctness
@@ -442,6 +446,10 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
     topic_counts: Dict[str, int] = {}
     topic_successes: Dict[str, int] = {}
     topic_difficulty: Dict[str, List[float]] = {}
+    # Self-play only — excludes the synthetic "grounded_gsm8k" bucket,
+    # which would otherwise skew topic-distribution and question-quality
+    # stats (grounded rollouts don't train question generation).
+    selfplay_topic_counts: Dict[str, int] = {}
 
     topic_match_scores: List[float] = []
     difficulty_match_scores: List[float] = []
@@ -449,6 +457,7 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
     solvability_scores: List[float] = []
     novelty_scores: List[float] = []
     question_rewards: List[float] = []
+    selfplay_question_rewards: List[float] = []
     solution_rewards: List[float] = []
     combined_rewards: List[float] = []
     pre_expert_rewards: List[float] = []
@@ -481,6 +490,16 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
         solvability_scores.append(1.0 if bool(meta["sympy_verified"]) else 0.0)
         novelty_scores.append(float(meta["novelty_scores"]["combined"]))
         question_rewards.append(float(meta["question_reward"]))
+        # Only self-play rollouts exercise the question-generation policy;
+        # grounded rollouts just solve known GSM8K questions and do not
+        # train the question head (their ``question_reward`` metadata is
+        # pinned to 0.0 — see rollout_grounded_trajectory).  We therefore
+        # track the self-play subset separately so
+        # ``avg_question_reward_selfplay`` actually reflects how the
+        # policy's question-gen skill is improving over iterations.
+        if str(meta.get("rollout_source", "fresh")) != "grounded":
+            selfplay_question_rewards.append(float(meta["question_reward"]))
+            selfplay_topic_counts[topic] = selfplay_topic_counts.get(topic, 0) + 1
         solution_rewards.append(float(meta["solution_reward"]))
         combined_rewards.append(float(meta["combined_reward"]))
         pre_expert_rewards.append(
@@ -539,6 +558,21 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
         ]
         return float(sum(vals) / max(1, len(vals)))
 
+    def _shannon_entropy(counts: Dict[str, int]) -> float:
+        total = sum(counts.values())
+        if total <= 0:
+            return 0.0
+        from math import log
+        ent = 0.0
+        for c in counts.values():
+            if c <= 0:
+                continue
+            p = c / total
+            ent -= p * log(p)
+        return float(ent)
+
+    selfplay_topic_entropy = _shannon_entropy(selfplay_topic_counts)
+
     return {
         "topics_in_sweet_spot": len(
             [s for s in per_topic_success.values() if 0.4 <= s <= 0.7]
@@ -557,6 +591,15 @@ def aggregate_curriculum_metrics(trajectories: List) -> Dict[str, object]:
         "avg_solvability": float(sum(solvability_scores) / max(1, len(solvability_scores))),
         "avg_novelty": float(sum(novelty_scores) / max(1, len(novelty_scores))),
         "avg_question_reward": float(sum(question_rewards) / max(1, len(question_rewards))),
+        # This is the real signal for "is question generation improving?"
+        # — grounded rollouts are excluded so we see only the policy's
+        # actual question-gen performance.
+        "avg_question_reward_selfplay": (
+            float(sum(selfplay_question_rewards) / len(selfplay_question_rewards))
+            if selfplay_question_rewards else 0.0
+        ),
+        "selfplay_topic_entropy": selfplay_topic_entropy,
+        "selfplay_topic_diversity": len(selfplay_topic_counts),
         "avg_solution_reward": float(sum(solution_rewards) / max(1, len(solution_rewards))),
         "avg_combined_reward": float(sum(combined_rewards) / max(1, len(combined_rewards))),
         "avg_pre_expert_reward": float(
@@ -660,10 +703,13 @@ def main():
     parser.add_argument(
         "--grounded-ratio",
         type=float,
-        default=0.5,
+        default=0.3,
         help="Fraction of each rollout batch that is GSM8K-anchored "
-        "(real question, reward from gold final answer).  Default 0.5.  "
-        "Set 0 to disable and go pure self-play.",
+        "(real question, reward from gold final answer).  Default 0.3 — "
+        "enough to pull GSM8K accuracy while leaving 70%% of the batch "
+        "as self-play, which is where the policy learns QUESTION generation "
+        "(the self-improvement loop).  Set 0 for pure self-play, or raise "
+        "to 0.5-0.7 to bias toward solving-only fine-tuning.",
     )
     parser.add_argument(
         "--use-prm",
@@ -883,6 +929,22 @@ def main():
                 current_iteration=math_env.curriculum_manager.current_iteration
             )
 
+            # One-line summary of the two training signals so it's obvious
+            # at a glance whether question generation is improving alongside
+            # solution generation.
+            logger.info(
+                "Rewards: Q_selfplay=%.3f (n=%d, topic_entropy=%.2f, topics=%d)  "
+                "Sol=%.3f  Combined=%.3f  grounded_acc=%.2f",
+                curriculum_stats["avg_question_reward_selfplay"],
+                len([t for t in trajectories
+                     if str(t.metadata.get("rollout_source", "fresh")) != "grounded"]),
+                curriculum_stats["selfplay_topic_entropy"],
+                curriculum_stats["selfplay_topic_diversity"],
+                curriculum_stats["avg_solution_reward"],
+                curriculum_stats["avg_combined_reward"],
+                math_env.last_grounded_stats.get("accuracy", 0.0),
+            )
+
             logger.info("Running PPO update...")
             train_start = time.perf_counter()
             training_metrics = ppo_trainer.train_step(rollout_buffer)
@@ -995,6 +1057,21 @@ def main():
                 "curriculum/avg_difficulty": curriculum_stats["avg_difficulty"],
                 "curriculum/avg_novelty": curriculum_stats["avg_novelty"],
                 "curriculum/replay_ratio": math_env.last_replay_ratio,
+                "curriculum/avg_question_reward": curriculum_stats[
+                    "avg_question_reward"
+                ],
+                "curriculum/avg_question_reward_selfplay": curriculum_stats[
+                    "avg_question_reward_selfplay"
+                ],
+                "curriculum/avg_solution_reward": curriculum_stats[
+                    "avg_solution_reward"
+                ],
+                "curriculum/selfplay_topic_entropy": curriculum_stats[
+                    "selfplay_topic_entropy"
+                ],
+                "curriculum/selfplay_topic_diversity": curriculum_stats[
+                    "selfplay_topic_diversity"
+                ],
                 "grounded/ratio": config.grounded_ratio,
                 "grounded/count": math_env.last_grounded_stats.get("count", 0),
                 "grounded/correct": math_env.last_grounded_stats.get("correct", 0),

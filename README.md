@@ -5,13 +5,13 @@
 
 ## 1. Project Overview
 
-AxiomForge-RL is a self-improving reinforcement learning system in which one language model generates math challenges, solves them, and learns from verification-driven rewards. The training loop combines curriculum learning, consensus checking, symbolic validation, and replay-based recursive training to amplify reasoning ability over generations.
+AxiomForge-RL is a self-improving reinforcement learning system in which one language model generates math challenges, solves them, and learns from verification-driven rewards. The training loop combines curriculum learning, **Process Reward Model (PRM) step scoring**, **GSM8K-grounded rollouts**, symbolic validation, and replay-based recursive training to amplify reasoning ability over generations.
 
-Core innovation: the agent does not optimize against a fixed benchmark distribution; it continuously reshapes its own task distribution and uses internal verification signals to drive capability growth.
+Core innovation: the agent does not optimize against a fixed benchmark distribution; it continuously reshapes its own task distribution via self-play while a minority of GSM8K-anchored rollouts pull the policy toward real-world benchmark correctness.
 
 **Base model:** Qwen2.5-Math-1.5B-Instruct, warm-started with a dual-task SFT checkpoint.
 **Environment:** curriculum-aware math arena exposed as an OpenEnv-compliant FastAPI service.
-**Training:** single-GPU PPO with adaptive curriculum, triple-verifier consensus rewards, and a generational replay buffer.
+**Training:** single-GPU PPO with adaptive curriculum, `Qwen2.5-Math-PRM-7B` step-level rewards on self-play rollouts, GSM8K ground-truth-anchored rollouts (default 30 %), and a generational replay buffer.
 
 ### Quick links
 - [Quickstart](#9-quickstart)
@@ -40,11 +40,13 @@ flowchart TD
     subgraph B["Verification and Scoring Layer"]
         QCLS[Question classifier<br/>topic + confidence]:::reward
         QEVAL[Question quality evaluator<br/>topic, difficulty, clarity,<br/>novelty, solvability]:::reward
-        TV[Triple verifier N=3]:::reward
+        PRM[Qwen2.5-Math-PRM-7B<br/>per-step correctness prob]:::reward
+        TV[Triple verifier N=3<br/>legacy fallback when --no-prm]:::reward
         SYM[Symbolic arithmetic verifier]:::reward
-        CONS[Consensus voting + strength]:::reward
+        CONS[Consensus voting + strength<br/>fallback only]:::reward
+        GT[GSM8K gold-answer check<br/>grounded rollouts only]:::reward
         SOL[Solution score aggregator]:::reward
-        BASE[Base reward combiner<br/>0.3*Q + 0.7*S]:::reward
+        BASE[Base reward combiner<br/>0.4*Q + 0.6*S<br/>grounded = pure R_sol]:::reward
         EXP[Simulated expert panel<br/>phase-conditioned modifier]:::reward
         FINAL[Final clipped reward]:::reward
     end
@@ -69,11 +71,15 @@ flowchart TD
 
     QGEN --> QCLS
     QCLS --> QEVAL
+    SGEN --> PRM
+    SGEN --> SYM
+    SGEN --> GT
     SGEN --> TV
-    TV --> SYM
     TV --> CONS
+    PRM --> SOL
     SYM --> SOL
     CONS --> SOL
+    GT --> SOL
     QEVAL --> BASE
     SOL --> BASE
     BASE --> EXP
@@ -99,27 +105,42 @@ flowchart TD
 
 ### 2.2 Reward Computation Graph
 
+Two reward paths feed the same optimizer: **self-play** (the policy
+generates both the question and the solution) and **grounded** (the
+policy solves a real GSM8K problem and is scored against its gold
+final answer).
+
 ```mermaid
 flowchart TD
-    QM[Question metrics:<br/>topic match,<br/>difficulty fit,<br/>clarity,<br/>novelty,<br/>solvability]
-    SM[Solution metrics:<br/>symbolic score,<br/>consensus score,<br/>format score]
+    subgraph SP["Self-play path (default 70%)"]
+        QM[Question metrics:<br/>topic match, difficulty fit,<br/>clarity, novelty, solvability]
+        SP_SOL[Solution metrics:<br/>0.55*PRM_mean + 0.20*PRM_min<br/>+ 0.15*SymPy + 0.10*Format]
+        QAGG[Q aggregate]
+        SAGG_SP[S aggregate]
+        RBASE_SP[R_base = 0.4*Q + 0.6*S]
+    end
 
-    QAGG[Q aggregate]
-    SAGG[S aggregate]
-    RBASE[R_base = 0.3*Q + 0.7*S]
-    PHASE[Expert phase selection]
-    MOD[reward modifier]
+    subgraph GR["Grounded path (default 30%)"]
+        GT_MATCH[gt_match = 1 iff model's<br/>Final Answer == gold]
+        GR_SOL[R_sol = 0.70*gt_match<br/>+ 0.20*SymPy + 0.10*Format<br/>or 0.60/0.15/0.15/0.10 with PRM]
+        RBASE_GR[R_base = R_sol<br/>no question reward<br/>on grounded]
+    end
+
+    PHASE[Expert phase selection<br/>pedagogy -> accuracy -> challenge]
+    MOD[reward modifier in -0.3..0.3]
     CLAMP[clip to 0, 1]
     RF[R_final]
 
     QM --> QAGG
-    SM --> SAGG
-    QAGG --> RBASE
-    SAGG --> RBASE
-    RBASE --> PHASE
+    SP_SOL --> SAGG_SP
+    QAGG --> RBASE_SP
+    SAGG_SP --> RBASE_SP
+    GT_MATCH --> GR_SOL
+    GR_SOL --> RBASE_GR
+    RBASE_SP --> PHASE
+    RBASE_GR --> PHASE
     PHASE --> MOD
     MOD --> CLAMP
-    RBASE --> CLAMP
     CLAMP --> RF
 ```
 
@@ -246,65 +267,75 @@ With $\gamma=1.0$ and $\lambda=0.95$, this setup emphasizes full-episode credit 
 
 ## 4. Verification Mechanisms
 
-### 4.1 Symbolic Arithmetic Verification
+### 4.1 Process Reward Model (PRM) — primary self-play signal
 
-Symbolic verification checks arithmetic consistency of step-by-step solutions and final-answer formatting.
-
-Process:
-1. Parse structured solution steps.
-2. Symbolically verify step computations.
-3. Track total steps, verified steps, failed steps, and final-answer validity.
-4. Produce arithmetic score:
+`Qwen/Qwen2.5-Math-PRM-7B` is loaded once at startup (4-bit via
+`bitsandbytes`, ~5 GB VRAM) and scores every self-play solution step
+with a per-step probability of correctness:
 
 $$
-S_{\text{sympy}}=
-\begin{cases}
-0 & \text{if } \text{steps\_total}=0\\
-\frac{\text{steps\_verified\_ok}}{\text{steps\_total}} \cdot 0.5 & \text{if any step failed}\\
-\frac{\text{steps\_verified\_ok}}{\text{steps\_total}} & \text{otherwise}
-\end{cases}
+p_i \;=\; \Pr\!\left[\text{step}_i \text{ is correct} \mid \text{question}\right]
+\in [0, 1]
 $$
 
-Failure handling: arithmetic failures do not hard-stop training; they reduce reward and can block replay admission.
+The solution is split on `Step N:` lines, each step is separated by
+the PRM's special `<extra_0>` token, and the model emits one
+classification logit per separator in a single forward pass. The
+positive-class softmax probability becomes the per-step score. See
+[`src/rl/prm_scorer.py`](src/rl/prm_scorer.py).
 
-### 4.2 Consensus Voting ($N=3$)
+Three statistics are used downstream:
 
-Three independently sampled solutions are generated in one batched pass for efficiency and diversity.
+| Statistic | Definition | Role |
+|---|---|---|
+| `PRM_mean` | $\bar p = \tfrac{1}{N}\sum_i p_i$ | smooth gradient |
+| `PRM_min` | $\min_i p_i$ | locates the weakest step |
+| `PRM_final` | $p_N$ | final-answer credibility |
 
-Answer extraction:
-1. Parse each candidate final answer.
-2. Convert to numeric form.
-3. Round to fixed precision for stable vote counting.
+Why PRM replaces the legacy triple-sample consensus: three samples
+from the same policy agree on wrong answers about as often as on right
+ones (groupthink). PRM is trained on labelled step-correctness data so
+its signal is *independent* of the policy under training, which is
+exactly what RL needs to not collapse to mode-seeking behaviour.
 
-Majority and strength:
+### 4.2 Symbolic Arithmetic Verification
+
+Symbolic verification checks arithmetic consistency of step-by-step
+solutions and final-answer formatting:
 
 $$
-\text{has\_majority} \iff \text{majority\_count} \ge 2
+S_{\text{sympy}}\;=\;\max\!\left(0,\;\min\!\left(1,\;\tfrac{\text{steps\_ok}}{\text{steps\_total}} - 0.3\,\tfrac{\text{steps\_failed}}{\text{steps\_total}}\right)\right)
 $$
 
+SymPy is fast, deterministic, and catches arithmetic drift that PRM
+can miss (the PRM is trained on *reasoning* quality, not
+floating-point correctness), so both signals are summed with
+complementary weights.
+
+### 4.3 Consensus Voting (legacy fallback, ``--no-prm``)
+
+When the PRM is disabled, the environment falls back to sampling
+$N=3$ independent solutions and majority-voting on the final
+numeric answer:
+
 $$
+\text{has\_majority} \iff \text{majority\_count} \ge 2, \qquad
 S_{\text{consensus\_strength}} = \frac{\text{majority\_count}-1}{N-1}
 $$
-
-For $N=3$:
-- $3/3 \rightarrow 1.0$
-- $2/3 \rightarrow 0.5$
-- $1/3 \rightarrow 0.0$
-
-Consensus reward component:
 
 $$
 S_{\text{consensus}}=
 \begin{cases}
-\min(1.0, S_{\text{consensus\_strength}} + 0.3), & \text{if majority and primary matches majority}\\
-0.2, & \text{if majority exists but primary is outlier}\\
-0.1, & \text{if no majority}
+\min(1.0, S_{\text{cs}} + 0.3), & \text{majority and primary matches}\\
+0.2, & \text{majority but primary outlier}\\
+0.1, & \text{no majority}
 \end{cases}
 $$
 
-Statistical rationale: this is a self-consistency estimator where agreement serves as a proxy for semantic correctness under independent stochastic samples.
+This is kept as a no-extra-GPU-memory fallback for environments
+without the PRM.
 
-### 4.3 Simulated Expert Panel
+### 4.4 Simulated Expert Panel
 
 Three reward-shaping phases model changing expert requirements:
 
@@ -328,6 +359,37 @@ Bounded modifier:
 $$
 m = \text{clip}(m_{\text{raw}}, -0.3, 0.3)
 $$
+
+### 4.5 Grounded (GSM8K-anchored) Rollouts
+
+A configurable fraction (default **30 %**, see `--grounded-ratio`) of
+each iteration's rollout batch uses a real GSM8K problem drawn from
+the reference dataset.  The policy solves the problem and is scored
+directly against the gold final answer — no consensus, no PRM, no
+question-generation credit.  This anchors the gradient to real
+benchmark correctness and protects the policy from self-play
+distribution drift.
+
+Reward (PRM off):
+
+$$
+R_{\text{grounded}} = 0.70\,\mathbb{1}[\text{pred} \equiv \text{gold}] + 0.20\,S_{\text{sympy}} + 0.10\,S_{\text{format}}
+$$
+
+Reward (PRM on — step quality discriminates lucky guesses from reasoned answers):
+
+$$
+R_{\text{grounded}} = 0.60\,\mathbb{1}[\text{pred} \equiv \text{gold}] + 0.15\,\text{PRM}_{\text{mean}} + 0.15\,S_{\text{sympy}} + 0.10\,S_{\text{format}}
+$$
+
+Mathematical equivalence is checked via `sympy.simplify(pred - gold) == 0`, so `$1.50`, `1.5`, and `3/2` all match `1.5`.
+
+Rationale for the 0.3 default: a higher ratio (e.g. 0.7) sacrifices
+question-generation training (the Theme #4 self-improvement loop); a
+lower ratio (e.g. 0.0) produces a strong self-play signal but weak
+benchmark movement.  0.3 was empirically chosen so the policy still
+gets **≈28 % of its total gradient** on question generation while
+receiving a clean ground-truth signal 30 % of the time.
 
 ---
 
@@ -474,6 +536,14 @@ Component definitions:
 
 ### 7.2 Solution Quality Score
 
+PRM path (default):
+
+$$
+S = 0.55\,\text{PRM}_{\text{mean}} + 0.20\,\text{PRM}_{\text{min}} + 0.15\,S_{\text{sympy}} + 0.10\,S_{\text{format}}
+$$
+
+Consensus fallback (`--no-prm`):
+
 $$
 S = 0.4\,S_{\text{sympy}} + 0.4\,S_{\text{consensus}} + 0.2\,S_{\text{format}}
 $$
@@ -481,19 +551,28 @@ $$
 Format score:
 
 $$
-S_{\text{format}} = 0.5\,\mathbb{1}_{\text{has\_steps}} + 0.5\,\mathbb{1}_{\text{has\_final\_answer}}
+S_{\text{format}} = 0.5\,R_{\text{eq}} + 0.3\,\mathbb{1}_{\text{final\_ok}} + 0.2\,B_{\text{len}}
 $$
 
-Edge-case behavior:
-- No parseable answers: low consensus fallback.
-- Majority exists but primary outlier: penalized consensus score.
-- Missing structured steps: format degradation.
+where $R_{\text{eq}}$ is the ratio of lines that contain a verifiable
+equation and $B_{\text{len}}$ is a small bonus for producing at least
+two steps (deters one-line answers that trivially format-match).
 
 ### 7.3 Combined Base Reward
 
+Self-play path:
+
 $$
-R_{\text{base}} = 0.3\,Q + 0.7\,S
+R_{\text{base}} = 0.4\,Q + 0.6\,S
 $$
+
+The 0.4/0.6 split (vs. the historical 0.3/0.7) roughly doubles the
+gradient flowing to the question-generation head without starving the
+solution signal — necessary for the Theme #4 self-improvement loop.
+
+Grounded path: $R_{\text{base}} = R_{\text{grounded}}$ (see §4.5); no
+question-generation credit is assigned because the question came from
+the reference dataset, not the policy.
 
 ### 7.4 Expert-Modified Reward
 
@@ -511,8 +590,10 @@ Core modules in the system:
 
 | Component | Purpose |
 |---|---|
-| Triple verification engine | Produces multi-sample solution checks and consensus statistics |
-| Consensus reward engine | Combines symbolic, consensus, and format signals into solution reward |
+| Process Reward Model scorer | Per-step correctness probabilities from Qwen2.5-Math-PRM-7B (primary self-play signal) |
+| Grounded rollout path | Scores policy outputs against GSM8K gold final answers (benchmark anchor) |
+| Triple verification engine | Produces multi-sample solution checks and consensus statistics (legacy fallback) |
+| Consensus reward engine | Combines symbolic, consensus, and format signals into solution reward (fallback path) |
 | Topic/difficulty classifier | Detects topic family and estimates post-hoc difficulty |
 | Curriculum scheduler | Maintains topic states, success rates, and adaptive selection probabilities |
 | Question quality evaluator | Computes question-side reward with novelty and solvability checks |
@@ -539,13 +620,21 @@ pip install -r requirements.txt
 # 2) Fetch / prepare the SFT-warm-started checkpoint at checkpoints/dual_task_v1
 #    (already present if you ran scripts/dual_task_sft_pipeline.py earlier)
 
-# 3) Sanity-check a short PPO run (2 iters, 3 rollouts)
-bash launch_ppo_training.sh --num-iterations 2 --rollouts-per-iter 3
+# 3) Sanity-check a short PPO run (2 iters, 3 rollouts, no PRM so the
+#    smoke test doesn't have to download the 7B model)
+bash launch_ppo_training.sh \
+  --num-iterations 2 \
+  --rollouts-per-iter 3 \
+  --no-prm \
+  --grounded-ratio 0.5
 ```
 
 ### 9.2 Extensive training (1× A100 PCIE)
 
-The previous command was a smoke test. Now that the loop is validated end-to-end, the recommended run for generating real reward-curve evidence on a single A100 PCIE (40 GB or 80 GB) is:
+The previous command was a smoke test. The recommended full run — with
+PRM step rewards on self-play rollouts, 30 % GSM8K-grounded rollouts
+for benchmark anchoring, and per-iteration curriculum / self-play
+metrics streaming to CSV — is:
 
 ```bash
 set -euo pipefail
@@ -558,36 +647,61 @@ python scripts/run_ppo_training_curriculum.py \
   --rollouts-per-iter 32 \
   --eval-data-path data/sft/dual_task_val.jsonl \
   --gsm8k-reference-data data/sft/gsm8k_sft.jsonl \
+  --grounded-ratio 0.3 \
+  --use-prm \
+  --prm-model Qwen/Qwen2.5-Math-PRM-7B \
+  --eval-every 5 \
+  --eval-max-samples 500 \
+  --eval-max-new-tokens 512 \
   --checkpoint-keep-last 5 \
   --checkpoint-keep-every 10 \
   --run-name "ppo_curriculum_$(date +%Y%m%d_%H%M)"
 ```
 
-**Sizing rationale (1× A100 PCIE, 1.5B policy + ValueHead in bf16):**
+**Sizing rationale (1× A100 PCIE/SXM 40–80 GB, 1.5B policy + ValueHead
++ 4-bit PRM all in bf16/bnb):**
 
 | Knob | Value | Why |
 |---|---|---|
-| `--num-iterations` | `50` | Enough iterations to draw a reward curve and see curriculum phase transitions (pedagogy -> accuracy -> challenge). |
-| `--rollouts-per-iter` | `32` | Large enough for a stable PPO gradient; small enough to finish one iteration (rollout + update + logging) in ~15 min on A100 PCIE. |
+| `--num-iterations` | `50` | Enough iterations to draw a reward curve and see curriculum phase transitions (pedagogy → accuracy → challenge). |
+| `--rollouts-per-iter` | `32` | Stable PPO gradient; ~12–14 min of rollout time per iter. Raise to 48–64 on SXM-80 for a tighter gradient. |
+| `--grounded-ratio` | `0.3` | 70 % self-play (trains question-gen) + 30 % GSM8K-anchored (pulls eval accuracy). Lower this for more self-play, raise for more benchmark pressure. |
+| `--use-prm` | on | Qwen2.5-Math-PRM-7B provides per-step correctness probabilities. Strictly better than `--no-prm` (which falls back to 3× self-consensus voting). |
+| `--prm-model` | `Qwen/Qwen2.5-Math-PRM-7B` | ~5 GB in 4-bit; add `--prm-no-4bit` for full bf16 (~14 GB) if you have headroom. |
+| `--eval-every` | `5` | GSM8K eval every 5 iterations; 10 eval points over the run. |
 | `--checkpoint-keep-last` | `5` | Lets you roll back 5 iterations if a phase transition spikes KL. |
 | `--checkpoint-keep-every` | `10` | Persists milestone snapshots at iter 10/20/30/40/50 outside the rolling window. |
-| *(default)* `eval_every=5` | — | Runs GSM8K eval every 5 iterations; 10 eval points over the run. |
-| *(default)* `learning_rate=1e-6` | — | Conservative, tuned for PPO stability on a 1.5B LoRA model. |
-| *(default)* `target_kl=0.15` | — | Early-stops the PPO epoch if the policy drifts too far. |
-| *(default)* `ppo_epochs=3` | — | Standard for PPO with 32-trajectory micro-batches. |
+| *(default)* `learning_rate=3e-6` | — | Sweet spot for LoRA-style fine-tuning on 1–2 B policies. |
+| *(default)* `target_kl=0.03` | — | Canonical RLHF PPO early-stop threshold; matches TRL / OpenRLHF. |
+| *(default)* `clip_range=0.2`, `clip_range_vf=0.2` | — | Standard PPO clip. |
+| *(default)* `ppo_epochs=3`, `batch_size=32` | — | 3 epochs × ⌈N/32⌉ micro-batches per iteration. |
+| *(default)* `ent_coef=0.02`, `vf_coef=0.5`, `max_grad_norm=0.5` | — | Conservative stability settings. |
+
+**Expected GPU memory (A100-80 GB, bf16 policy + 4-bit PRM):**
+
+| Component | VRAM |
+|---|---|
+| Qwen2.5-Math-1.5B policy (bf16, trainable) | ~3.5 GB |
+| ValueHead backbone (shared-weights read-only) | ~3 GB |
+| AdamW optimizer states (bf16) | ~7 GB |
+| Rollout activations / KV cache (1 × batch 32 × 700 tok) | ~2 GB |
+| Qwen2.5-Math-PRM-7B (4-bit via bitsandbytes) | ~5 GB |
+| Peak during PPO update | ~22 GB |
+| Peak headroom on 80 GB SXM | ≥ 55 GB (plenty for --no-prm-no-4bit upgrade) |
 
 **Expected wall-clock (post-compile, TF32 + cuDNN bench on):**
 
 | Phase | Time per iteration |
 |---|---|
-| Rollouts (32× sequential) | ~12-14 min |
-| PPO update (3 epochs × 96 micro-steps) | ~2-3 min |
-| Logging + checkpoint | ~10-20 s |
-| Eval (every 5 iters, 500 GSM8K problems, greedy) | ~6-8 min |
-| **Per-iteration average** | **~16 min** |
-| **Full 50-iter run** | **~13-15 hours** |
+| Rollouts (32×, 70 % self-play + 30 % grounded) | ~11–13 min |
+| PRM scoring (per rollout, 4-bit) | +30–60 s amortised in the rollout loop |
+| PPO update (3 epochs × ~96 micro-steps) | ~2–3 min |
+| Logging + checkpoint | ~10–20 s |
+| Eval (every 5 iters, 500 GSM8K problems, greedy) | ~6–8 min |
+| **Per-iteration average** | **~16–18 min** |
+| **Full 50-iter run** | **~14–16 hours** |
 
-Use `nohup` + `tee` if you want to detach and monitor:
+Detach with `nohup` to keep running after logout:
 
 ```bash
 nohup bash -c 'set -euo pipefail
@@ -599,6 +713,9 @@ python scripts/run_ppo_training_curriculum.py \
   --rollouts-per-iter 32 \
   --eval-data-path data/sft/dual_task_val.jsonl \
   --gsm8k-reference-data data/sft/gsm8k_sft.jsonl \
+  --grounded-ratio 0.3 \
+  --use-prm \
+  --eval-every 5 \
   --checkpoint-keep-last 5 \
   --checkpoint-keep-every 10 \
   --run-name "ppo_curriculum_$(date +%Y%m%d_%H%M)"' \
@@ -606,6 +723,12 @@ python scripts/run_ppo_training_curriculum.py \
 
 # Follow the live log:
 tail -f logs/run_*.log
+```
+
+Or use the thin launcher (pre-filled defaults):
+
+```bash
+bash launch_ppo_training.sh   # same flags as the nohup snippet above
 ```
 
 ### 9.3 Scale-down / debug presets
@@ -622,21 +745,38 @@ If you need a shorter loop for debugging a code change, shrink either axis:
 
 ### 9.4 Monitoring
 
-CSV metrics stream to `logs/ppo-curriculum/<run-name>/`:
+CSV + console metrics stream to `logs/ppo-curriculum/<run-name>/`:
 
 | File | What's in it |
 |---|---|
-| `ppo_metrics.csv` | `policy_loss`, `value_loss`, `approx_kl`, `clip_fraction`, `entropy`, per-iteration |
-| `reward_metrics.csv` | combined / solver / proposer reward, SymPy pass rate, consensus majority rate |
-| `curriculum_metrics.csv` | per-topic success rate, difficulty target, attempts, sweet-spot membership |
-| `eval_metrics.csv` | GSM8K accuracy at each eval checkpoint |
-| `console_output.log` | full captured stdout/stderr |
+| `metrics.csv` | unified stream with `ppo/*`, `curriculum/*`, `prm/*`, `grounded/*`, `eval/*`, `system/*` columns, one row per iteration |
+| `console_output.log` | full captured stdout/stderr (tee'd) |
+| `iteration_NNN/trajectories.jsonl` | per-rollout state, solution, and reward breakdown for offline inspection |
+| `iteration_NNN/metrics.json` | structured per-iteration summary |
 
-Healthy run signatures to watch for (based on validated short run):
-- `approx_kl` stays below `0.1` (target is `0.15`)
-- `clip_fraction` sits in `[0.10, 0.30]`
-- `combined_reward` mean trends upward after ~5 iterations
-- `consensus_has_majority` rate climbs above `0.5` within ~10 iterations
+Per-iteration console summary (one line, easy to grep):
+
+```
+Rewards: Q_selfplay=0.412 (n=22, topic_entropy=2.18, topics=9)  Sol=0.573  Combined=0.531  grounded_acc=0.67
+PPO update metrics: policy_loss=-0.0123 value_loss=0.0841 entropy=1.82 approx_kl=0.0187 clip_fraction=0.12 update_steps=96
+Eval policy fingerprint: embed_l2=1234.56 embed_sha8=ab12cd34 last_param=model.layers.27.mlp.down_proj.weight l2=98.76
+```
+
+The weight fingerprint lets you *visually confirm* that PPO updates are
+actually reaching the policy before each eval (values must drift
+iteration to iteration).
+
+**Healthy run signatures:**
+
+| Signal | Target |
+|---|---|
+| `approx_kl` | stays below `0.045` (1.5 × `target_kl=0.03`); spikes trigger early stop |
+| `clip_fraction` | `0.08–0.25` (too low = stale ratios, too high = collapsing policy) |
+| `curriculum/avg_question_reward_selfplay` | trends upward after ~5 iters |
+| `curriculum/selfplay_topic_entropy` | stays ≥ 1.5 (policy isn't collapsing onto one topic) |
+| `grounded/accuracy` | trends upward; should exceed initial GSM8K eval within ~10 iters |
+| `prm/mean_of_means` | ≥ 0.4 on PRM runs; `prm/degraded_count` ≈ 0 |
+| `eval/accuracy` | net positive delta vs. initial SFT eval |
 
 ---
 
@@ -654,11 +794,13 @@ Global GPU performance knobs (TF32 matmul, cuDNN benchmark) are set at import ti
 
 ### 10.2 Verification (rewards)
 
-- **Triple verifier** ([`src/rl/triple_verifier.py`](src/rl/triple_verifier.py)): samples 3 solutions per question with moderate temperature and runs majority vote.
-- **Consensus reward calculator** ([`src/rl/consensus_reward_calculator.py`](src/rl/consensus_reward_calculator.py)): combines SymPy, consensus, and format signals with weights `[0.4, 0.4, 0.2]`.
+- **Process Reward Model scorer** ([`src/rl/prm_scorer.py`](src/rl/prm_scorer.py)): loads `Qwen/Qwen2.5-Math-PRM-7B` in 4-bit and returns per-step correctness probabilities, plus `mean` / `min` / `final` aggregates. Primary self-play correctness signal.
+- **Grounded reward path** (in [`src/rl/math_environment_curriculum.py`](src/rl/math_environment_curriculum.py)): scores policy output against GSM8K gold final answers via SymPy equivalence.
+- **Triple verifier** ([`src/rl/triple_verifier.py`](src/rl/triple_verifier.py)): legacy fallback (`--no-prm`); samples 3 solutions per question and runs majority vote.
+- **Consensus reward calculator** ([`src/rl/consensus_reward_calculator.py`](src/rl/consensus_reward_calculator.py)): fallback path reward combiner; weights `[SymPy 0.4, consensus 0.4, format 0.2]`.
 - **Symbolic step verifier** ([`src/sft/step_verify_sympy.py`](src/sft/step_verify_sympy.py)): parses step-wise solutions, symbolically validates each step, and emits `steps_total / steps_verified_ok / steps_failed / final_answer`.
 - **Question quality evaluator** ([`src/rl/question_quality_evaluator.py`](src/rl/question_quality_evaluator.py)): topic match, difficulty fit, clarity, novelty, solvability.
-- **Expert panel** ([`src/rl/expert_panel.py`](src/rl/expert_panel.py)): phased reward-shaping modifier (pedagogy -> accuracy -> challenge).
+- **Expert panel** ([`src/rl/expert_panel.py`](src/rl/expert_panel.py)): phased reward-shaping modifier (pedagogy → accuracy → challenge).
 
 ### 10.3 Curriculum
 
@@ -707,7 +849,8 @@ Finetune_qwen/
 |   |   |-- replay_buffer.py       generational memory with novelty gating
 |   |   |-- math_environment*.py   environment classes (base, consensus, curriculum)
 |   |   |-- curriculum_manager.py  adaptive curriculum state machine
-|   |   |-- triple_verifier.py     N=3 consensus sampler
+|   |   |-- prm_scorer.py          Qwen2.5-Math-PRM-7B step-level reward (primary)
+|   |   |-- triple_verifier.py     N=3 consensus sampler (fallback, --no-prm)
 |   |   |-- consensus_reward_calculator.py  multi-signal reward combiner
 |   |   |-- expert_panel.py        phased reward modifier
 |   |   |-- question_classifier.py topic + difficulty detection

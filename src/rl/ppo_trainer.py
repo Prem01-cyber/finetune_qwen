@@ -313,6 +313,12 @@ class PPOTrainer:
                 self.target_kl,
             )
 
+        # Switch back to eval mode so subsequent rollout collection runs
+        # without dropout / BN mode quirks.  Qwen has no dropout by default
+        # but this is cheap insurance against silent quality drift.
+        self.policy.eval()
+        self.value.eval()
+
         metrics = {k: float(sum(v) / max(len(v), 1)) for k, v in stats.items()}
         metrics["update_steps"] = float(update_steps)
         return metrics

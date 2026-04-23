@@ -13,11 +13,19 @@ self-serve guide and to the **Theme #4 — Self-Improvement** brief.
   + Dockerfile for HF Spaces under [`deployment/`](deployment/).
 - **Training stack:** in-process single-GPU PPO
   ([`src/rl/ppo_trainer.py`](src/rl/ppo_trainer.py)) on top of a 1.5B
-  Qwen math model. Ready to swap for TRL/GRPO (see §11 below).
-- **Reward:** 5 independent components + expert-panel curriculum
-  modifier — see
-  [`src/rl/consensus_reward_calculator.py`](src/rl/consensus_reward_calculator.py)
-  and [`src/rl/expert_panel.py`](src/rl/expert_panel.py).
+  Qwen math model, with **Qwen2.5-Math-PRM-7B** ([`src/rl/prm_scorer.py`](src/rl/prm_scorer.py))
+  in 4-bit providing per-step correctness probabilities on self-play
+  rollouts, and a 30 % slice of each rollout batch **grounded** on
+  real GSM8K problems scored against the gold final answer. Ready to
+  swap for TRL/GRPO (see §11 below).
+- **Reward:** 6 independent signals — **PRM step scores (mean/min/final)**,
+  **SymPy step verification**, **format compliance**, **question
+  quality** (topic/clarity/novelty), **GSM8K ground-truth match** on
+  grounded rollouts, and an **expert-panel curriculum modifier**.
+  Combined in [`src/rl/math_environment_curriculum.py`](src/rl/math_environment_curriculum.py)
+  (primary path) with [`src/rl/consensus_reward_calculator.py`](src/rl/consensus_reward_calculator.py)
+  as the `--no-prm` fallback and [`src/rl/expert_panel.py`](src/rl/expert_panel.py)
+  for phased modifiers.
 - **Demo:** [`scripts/demo_before_after.py`](scripts/demo_before_after.py)
   renders baseline-vs-trained accuracy on GSM8K-style problems.
 
@@ -71,9 +79,9 @@ result = arena.play_episode()  # proposer_reward + solver_reward + ...
 | 4 | Treat environment as a first-class artifact. | Environment is a separate package: [`src/openenv/`](src/openenv/). Reward logic lives in [`src/rl/consensus_reward_calculator.py`](src/rl/consensus_reward_calculator.py). |
 | 5 | Build with OpenEnv: reset/step/state + FastAPI. | [`src/openenv/environment.py`](src/openenv/environment.py) implements `reset/step/state/close`. [`src/openenv/server.py`](src/openenv/server.py) exposes them over FastAPI. [`src/openenv/client.py`](src/openenv/client.py) is the paired HTTP client. |
 | 6 | Keep the task simple at first; use curriculum. | Expert panel phases (`pedagogy → exploration → expertise`) in [`src/rl/expert_panel.py`](src/rl/expert_panel.py); per-topic difficulty starts at `0.5` and moves only when `total_attempts ≥ 5`. |
-| 7 | Design rewards carefully: multiple components. | 5 independent components: **SymPy step score**, **consensus score**, **format score**, **question-quality score** (clarity, novelty, topic-match), **expert-panel modifier**. See [`src/rl/consensus_reward_calculator.py`](src/rl/consensus_reward_calculator.py) and [`src/rl/question_quality_evaluator.py`](src/rl/question_quality_evaluator.py). |
-| 8 | Protect against reward hacking. | (a) Five *independent* signals — hard to game all. (b) Consensus majority answer is **never revealed to the agent**, so the policy can't chase it. (c) pydantic validators bound action sizes (`question ≤ 4000 chars`, `solution ≤ 8000 chars`). (d) Clamp `measured_difficulty` and reward components to `[0, 1]`. (e) SymPy verification uses a restricted expression grammar, not `eval()`. (f) Length bonuses are capped in format score. |
-| 9 | Use process-aware feedback. | SymPy step-by-step verification: `steps_verified_ok / steps_total` is a line-by-line signal that credits partial progress ([`src/sft/step_verify_sympy.py`](src/sft/step_verify_sympy.py)). |
+| 7 | Design rewards carefully: multiple components. | 6 independent components: **PRM step probabilities** (mean/min/final, from Qwen2.5-Math-PRM-7B — independent model, uncorrelated with the policy), **SymPy step verification**, **format compliance**, **question quality** (topic match, clarity, novelty, solvability), **GSM8K ground-truth match** on grounded rollouts, and the **expert-panel curriculum modifier**. See [`src/rl/prm_scorer.py`](src/rl/prm_scorer.py), [`src/rl/math_environment_curriculum.py`](src/rl/math_environment_curriculum.py), [`src/rl/consensus_reward_calculator.py`](src/rl/consensus_reward_calculator.py) (legacy fallback), and [`src/rl/question_quality_evaluator.py`](src/rl/question_quality_evaluator.py). |
+| 8 | Protect against reward hacking. | (a) Six *independent* signals — PRM is a separately trained model, making it uniquely hard to game. (b) Consensus majority answer is **never revealed to the agent**. (c) Grounded rollouts use the **gold final answer** for ground-truth reward (cannot be hacked by the policy). (d) pydantic validators bound action sizes (`question ≤ 4000 chars`, `solution ≤ 8000 chars`). (e) Clamp `measured_difficulty` and reward components to `[0, 1]`. (f) SymPy verification uses a restricted expression grammar, not `eval()`. (g) Length bonuses are capped in the format score. |
+| 9 | Use process-aware feedback. | Two complementary process-level signals: (a) **SymPy step verification** gives `steps_verified_ok / steps_total` (arithmetic consistency, [`src/sft/step_verify_sympy.py`](src/sft/step_verify_sympy.py)); (b) **Qwen2.5-Math-PRM-7B** scores each reasoning step with a probability of correctness against the question semantics ([`src/rl/prm_scorer.py`](src/rl/prm_scorer.py)). `PRM_min` explicitly amplifies the weakest step, pushing the policy to fix individual broken steps rather than averaging them out. |
 | 10 | Training stack: TRL + Unsloth + OpenEnv. | OpenEnv: ✅ done. TRL: planned migration (see §11 below); our reward function is already in the right shape — it takes `(question, solution)` and returns a scalar, which is the TRL GRPO reward contract. Unsloth: planned for the 7B scale-up (§ Scaling). |
 | 11 | Prefer GRPO / RLVR for verifiable tasks. | **Current:** custom single-GPU PPO (deliberate — see *Proof-of-concept ladder* below). **Next tier:** swap `PPOTrainer` for `trl.GRPOTrainer`. Because our reward is already group-shaped (triple verifier = group-of-3), the migration is essentially deleting the ValueHead and changing the advantage to group-mean-baseline. |
 | 12 | Keep inference fast. | bf16 everywhere, `torch.set_float32_matmul_precision("high")`, cuDNN benchmark + TF32 enabled on boot (see the top of `scripts/run_ppo_training_curriculum.py`). `torch.compile` intentionally off by default because it deadlocks with HF `.generate()` + growing KV cache; opt-in via `--torch-compile`. vLLM is the next scaling lever (§ Scaling). |
@@ -113,9 +121,9 @@ pivot before spending 7B-scale compute.
 | Role | Files under ownership |
 |------|-----------------------|
 | Environment | [`src/openenv/`](src/openenv/), [`src/rl/math_environment*.py`](src/rl/), [`src/rl/curriculum_manager.py`](src/rl/curriculum_manager.py) |
-| Verifier / Rewards | [`src/rl/consensus_reward_calculator.py`](src/rl/consensus_reward_calculator.py), [`src/rl/triple_verifier.py`](src/rl/triple_verifier.py), [`src/rl/question_quality_evaluator.py`](src/rl/question_quality_evaluator.py), [`src/sft/step_verify_sympy.py`](src/sft/step_verify_sympy.py), [`src/rl/expert_panel.py`](src/rl/expert_panel.py) |
+| Verifier / Rewards | [`src/rl/prm_scorer.py`](src/rl/prm_scorer.py), [`src/rl/consensus_reward_calculator.py`](src/rl/consensus_reward_calculator.py), [`src/rl/triple_verifier.py`](src/rl/triple_verifier.py), [`src/rl/question_quality_evaluator.py`](src/rl/question_quality_evaluator.py), [`src/sft/step_verify_sympy.py`](src/sft/step_verify_sympy.py), [`src/rl/expert_panel.py`](src/rl/expert_panel.py) |
 | Training | [`src/rl/ppo_trainer.py`](src/rl/ppo_trainer.py), [`src/rl/rollout_buffer.py`](src/rl/rollout_buffer.py), [`scripts/run_ppo_training_curriculum.py`](scripts/run_ppo_training_curriculum.py), [`src/utils/csv_logger.py`](src/utils/csv_logger.py) |
-| Demo / Product | [`scripts/demo_before_after.py`](scripts/demo_before_after.py), [`deployment/`](deployment/), [`README_HACKATHON.md`](README_HACKATHON.md) (legacy), this file |
+| Demo / Product | [`scripts/demo_before_after.py`](scripts/demo_before_after.py), [`deployment/`](deployment/), [`README.md`](README.md), this file |
 
 ---
 

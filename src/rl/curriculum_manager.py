@@ -158,7 +158,20 @@ class CurriculumManager:
         combined_reward: Optional[float] = None,
         measured_difficulty: Optional[float] = None,
     ) -> None:
-        state = self.topics[topic]
+        # Grounded rollouts tag themselves with a synthetic topic name
+        # (``grounded_gsm8k``) that isn't part of the curriculum ontology.
+        # They must not pollute per-topic statistics — silently skip the
+        # update for any unknown topic instead of crashing.  The combined
+        # reward is still recorded for plateau detection.
+        state = self.topics.get(topic)
+        if state is None:
+            logger.debug(
+                "Skipping curriculum update for out-of-ontology topic %r", topic
+            )
+            if combined_reward is not None:
+                self.recent_combined_rewards.append(float(combined_reward))
+                self.recent_combined_rewards = self.recent_combined_rewards[-30:]
+            return
         state.total_attempts += 1
         state.current_iteration_attempts += 1
         state.successes += int(solution_success)

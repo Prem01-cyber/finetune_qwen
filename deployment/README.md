@@ -26,7 +26,11 @@ environment scores both the question and the solution with:
 - **SymPy step verification** — process-level arithmetic check (rubric rule #9).
 - **Triple-verifier consensus** — two alternate solutions sampled from a
   reference model; majority vote catches semantic errors the SymPy layer
-  cannot (rubric rule #7).
+  cannot (rubric rule #7). Note: the deployed server uses the
+  lightweight consensus-based path; training additionally loads
+  `Qwen2.5-Math-PRM-7B` in 4-bit for per-step correctness rewards —
+  that dependency is intentionally kept out of the deployed image to
+  minimise cold-start time and VRAM footprint.
 - **Format compliance** — steps and final-answer tagging.
 - **Expert-panel modifier** — phased curriculum weighting (pedagogy →
   exploration → expertise) that shifts what "good" means as the agent
