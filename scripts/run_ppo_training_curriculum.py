@@ -124,7 +124,11 @@ class CurriculumTrainingConfig:
     # speed for ~40% less activation memory — essential once the
     # 1.5B-param policy is actually trainable.  Forces use_cache=False
     # on the policy (we already do that in _policy_logits_at_state).
+    # When flash_attention_2 is selected, checkpointing is auto-disabled
+    # (Flash already gives O(T) attention memory) unless
+    # grad_checkpoint_explicit is set, in which case we force it on.
     gradient_checkpointing = True
+    grad_checkpoint_explicit = False
     clip_range = 0.2
     clip_range_vf = 0.2
     vf_coef = 0.5
@@ -444,7 +448,8 @@ def initialize_models(config: CurriculumTrainingConfig):
     # can still force it on/off via --grad-checkpoint / --no-grad-checkpoint.
     flash_active = attn_impl == "flash_attention_2"
     grad_ckpt_requested = getattr(config, "gradient_checkpointing", True)
-    if grad_ckpt_requested and not args.grad_checkpoint_explicit and flash_active:
+    grad_ckpt_forced_on = getattr(config, "grad_checkpoint_explicit", False)
+    if grad_ckpt_requested and not grad_ckpt_forced_on and flash_active:
         grad_ckpt_effective = False
         logger.info(
             "Flash-Attn 2 active — leaving gradient checkpointing OFF by "
@@ -1000,6 +1005,7 @@ def main():
     config.clip_range_vf = max(1e-3, float(args.clip_range_vf))
     config.batch_size = max(1, int(args.batch_size))
     config.gradient_checkpointing = bool(args.gradient_checkpointing)
+    config.grad_checkpoint_explicit = bool(args.grad_checkpoint_explicit)
     if args.torch_compile:
         config.use_torch_compile = True
 
