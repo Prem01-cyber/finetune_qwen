@@ -93,13 +93,22 @@ class TeeStream:
 
 class CurriculumTrainingConfig:
     base_model = "checkpoints/dual_task_v1"
-    # Canonical RLHF-PPO settings (InstructGPT / TRL / open-rlhf defaults):
+    # Canonical RLHF-PPO settings (InstructGPT / TRL / open-rlhf defaults),
+    # tuned for a 1.5B policy + grounded-rollout stabilisation:
     #   * lr 3e-6 is the sweet-spot for LoRA-style fine-tuning on 1-2B models;
     #     1e-6 produced visibly sluggish learning and wastes compute.
-    #   * clip_range 0.2 and target_kl 0.03 are the values every stable RLHF
-    #     stack uses.  The previous 0.3 / 0.15 combo effectively disabled
-    #     early-stopping and allowed single-update policy collapse when an
-    #     outlier advantage showed up.
+    #   * clip_range 0.2 is the canonical PPO ε.
+    #   * target_kl 0.05 is deliberately LOOSER than the 0.015-0.03 used in
+    #     InstructGPT-scale RLHF.  Reasons:
+    #       1. Grounded rollouts anchor the policy against gold GSM8K answers,
+    #          so the catastrophic-collapse risk that target_kl guards against
+    #          is already bounded.
+    #       2. At target_kl=0.03 the per-batch approx_kl regularly crossed the
+    #          1.5× trip line in epoch 1, giving us ~1/3 of the planned
+    #          gradient budget per iteration.
+    #     0.05 with kl_trip_multiplier=1.5 → trip at 0.075 ≈ actually lets
+    #     all 3 epochs complete in typical mid-training iterations.
+    #   * kl_trip_multiplier=1.5 keeps the canonical trip ratio; tune via CLI.
     learning_rate = 3e-6
     ppo_epochs = 3
     batch_size = 32
@@ -108,7 +117,8 @@ class CurriculumTrainingConfig:
     vf_coef = 0.5
     ent_coef = 0.02
     max_grad_norm = 0.5
-    target_kl = 0.03
+    target_kl = 0.05
+    kl_trip_multiplier = 1.5
 
     gamma = 1.0
     gae_lambda = 0.95
@@ -712,6 +722,44 @@ def main():
         "to 0.5-0.7 to bias toward solving-only fine-tuning.",
     )
     parser.add_argument(
+        "--target-kl",
+        type=float,
+        default=0.05,
+        help="PPO KL-divergence early-stopping target.  Epoch aborts when "
+        "approx_kl > kl_trip_multiplier * target_kl.  Default 0.05 (looser "
+        "than the 0.015-0.03 canonical RLHF range) because grounded "
+        "rollouts already bound collapse risk and a tighter threshold was "
+        "cutting most iterations to 1 of 3 planned epochs.  Drop to 0.03 "
+        "if you see policy_loss oscillating wildly.",
+    )
+    parser.add_argument(
+        "--kl-trip-multiplier",
+        type=float,
+        default=1.5,
+        help="Multiplier applied to --target-kl for the early-stop trip line. "
+        "Canonical RLHF uses 1.5.  Raise to 2.0-2.5 if you want to almost "
+        "never trip early (pairs well with a lower --target-kl).  Final "
+        "trip threshold = target_kl * kl_trip_multiplier (logged per iter).",
+    )
+    parser.add_argument(
+        "--ppo-epochs",
+        type=int,
+        default=3,
+        help="Number of gradient epochs over each rollout buffer.  Default 3.",
+    )
+    parser.add_argument(
+        "--clip-range",
+        type=float,
+        default=0.2,
+        help="PPO policy ratio clip ε.  Default 0.2 (canonical).",
+    )
+    parser.add_argument(
+        "--clip-range-vf",
+        type=float,
+        default=0.2,
+        help="PPO value-function clip ε.  Default 0.2.",
+    )
+    parser.add_argument(
         "--use-prm",
         dest="use_prm",
         action="store_true",
@@ -764,6 +812,11 @@ def main():
     config.use_prm = bool(args.use_prm)
     config.prm_model = str(args.prm_model)
     config.prm_load_in_4bit = bool(args.prm_load_in_4bit)
+    config.target_kl = max(1e-4, float(args.target_kl))
+    config.kl_trip_multiplier = max(1.0, float(args.kl_trip_multiplier))
+    config.ppo_epochs = max(1, int(args.ppo_epochs))
+    config.clip_range = max(1e-3, float(args.clip_range))
+    config.clip_range_vf = max(1e-3, float(args.clip_range_vf))
     if args.torch_compile:
         config.use_torch_compile = True
 
@@ -847,7 +900,16 @@ def main():
             compress_old_logs=config.compress_old_logs,
         )
 
-        logger.info("Using single-GPU PPO trainer on %s", device)
+        logger.info(
+            "Using single-GPU PPO trainer on %s | target_kl=%.4f × %.2f → "
+            "trip@%.4f | ppo_epochs=%d | clip_range=%.2f",
+            device,
+            config.target_kl,
+            config.kl_trip_multiplier,
+            config.target_kl * config.kl_trip_multiplier,
+            config.ppo_epochs,
+            config.clip_range,
+        )
         ppo_trainer = PPOTrainer(
             policy_model=policy,
             value_model=value,
@@ -861,6 +923,7 @@ def main():
             ent_coef=config.ent_coef,
             max_grad_norm=config.max_grad_norm,
             target_kl=config.target_kl,
+            kl_trip_multiplier=config.kl_trip_multiplier,
         )
 
         if args.skip_initial_eval:
@@ -950,15 +1013,37 @@ def main():
             training_metrics = ppo_trainer.train_step(rollout_buffer)
             train_seconds = time.perf_counter() - train_start
 
+            update_steps_done = int(training_metrics.get("update_steps", 0.0))
+            update_steps_planned = int(
+                training_metrics.get("update_steps_planned", 0.0)
+            )
+            early_stop_epoch = int(training_metrics.get("early_stop_epoch", -1.0))
+            early_stop_frac = (
+                1.0 - (update_steps_done / update_steps_planned)
+                if update_steps_planned > 0
+                else 0.0
+            )
+            early_stop_tag = (
+                "full" if early_stop_epoch < 0
+                else f"KL-stopped@epoch{early_stop_epoch + 1}/{config.ppo_epochs}"
+            )
             logger.info(
                 "PPO update metrics: policy_loss=%.4f value_loss=%.4f "
-                "entropy=%.4f approx_kl=%.4f clip_fraction=%.4f update_steps=%d",
+                "entropy=%.4f approx_kl=%.4f (trip@%.4f) clip_fraction=%.4f "
+                "updates=%d/%d (%.0f%% budget used) | %s",
                 training_metrics["policy_loss"],
                 training_metrics["value_loss"],
                 training_metrics["entropy"],
                 training_metrics["approx_kl"],
+                training_metrics.get(
+                    "kl_trip_threshold",
+                    config.target_kl * config.kl_trip_multiplier,
+                ),
                 training_metrics["clip_fraction"],
-                int(training_metrics.get("update_steps", 0.0)),
+                update_steps_done,
+                update_steps_planned,
+                100.0 * (1.0 - early_stop_frac),
+                early_stop_tag,
             )
 
             eval_start = time.perf_counter()
@@ -1050,6 +1135,17 @@ def main():
                 "train/entropy": training_metrics["entropy"],
                 "train/approx_kl": training_metrics["approx_kl"],
                 "train/clip_fraction": training_metrics["clip_fraction"],
+                "train/update_steps": training_metrics.get("update_steps", 0.0),
+                "train/update_steps_planned": training_metrics.get(
+                    "update_steps_planned", 0.0
+                ),
+                "train/early_stop_epoch": training_metrics.get(
+                    "early_stop_epoch", -1.0
+                ),
+                "train/kl_trip_threshold": training_metrics.get(
+                    "kl_trip_threshold",
+                    config.target_kl * config.kl_trip_multiplier,
+                ),
                 "rollout/mean_reward": buffer_stats["mean_episode_reward"],
                 "rollout/num_trajectories": len(trajectories),
                 "rollout/mean_length": buffer_stats["mean_episode_length"],

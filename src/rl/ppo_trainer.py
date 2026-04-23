@@ -123,7 +123,12 @@ class PPOTrainer:
         vf_coef       : Value loss coefficient c1.
         ent_coef      : Entropy bonus coefficient c2.
         max_grad_norm : Gradient clipping norm.
-        target_kl     : Early-stopping KL threshold.
+        target_kl     : Early-stopping KL target (epoch aborts when
+                        approx_kl > kl_trip_multiplier * target_kl).
+        kl_trip_multiplier : Multiplier on target_kl used for the early-stop
+                        trip line.  Canonical RLHF uses 1.5; raise to 2.0-2.5
+                        for small policies + grounded rollouts where we want
+                        more full epochs per batch.
     """
 
     def __init__(
@@ -140,6 +145,7 @@ class PPOTrainer:
         ent_coef: float = 0.01,
         max_grad_norm: float = 1.0,
         target_kl: float = 0.01,
+        kl_trip_multiplier: float = 1.5,
     ) -> None:
         self.policy = policy_model
         self.value = value_model
@@ -149,6 +155,11 @@ class PPOTrainer:
         self.batch_size = batch_size
         self.max_grad_norm = max_grad_norm
         self.target_kl = target_kl
+        # The canonical OpenAI/TRL early-stop trips at 1.5 * target_kl.  Exposed
+        # as a knob because on small policies with grounded rollouts you can
+        # safely push this to 2.0-2.5 and get more full PPO epochs per batch,
+        # which dominates when target_kl itself is the binding constraint.
+        self.kl_trip_multiplier = float(kl_trip_multiplier)
 
         self.loss_fn = PPOLoss(
             clip_range=clip_range,
@@ -211,7 +222,9 @@ class PPOTrainer:
         }
 
         early_stopped = False
+        early_stop_epoch = -1
         update_steps = 0
+        kl_trip_threshold = self.kl_trip_multiplier * self.target_kl
 
         # Every mini-batch runs a full fwd+bwd on the 1.5B policy *and* the
         # value head (~150 ms on an A100), so a typical update does a few
@@ -257,12 +270,19 @@ class PPOTrainer:
                     new_log_probs, old_log_probs, advantages
                 )
 
-                if pg_info["approx_kl"] > 1.5 * self.target_kl:
+                if pg_info["approx_kl"] > kl_trip_threshold:
                     logger.info(
-                        f"Early stopping at epoch {epoch}: "
-                        f"approx_kl={pg_info['approx_kl']:.4f}"
+                        "Early stopping at epoch %d/%d: approx_kl=%.4f > "
+                        "threshold=%.4f (target_kl=%.4f × %.2f)",
+                        epoch + 1,
+                        self.ppo_epochs,
+                        pg_info["approx_kl"],
+                        kl_trip_threshold,
+                        self.target_kl,
+                        self.kl_trip_multiplier,
                     )
                     early_stopped = True
+                    early_stop_epoch = epoch
                     break
 
                 # --- value: re-forward V_φ(s) ---
@@ -321,6 +341,13 @@ class PPOTrainer:
 
         metrics = {k: float(sum(v) / max(len(v), 1)) for k, v in stats.items()}
         metrics["update_steps"] = float(update_steps)
+        metrics["update_steps_planned"] = float(total_steps)
+        # -1 when we completed all epochs without tripping the KL guard.
+        # 0-indexed epoch at which the KL guard fired otherwise — so a value
+        # of 0 means PPO stopped during the very first epoch (the failure
+        # mode that motivated making target_kl / kl_trip_multiplier tunable).
+        metrics["early_stop_epoch"] = float(early_stop_epoch)
+        metrics["kl_trip_threshold"] = float(kl_trip_threshold)
         return metrics
 
     # ------------------------------------------------------------------
