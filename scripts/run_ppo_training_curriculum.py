@@ -111,7 +111,19 @@ class CurriculumTrainingConfig:
     #   * kl_trip_multiplier=1.5 keeps the canonical trip ratio; tune via CLI.
     learning_rate = 3e-6
     ppo_epochs = 3
-    batch_size = 32
+    # PPO mini-batch size.  Each mini-batch runs one full fwd+bwd through
+    # the 1.5B-param policy with activations kept for the backward pass.
+    # Qwen2.5-1.5B × seq_len ≈ 500 × 28 layers = ~1.5 GB activations per
+    # sample; B=32 overflowed an 80 GB A100 once the policy was actually
+    # trainable post-audit-fix.  B=8 fits comfortably with grad
+    # checkpointing on (leaves ~15 GB headroom) and does NOT slow
+    # throughput much because we just run 4× more micro-batches.
+    batch_size = 8
+    # Gradient checkpointing on the policy trades ~30% of backward-pass
+    # speed for ~40% less activation memory — essential once the
+    # 1.5B-param policy is actually trainable.  Forces use_cache=False
+    # on the policy (we already do that in _policy_logits_at_state).
+    gradient_checkpointing = True
     clip_range = 0.2
     clip_range_vf = 0.2
     vf_coef = 0.5
@@ -387,6 +399,29 @@ def initialize_models(config: CurriculumTrainingConfig):
         )
 
     policy = policy.to(device)
+
+    # Gradient checkpointing: drop intermediate activations on the forward
+    # pass and recompute them during backward.  For a 28-layer Qwen2.5-1.5B
+    # with B=8, seq_len≈500 this cuts peak activation memory roughly 40%
+    # (from ~20 GB to ~12 GB) at the cost of ~30% longer backward.
+    # Required combination for HF models:
+    #   1. gradient_checkpointing_enable() — registers the hooks
+    #   2. use_cache=False on every forward — cache + checkpointing is
+    #      incompatible (we already force this in _policy_logits_at_state
+    #      and in rollouts).
+    if getattr(config, "gradient_checkpointing", True):
+        policy.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        if hasattr(policy, "config"):
+            policy.config.use_cache = False
+        logger.info(
+            "Gradient checkpointing ENABLED on policy "
+            "(use_reentrant=False, use_cache=False)."
+        )
+    else:
+        logger.info("Gradient checkpointing DISABLED on policy (--no-grad-checkpoint).")
+
     log_gpu_memory("After policy loaded")
 
     value = ValueHead(base_model_name, model_device_map={"": "cpu"})
@@ -825,6 +860,26 @@ def main():
         help="PPO value-function clip ε.  Default 0.2.",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="PPO mini-batch size.  Default 8: a 1.5B-param policy with "
+        "bf16 weights + grads + AdamW states + per-layer backward-pass "
+        "activations already uses ~25 GB at this size; B=32 OOMs an 80 GB "
+        "A100.  Throughput barely changes because we simply run 4× more "
+        "micro-batches.  Drop to 4 if you add more resident modules (e.g. "
+        "PRM in bf16 instead of 4-bit).",
+    )
+    parser.add_argument(
+        "--no-grad-checkpoint",
+        dest="gradient_checkpointing",
+        action="store_false",
+        default=True,
+        help="Disable gradient checkpointing on the policy.  Default: ON "
+        "(saves ~40%% activation memory for ~30%% slower backward).  Only "
+        "disable if you have very large VRAM headroom and want the speed.",
+    )
+    parser.add_argument(
         "--use-prm",
         dest="use_prm",
         action="store_true",
@@ -882,6 +937,8 @@ def main():
     config.ppo_epochs = max(1, int(args.ppo_epochs))
     config.clip_range = max(1e-3, float(args.clip_range))
     config.clip_range_vf = max(1e-3, float(args.clip_range_vf))
+    config.batch_size = max(1, int(args.batch_size))
+    config.gradient_checkpointing = bool(args.gradient_checkpointing)
     if args.torch_compile:
         config.use_torch_compile = True
 

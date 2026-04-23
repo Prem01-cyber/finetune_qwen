@@ -13,7 +13,12 @@
 #   bash launch_ppo_training.sh --num-iterations 50 --rollouts-per-iter 32
 #   bash launch_ppo_training.sh --no-prm   # skip the 7B PRM download
 #   bash launch_ppo_training.sh --grounded-ratio 0.0  # pure self-play
-#
+#bash launch_ppo_training.sh \
+  --num-iterations 3 \
+  --rollouts-per-iter 16 \
+  --skip-initial-eval \
+  --run-name "smoke_postfix2_$(date +%Y%m%d_%H%M)"
+
 # PPO KL knobs (see run_ppo_training_curriculum.py for full docs):
 #   --target-kl 0.05          looser than canonical 0.015-0.03 on purpose —
 #                             grounded rollouts bound collapse risk and a
@@ -23,9 +28,28 @@
 #                             whether the budget is being honored.
 #   --kl-trip-multiplier 1.5  canonical; push to 2.0-2.5 to make early-stop
 #                             effectively never fire (pair with lower kl).
+#
+# Memory knobs (added after the post-audit OOM — the 1.5B policy is now
+# actually trainable, so activations, grads and AdamW state are real):
+#   --batch-size 8            was 32.  B=32 × seq~500 × 28 layers of bf16
+#                             Qwen2 activations = ~40 GB, which pushes an
+#                             80 GB A100 over the edge once grads +
+#                             optimiser state are resident.  Throughput
+#                             is ~unchanged because we just run 4× more
+#                             micro-batches.
+#   grad checkpointing ON     default; disable with --no-grad-checkpoint.
+#                             Saves ~40% activation memory.
+#   PYTORCH_CUDA_ALLOC_CONF   expandable_segments:True handles the
+#                             "2-3 GB reserved-but-unallocated"
+#                             fragmentation the runtime warns about.
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+# Tell the PyTorch caching allocator to grow segments on demand instead
+# of keeping large fragmented blocks.  This is the exact mitigation the
+# OOM error message tells us to apply and typically recovers 2-4 GB of
+# usable VRAM in PPO-style workloads where tensor shapes fluctuate.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 python scripts/run_ppo_training_curriculum.py \
   --base-model checkpoints/dual_task_v1 \
@@ -41,6 +65,7 @@ python scripts/run_ppo_training_curriculum.py \
   --kl-trip-multiplier 1.5 \
   --ppo-epochs 3 \
   --clip-range 0.2 \
+  --batch-size 8 \
   --eval-every 5 \
   --eval-max-samples 500 \
   --eval-max-new-tokens 512 \
