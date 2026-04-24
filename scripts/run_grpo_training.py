@@ -150,37 +150,56 @@ def compute_grounded_reward(
 # Generation
 # ---------------------------------------------------------------------------
 
-SOLUTION_PROMPT_TEMPLATE = (
-    "Solve the following math problem step by step. "
-    "Show each step clearly and end with 'Final Answer: <number>'.\n\n"
-    "Problem:\n{question}\n\nSolution:"
-)
+def _build_stop_token_ids(tokenizer: AutoTokenizer) -> List[int]:
+    """
+    Return a list of token IDs that should stop generation.
+
+    Qwen2.5-chat models end turns with <|im_end|> (ID 151645).  If that
+    token is not the same as eos_token_id we include both so that .generate()
+    halts cleanly instead of running to max_new_tokens and emitting repetitive
+    garbage.
+    """
+    stop_ids: List[int] = []
+    if tokenizer.eos_token_id is not None:
+        stop_ids.append(tokenizer.eos_token_id)
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if isinstance(im_end_id, int) and im_end_id not in stop_ids:
+        stop_ids.append(im_end_id)
+    return stop_ids or None  # type: ignore[return-value]
 
 
 def generate_solutions(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
-    question: str,
+    prompt: str,
     K: int,
     max_new_tokens: int,
     temperature: float,
     device: torch.device,
 ) -> Tuple[List[str], List[torch.Tensor], List[torch.Tensor]]:
     """
-    Generate K solutions for a question.
+    Generate K solutions for a pre-formatted prompt.
+
+    ``prompt`` must come from ``math_env.format_solution_prompt(question)``
+    so the chat-template system/user wrapping exactly matches the SFT
+    training format.  Passing a raw-text prompt causes the model to ignore
+    step-format instructions, produce empty Final-Answer lines, and
+    generate repetitive filler tokens until max_new_tokens is exhausted.
 
     Returns:
-        solutions     : list of K decoded solution strings
-        input_ids_list: list of K prompt+solution token tensors (for log_prob)
-        response_masks: list of K boolean masks (True = response token)
+        solutions     : list of K decoded solution strings (no prompt, no
+                        special tokens — ready for compute_grounded_reward)
+        input_ids_list: list of K full (prompt+response) token ID tensors
+        response_masks: list of K bool masks (True = response token)
     """
-    prompt = SOLUTION_PROMPT_TEMPLATE.format(question=question)
+    stop_ids = _build_stop_token_ids(tokenizer)
+
     enc = tokenizer(
         prompt,
         return_tensors="pt",
         padding=False,
         truncation=True,
-        max_length=512,
+        max_length=1024,   # generous for chat-template-wrapped prompts
     ).to(device)
     prompt_len = enc["input_ids"].shape[1]
 
@@ -199,6 +218,7 @@ def generate_solutions(
                 temperature=temperature,
                 top_p=0.9,
                 pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                eos_token_id=stop_ids,
                 use_cache=True,
             )
             full_ids = out[0]  # [prompt_len + response_len]
@@ -561,10 +581,15 @@ def main() -> None:
             gold = qa["gold_final"]
 
             # --- Generate K solutions ---
+            # Use the exact same chat-template prompt format as PPO rollouts
+            # (system prompt + user turn → add_generation_prompt=True).
+            # A raw-text prompt causes empty Final-Answer lines and repetitive
+            # filler tokens because the SFT-trained model expects the chat format.
+            solution_prompt = math_env.format_solution_prompt(question)
             solutions, input_ids_list, response_masks = generate_solutions(
                 model=model,
                 tokenizer=tokenizer,
-                question=question,
+                prompt=solution_prompt,
                 K=args.group_size,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
