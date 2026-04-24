@@ -1167,10 +1167,10 @@ def main() -> None:
     qa_pairs = gsm8k_pairs  # for reward env (all GSM8K gold answers needed)
 
     # ── Load PRM (optional) ─────────────────────────────────────────────────
-    prm_scorer: Optional[ProcessRewardScorer] = None
+    prm: Optional[ProcessRewardScorer] = None
     if args.use_prm:
         try:
-            prm_scorer = ProcessRewardScorer(
+            prm = ProcessRewardScorer(
                 model_name=args.prm_model,
                 device=device,
                 load_in_4bit=True,
@@ -1188,7 +1188,7 @@ def main() -> None:
         tokenizer=tokenizer,
         reference_questions=[],
         grounded_qa_pairs=qa_pairs,
-        prm_scorer=prm_scorer,
+        prm_scorer=prm,
         max_solution_tokens=args.max_new_tokens,
         device=device,
     )
