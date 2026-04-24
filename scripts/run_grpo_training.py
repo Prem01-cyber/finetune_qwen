@@ -40,14 +40,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
+import csv
 import json
 import logging
 import random
+import shutil
 import sys
 import time
 import types
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -67,9 +71,66 @@ from src.rl.math_environment_curriculum import CurriculumMathEnvironment
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    format="%(asctime)s %(levelname)-8s %(name)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Logging infrastructure
+# ---------------------------------------------------------------------------
+
+class TeeStream:
+    """Mirrors every write to a terminal stream into a log file.
+
+    Wrapping sys.stdout and sys.stderr with this object ensures that *all*
+    output — bare print() calls, tqdm bars, third-party library writes — lands
+    in the run log file in addition to the terminal.
+
+    A separate FileHandler on the root logger (see _add_file_logging) captures
+    the Python logging subsystem independently, because logging.StreamHandler
+    stores a reference to the stream at creation time and therefore bypasses
+    any later sys.stderr reassignment.  Both mechanisms together guarantee that
+    nothing escapes the log file.
+    """
+
+    def __init__(self, primary, secondary):
+        self.primary = primary
+        self.secondary = secondary
+
+    def write(self, data: str) -> int:
+        self.primary.write(data)
+        self.secondary.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.primary.flush()
+        self.secondary.flush()
+
+    def isatty(self) -> bool:
+        return getattr(self.primary, "isatty", lambda: False)()
+
+    def fileno(self) -> int:
+        return self.primary.fileno()
+
+
+def _add_file_logging(log_path: Path) -> logging.FileHandler:
+    """Attach a FileHandler to the root logger.
+
+    Every logger.info / logger.warning / … call — from any module — will be
+    written to ``log_path`` in addition to the terminal.  This complements
+    TeeStream: TeeStream captures bare print() / sys.stderr writes; this
+    handler captures the logging subsystem, which uses its own internal stream
+    reference that TeeStream cannot intercept.
+    """
+    fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s - %(message)s"
+    ))
+    logging.getLogger().addHandler(fh)
+    return fh
+
 
 if torch.cuda.is_available():
     torch.set_float32_matmul_precision("high")
@@ -373,11 +434,104 @@ def main() -> None:
     parser.add_argument("--skip-initial-eval", action="store_true")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--save-every", type=int, default=1,
+        help="Save a full checkpoint every N iterations (default 1 = every iter). "
+             "Best-policy is always saved when accuracy improves, independently of this flag.",
+    )
+    parser.add_argument(
+        "--keep-last", type=int, default=0,
+        help="Keep only the last K iter_* checkpoints on disk (0 = keep all). "
+             "best_policy/ is never pruned.",
+    )
     args = parser.parse_args()
 
-    run_name = args.run_name or f"grpo_{int(time.time())}"
+    # ── Run identity ─────────────────────────────────────────────────────────
+    # Establish run_name first — everything that follows (including log paths)
+    # derives from it.
+    run_name = args.run_name or f"grpo_{datetime.now():%Y%m%d_%H%M%S}"
     out_dir = Path(args.output_dir) / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Log directory ─────────────────────────────────────────────────────────
+    # One canonical directory for ALL run artefacts that are not model weights:
+    #   console_output.log  — full terminal mirror (logger.* + print + tqdm)
+    #   config.json         — serialised CLI args for reproducibility
+    #   metrics.csv         — one row per iteration, written live
+    #   summary.json        — written at the end of training
+    log_dir = Path("logs") / "grpo" / run_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Console log file ─────────────────────────────────────────────────────
+    console_log_path = log_dir / "console_output.log"
+    _console_log_file = console_log_path.open("a", encoding="utf-8", buffering=1)
+
+    # 1) FileHandler on the root logger → every logger.*() call goes to file.
+    #    This is necessary because logging.StreamHandler stores a reference to
+    #    sys.stderr at *creation* time (inside logging.basicConfig above), so
+    #    reassigning sys.stderr later has no effect on existing handlers.
+    _file_handler = _add_file_logging(console_log_path)
+
+    # 2) TeeStream on sys.stdout / sys.stderr → every print() / tqdm bar /
+    #    library write also goes to file.  Both together cover 100% of output.
+    _original_stdout = sys.stdout
+    _original_stderr = sys.stderr
+    sys.stdout = TeeStream(_original_stdout, _console_log_file)
+    sys.stderr = TeeStream(_original_stderr, _console_log_file)
+
+    logger.info("=" * 70)
+    logger.info("GRPO run: %s", run_name)
+    logger.info("Checkpoints : %s", out_dir)
+    logger.info("Logs        : %s", log_dir)
+    logger.info("Console log : %s", console_log_path)
+    logger.info("=" * 70)
+
+    # ── Persist config for reproducibility ───────────────────────────────────
+    (log_dir / "config.json").write_text(
+        json.dumps(vars(args), indent=2, default=str), encoding="utf-8"
+    )
+
+    # ── Live CSV metrics writer ───────────────────────────────────────────────
+    # Written one row per iteration so you can tail / open in Excel mid-run.
+    _metrics_csv_path = log_dir / "metrics.csv"
+    _csv_file: Optional[Any] = None
+    _csv_writer: Optional[Any] = None
+
+    def _append_metrics_csv(row: Dict[str, Any]) -> None:
+        """Append one metrics row to metrics.csv; writes header on first call."""
+        nonlocal _csv_file, _csv_writer
+        # Normalise floats to fixed precision so the CSV is human-readable.
+        flat = {
+            k: (f"{v:.6f}" if isinstance(v, float) else v)
+            for k, v in row.items()
+        }
+        if _csv_writer is None:
+            _csv_file = _metrics_csv_path.open("w", newline="", encoding="utf-8")
+            _csv_writer = csv.DictWriter(
+                _csv_file,
+                fieldnames=list(flat.keys()),
+                extrasaction="ignore",
+            )
+            _csv_writer.writeheader()
+        _csv_writer.writerow(flat)
+        _csv_file.flush()  # type: ignore[union-attr]
+
+    # ── Teardown: restore streams and close files on any exit path ───────────
+    # atexit runs unconditionally — on normal completion, keyboard interrupt,
+    # unhandled exception, or OOM crash.  This is equivalent to a finally block
+    # without requiring the entire training body to be re-indented.
+    def _teardown_logging() -> None:
+        sys.stdout = _original_stdout
+        sys.stderr = _original_stderr
+        logging.getLogger().removeHandler(_file_handler)
+        if not getattr(_file_handler.stream, "closed", False):
+            _file_handler.close()
+        if _csv_file is not None and not getattr(_csv_file, "closed", False):
+            _csv_file.close()
+        if not _console_log_file.closed:
+            _console_log_file.close()
+
+    atexit.register(_teardown_logging)
 
     random.seed(42)
     np.random.seed(42)
@@ -386,6 +540,20 @@ def main() -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     attn_impl = select_attn_implementation()
     logger.info("Device: %s | attn: %s", device, attn_impl)
+    if torch.cuda.is_available():
+        _gpu = torch.cuda.get_device_properties(0)
+        logger.info(
+            "GPU: %s | %.1f GB VRAM | capability sm_%d%d",
+            _gpu.name, _gpu.total_memory / 1e9, _gpu.major, _gpu.minor,
+        )
+    logger.info(
+        "Run config: K=%d N=%d lr=%.1e T=%.2f max_new=%d | eval_every=%d eval_N=%d | "
+        "grad_clip=%.2f save_every=%d keep_last=%d",
+        args.group_size, args.questions_per_iter, args.learning_rate,
+        args.temperature, args.max_new_tokens,
+        args.eval_every, args.eval_max_samples,
+        args.max_grad_norm, args.save_every, args.keep_last,
+    )
 
     # ── Load model ──────────────────────────────────────────────────────────
     logger.info("Loading model from %s ...", args.base_model)
@@ -698,19 +866,84 @@ def main() -> None:
                 logger.info("New best saved to %s", best_path)
             iter_metrics.update(eval_res)
 
-        # --- Save checkpoint ---
-        ckpt_path = out_dir / f"iter_{iteration:04d}"
-        ckpt_path.mkdir(exist_ok=True)
-        model.save_pretrained(str(ckpt_path))
-        tokenizer.save_pretrained(str(ckpt_path))
+        # --- Save checkpoint (respect --save-every / --keep-last) ---
+        is_last_iter = iteration == args.num_iterations
+        should_save = is_last_iter or (
+            args.save_every > 0 and iteration % args.save_every == 0
+        )
+        if should_save:
+            ckpt_path = out_dir / f"iter_{iteration:04d}"
+            ckpt_path.mkdir(exist_ok=True)
+            model.save_pretrained(str(ckpt_path))
+            tokenizer.save_pretrained(str(ckpt_path))
 
+            # Prune older iter_* checkpoints beyond the rolling window.
+            if args.keep_last and args.keep_last > 0:
+                existing = sorted(
+                    p for p in out_dir.iterdir()
+                    if p.is_dir() and p.name.startswith("iter_")
+                )
+                to_remove = existing[: -args.keep_last]
+                for old in to_remove:
+                    try:
+                        shutil.rmtree(old)
+                        logger.info("Pruned old checkpoint: %s", old.name)
+                    except OSError as exc:
+                        logger.warning("Could not prune %s: %s", old.name, exc)
+
+        # ── Write metrics to both JSONL (full history) and CSV (live row) ────
         metrics_log.append(iter_metrics)
         (out_dir / "metrics.jsonl").write_text(
             "\n".join(json.dumps(m) for m in metrics_log), encoding="utf-8"
         )
+        # CSV: one row per iteration, flushed immediately so you can
+        # `tail -f logs/grpo/<run>/metrics.csv` or open it in Excel mid-run.
+        _append_metrics_csv({
+            "iteration":      iter_metrics["iteration"],
+            "timestamp":      datetime.now().isoformat(timespec="seconds"),
+            "loss":           iter_metrics.get("loss", 0.0),
+            "mean_reward":    iter_metrics.get("mean_reward", 0.0),
+            "std_reward":     iter_metrics.get("std_reward", 0.0),
+            "batch_accuracy": iter_metrics.get("batch_accuracy", 0.0),
+            "n_groups":       iter_metrics.get("n_groups", 0),
+            "skipped_groups": iter_metrics.get("skipped_groups", 0),
+            "iter_time_s":    iter_metrics.get("iter_time_s", 0.0),
+            # eval columns are empty ("") on non-eval iterations so the CSV
+            # stays columnar without shifting anything.
+            "gsm8k_accuracy": iter_metrics.get("accuracy", ""),
+            "gsm8k_correct":  iter_metrics.get("correct", ""),
+            "gsm8k_total":    iter_metrics.get("total", ""),
+        })
 
-    logger.info("GRPO training complete. Best GSM8K: %.2f%%", 100 * best_accuracy)
-    logger.info("Metrics saved to %s", out_dir / "metrics.jsonl")
+    logger.info("=" * 70)
+    logger.info("GRPO training complete.")
+    logger.info("Best GSM8K accuracy : %.2f%%", 100 * best_accuracy)
+    logger.info("Checkpoints         : %s", out_dir)
+    logger.info("Logs                : %s", log_dir)
+    logger.info("Console log         : %s", console_log_path)
+    logger.info("=" * 70)
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    summary: Dict[str, Any] = {
+        "run_name": run_name,
+        "best_accuracy": best_accuracy,
+        "total_iterations": args.num_iterations,
+        "checkpoints_dir": str(out_dir),
+        "log_dir": str(log_dir),
+        "console_log": str(console_log_path),
+        "metrics_csv": str(_metrics_csv_path),
+        "metrics_jsonl": str(out_dir / "metrics.jsonl"),
+    }
+    (log_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, default=str), encoding="utf-8"
+    )
+    logger.info("Summary written to %s", log_dir / "summary.json")
+
+    # Explicit teardown (atexit is the safety net for crashes; calling here
+    # ensures everything is flushed and closed before the process returns
+    # normally — atexit won't double-close because _teardown_logging is
+    # idempotent via the .closed checks).
+    _teardown_logging()
 
 
 if __name__ == "__main__":
