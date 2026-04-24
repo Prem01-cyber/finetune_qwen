@@ -411,12 +411,12 @@ def main() -> None:
         except Exception as exc:
             logger.warning("PRM load failed (%s); running without PRM.", exc)
 
-    # Build a minimal math_env just for its reward utilities
-    from src.rl.math_environment_curriculum import CurriculumMathEnvironment
-    from src.rl.value_network import ValueHead
+    # Build a minimal math_env just for its reward utilities (compute_grounded_reward).
+    # value_model=None is safe: it's only stored as self.value and never invoked on
+    # the grounded-reward path, so GRPO avoids the ~3 GB ValueHead backbone entirely.
     math_env = CurriculumMathEnvironment(
         policy_model=model,
-        value_model=None,          # GRPO has no critic
+        value_model=None,
         tokenizer=tokenizer,
         reference_questions=[],
         grounded_qa_pairs=qa_pairs,
