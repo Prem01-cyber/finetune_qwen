@@ -42,16 +42,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import random
 import sys
 import time
+import types
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm.auto import tqdm
 
@@ -61,7 +62,6 @@ from scripts.convert_gsm8k_to_sft import parse_gsm8k_answer
 from scripts.eval_sft_inference import evaluate_gsm8k
 from src.rl.prm_scorer import ProcessRewardScorer
 from src.sft.solution_format import extract_final_answer_numeric_str
-from src.sft.step_verify_sympy import verify_solution_text
 from src.utils.attn_backend import select_attn_implementation
 from src.rl.math_environment_curriculum import CurriculumMathEnvironment
 
@@ -75,6 +75,7 @@ if torch.cuda.is_available():
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True   # auto-tune fastest conv algo per shape
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +133,11 @@ def compute_grounded_reward(
     question: str,
     solution: str,
     gold_final: str,
-    prm_scorer: Optional[ProcessRewardScorer],
     math_env: CurriculumMathEnvironment,
 ) -> float:
-    """Thin wrapper re-using the existing reward pipeline."""
+    """Thin wrapper re-using the existing reward pipeline.
+    PRM is handled inside math_env (loaded at startup); no need to pass it here.
+    """
     result = math_env.compute_grounded_reward(
         question=question,
         solution=solution,
@@ -394,19 +396,79 @@ def main() -> None:
         except Exception as _e:
             logger.warning("Could not load chat template from base model: %s", _e)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
+    # PEFT <= 0.12 crashes inside merge_and_unload() when the
+    # transformers.integrations.tensor_parallel module is missing.
+    if "transformers.integrations.tensor_parallel" not in sys.modules:
+        sys.modules["transformers.integrations.tensor_parallel"] = types.ModuleType(
+            "tensor_parallel"
+        )
+
+    model_path = Path(args.base_model)
+    is_adapter = (model_path / "adapter_config.json").exists()
+
+    load_kwargs = dict(
         torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
         device_map={"": device},
         trust_remote_code=True,
         attn_implementation=attn_impl,
     )
-    model.gradient_checkpointing_enable()
+
+    if is_adapter:
+        # Determine actual base model from pipeline_meta.json (written by SFT pipeline).
+        _meta_path = model_path / "pipeline_meta.json"
+        _base_for_weights = "Qwen/Qwen2.5-Math-1.5B-Instruct"
+        if _meta_path.exists():
+            _base_for_weights = json.loads(
+                _meta_path.read_text(encoding="utf-8")
+            ).get("base_model", _base_for_weights)
+        logger.info("Detected PEFT adapter — loading base %s then merging %s",
+                    _base_for_weights, args.base_model)
+        _base = AutoModelForCausalLM.from_pretrained(_base_for_weights, **load_kwargs)
+        model = PeftModel.from_pretrained(_base, args.base_model).merge_and_unload()
+        model = model.to(device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.base_model, **load_kwargs)
+
+    # PEFT.merge_and_unload() leaves requires_grad=False on every param.
+    # Re-enable unconditionally so GRPO's optimizer actually updates weights.
+    params_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
     for p in model.parameters():
         p.requires_grad_(True)
+    params_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if params_before == 0 and params_after > 0:
+        logger.warning(
+            "All parameters were frozen on load (PEFT merge_and_unload bug). "
+            "Re-enabled requires_grad — any prior frozen runs were training nothing."
+        )
+
+    # Flash-Attn 2 turns attention memory from O(T²) to O(T), so gradient
+    # checkpointing gives almost no extra saving while costing ~30% more
+    # backward time.  Disable it when Flash is active (mirrors PPO runner).
+    # gradient_checkpointing_enable requires use_reentrant=False on modern
+    # PyTorch — the default True is deprecated and causes silent issues.
+    # Also set use_cache=False: HF models can't use KV cache together with
+    # gradient checkpointing (incompatible memory management).
+    flash_active = attn_impl == "flash_attention_2"
+    if not flash_active:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        if hasattr(model, "config"):
+            model.config.use_cache = False
+        logger.info("Gradient checkpointing ENABLED (use_reentrant=False, use_cache=False).")
+    else:
+        logger.info(
+            "Flash-Attn 2 active — gradient checkpointing OFF "
+            "(Flash already gives O(T) attention memory)."
+        )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("Trainable parameters: %s", f"{n_params:,}")
+    n_total = sum(p.numel() for p in model.parameters())
+    logger.info(
+        "Trainable parameters: %s / %s (%.1f%%)",
+        f"{n_params:,}", f"{n_total:,}", 100.0 * n_params / max(n_total, 1),
+    )
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -481,8 +543,17 @@ def main() -> None:
 
         all_rewards: List[float] = []
         skipped = 0
-        total_loss = torch.tensor(0.0, device=device)
         n_groups = 0
+        total_loss_val = 0.0
+
+        # Zero gradients once before the loop — we accumulate them via
+        # per-group .backward() calls instead of building one giant graph.
+        # Keeping all K*N forward passes alive until a single backward()
+        # at the end would hold O(K*N) computation graphs in GPU memory
+        # simultaneously (64 graphs at K=4, N=16), risking OOM.  Calling
+        # .backward() immediately after each group frees that graph right
+        # away; gradients accumulate in .grad tensors without extra memory.
+        optimizer.zero_grad()
 
         pbar = tqdm(questions_batch, desc=f"Iter {iteration} GRPO groups", unit="q")
         for qa in pbar:
@@ -507,13 +578,12 @@ def main() -> None:
                     question=question,
                     solution=sol,
                     gold_final=gold,
-                    prm_scorer=prm_scorer,
                     math_env=math_env,
                 )
                 rewards.append(r)
             all_rewards.extend(rewards)
 
-            # --- GRPO loss ---
+            # --- GRPO loss + immediate backward ---
             group_loss = grpo_loss_for_group(
                 model=model,
                 input_ids_list=input_ids_list,
@@ -530,7 +600,10 @@ def main() -> None:
                 )
                 continue
 
-            total_loss = total_loss + group_loss
+            # Backprop immediately — frees this group's computation graph.
+            # Gradients from all valid groups accumulate in param.grad.
+            group_loss.backward()
+            total_loss_val += group_loss.item()
             n_groups += 1
             pbar.set_postfix(
                 mean_r=f"{np.mean(rewards):.3f}",
@@ -538,17 +611,20 @@ def main() -> None:
                 skip=skipped,
             )
 
-        # --- Gradient step (once per iteration, over all groups) ---
+        # --- Gradient step: normalise accumulated grads then step ---
         if n_groups > 0:
-            avg_loss = total_loss / n_groups
-            optimizer.zero_grad()
-            avg_loss.backward()
+            # Divide accumulated grads by n_groups to get the true average
+            # (equivalent to averaging the group losses before backward).
+            if n_groups > 1:
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.div_(n_groups)
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad],
                 args.max_grad_norm,
             )
             optimizer.step()
-            loss_val = avg_loss.item()
+            loss_val = total_loss_val / n_groups
         else:
             loss_val = 0.0
 
