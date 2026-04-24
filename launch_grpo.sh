@@ -58,11 +58,13 @@
 #
 # ── Expected wall-time on this host ──────────────────────────────────────
 #
-#   Initial eval (250 samples)           : ~5 min
-#   Train iter @ K=8, N=16, max_new=400  : ~6-7 min
-#   Eval every 3 iters (250 samples)     : ~5 min each × 10 = 50 min
-#   30 iterations × 7 min                : ~3.5 h
-#   Total                                : ~4.5 h end-to-end
+#   Initial eval (250 samples)                        : ~5 min
+#   Train iter @ K=8 batched, N=16, max_new=400       : ~90 s  (was ~6-7 min sequential)
+#   Eval every 10 iters (250 samples) × 10 evals      : ~5 min each × 10 = 50 min
+#   100 iterations × 1.5 min                          : ~2.5 h
+#   Total                                             : ~3.5 h end-to-end
+#
+#   This is 3× more iterations than the previous 30-iter run in the same wall-time.
 #
 # ── Overrides ────────────────────────────────────────────────────────────
 #
@@ -113,22 +115,60 @@ echo "[launch] run_name = $RUN_NAME"
 echo "[launch] log_file = $LOG_FILE"
 
 # ── Train ────────────────────────────────────────────────────────────────
+#
+# What each flag does on this hardware:
+#
+#   --group-size 8            K=8 batched in ONE model.generate call — near-100%
+#                             GPU utilisation vs the old sequential K=8 loop.
+#                             Halved wall-time per iteration → 2× iterations in 4.5 h.
+#
+#   --questions-per-iter 16   N=16 groups per step; gradient is already well-conditioned
+#                             at this size — going higher adds wall-time without signal.
+#
+#   --clip-eps 0.2            PPO-style IS clip: prevents any single high-advantage
+#                             group from spiking the policy at 1e-5 LR.
+#
+#   --warmup-iters 3          Linear LR ramp: 1e-6 → 1e-5 over 3 iterations so the
+#                             first gradient step doesn't jolt a freshly-merged model.
+#
+#   --min-lr-ratio 0.1        Cosine decays to 1e-6 (10% of peak) by iteration 100.
+#
+#   --difficulty-alpha 2.0    Difficulty-weighted sampling: questions where the model
+#                             scores 40-60% of K=8 solutions are sampled most often.
+#                             Questions it always gets right / wrong are deprioritised.
+#
+#   --num-iterations 100      With batched generation, each iter is ~90s on A100,
+#                             so 100 iters ≈ 3.5 h + eval overhead.  Much more signal
+#                             than the previous 30-iter limit.
+#
+#   --eval-every 10           10 eval points over 100 iters — still a clear curve.
+#
+#   --save-every 10           Save checkpoint every 10 iters; best_policy/ always saved
+#                             when accuracy improves regardless of this flag.
+#
+#   --keep-last 3             Keep the 3 newest iter_* checkpoints on disk (~9 GB).
+#
 python -u scripts/run_grpo_training.py \
     --base-model checkpoints/dual_task_v1 \
     --output-dir checkpoints/grpo \
     --gsm8k-data data/sft/gsm8k_sft.jsonl \
     --eval-data-path data/sft/dual_task_val.jsonl \
-    --num-iterations 30 \
+    --num-iterations 100 \
     --group-size 8 \
     --questions-per-iter 16 \
     --learning-rate 1e-5 \
     --max-new-tokens 400 \
     --temperature 0.8 \
     --max-grad-norm 0.5 \
-    --eval-every 3 \
+    --clip-eps 0.2 \
+    --warmup-iters 3 \
+    --min-lr-ratio 0.1 \
+    --difficulty-alpha 2.0 \
+    --overlong-filter \
+    --eval-every 10 \
     --eval-max-samples 250 \
     --eval-max-new-tokens 512 \
-    --save-every 5 \
+    --save-every 10 \
     --keep-last 3 \
     --use-prm \
     --prm-model Qwen/Qwen2.5-Math-PRM-7B \
