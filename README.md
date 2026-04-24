@@ -968,6 +968,34 @@ and adapts naturally as the model improves.
 | `src/openenv/client.py` | HTTP client mirroring in-process API |
 | `src/openenv/models.py` | Pydantic wire models with range-clamped validators |
 
+#### Self-Play in GRPO (`--self-play-ratio`)
+
+Each GRPO iteration is split into two branches controlled by `--self-play-ratio` (default 0.30):
+
+| Branch | `--self-play-ratio` fraction | Description |
+|---|---|---|
+| **Grounded** | `1 - ratio` | Dataset question with gold answer; reward = 0.60·correct + 0.15·PRM + 0.15·SymPy + 0.10·format |
+| **Self-play** | `ratio` | Model generates the question from a curriculum instruction; reward = 0.40·question_quality + 0.60·solution_quality |
+
+**Self-play group pipeline:**
+1. `math_env.sample_instruction()` → `(instruction, topic, difficulty_target)`
+2. `generate_question(model, instruction)` → raw question text
+3. Validity check: reject if `len(question) < 10` — logged as `q_gen_valid` vs `q_gen_attempts`
+4. `generate_solutions_batched(model, question, K)` → K candidate solutions
+5. `compute_self_play_reward(question, sol, topic, difficulty)` → `(combined, q_reward, s_reward, q_metrics)`
+6. Advantages computed from group of K combined rewards → GRPO loss → backward
+
+**Question quality reward components** (logged per-iteration when self-play is active):
+
+| Metric | What it measures |
+|---|---|
+| `topic_match` | Does the generated question address the requested topic/skill? |
+| `difficulty_fit` | Is the complexity appropriate for the target difficulty level? |
+| `clarity` | Is the question clearly phrased with all necessary information? |
+| `novelty` | Is the question distinct from previously seen questions? (trigram Jaccard) |
+| `solvability` | Can at least one reasoning step be symbolically verified? |
+| `q_quality_rate` | **Question generation accuracy**: fraction of groups where mean q_reward > 0.5 |
+
 ### 10.5 Evaluation and Demo
 
 | Script | Purpose |
@@ -990,38 +1018,85 @@ All logs land in `logs/grpo/<run-name>/`:
 | `config.json` | Full run configuration snapshot |
 | `summary.json` | Run summary written at completion |
 
-Structured `metrics.jsonl` fields:
+Full `metrics.jsonl` schema (one JSON object per line):
 
 ```json
 {
-  "iteration": 10,
-  "loss": -0.0023,
-  "mean_reward": 0.762,
-  "std_reward": 0.231,
-  "batch_accuracy": 0.831,
-  "groups": 16,
-  "skipped": 0,
-  "learning_rate": 9.12e-6,
-  "iter_time_s": 43.2,
-  "accuracy": 0.672,
-  "best_accuracy": 0.672
+  "iteration":           10,
+  "loss":               -0.0023,
+  "mean_reward":         0.762,
+  "std_reward":          0.231,
+  "batch_accuracy":      0.831,
+  "n_groups":            16,
+  "skipped_groups":      0,
+  "learning_rate":       9.12e-6,
+  "iter_time_s":         43.2,
+
+  "n_self_play_groups":  5,
+  "q_gen_attempts":      5,
+  "q_gen_valid":         5,
+  "q_gen_valid_rate":    1.0,
+  "mean_question_reward": 0.621,
+  "q_quality_rate":      0.80,
+  "q_topic_match":       0.74,
+  "q_difficulty_fit":    0.68,
+  "q_clarity":           0.71,
+  "q_novelty":           0.55,
+  "q_solvability":       0.69,
+
+  "accuracy":            0.672,
+  "best_accuracy":       0.672
 }
 ```
 
-### 11.2 Reading the per-iteration console line
+**Question-generation metric definitions:**
 
+| Field | Meaning |
+|---|---|
+| `q_gen_attempts` | Number of times `generate_question()` was called this iteration |
+| `q_gen_valid` | Questions that passed the minimum length check (≥ 10 chars) |
+| `q_gen_valid_rate` | `q_gen_valid / q_gen_attempts` — generation success rate |
+| `mean_question_reward` | Average of all K×n_self_play question-quality scores this iteration |
+| `q_quality_rate` | Fraction of self-play groups whose mean question_reward > 0.5 (the "question generation accuracy") |
+| `q_topic_match` | Avg topic-match component: did the generated question match the requested topic? |
+| `q_difficulty_fit` | Avg difficulty-fit component: was the generated question at the target difficulty? |
+| `q_clarity` | Avg clarity score (structural heuristics) |
+| `q_novelty` | Avg novelty score (trigram Jaccard against seen questions) |
+| `q_solvability` | Avg solvability score (can SymPy verify at least one step?) |
+
+### 11.2 Reading the per-iteration console output
+
+Each iteration now emits **two** log lines:
+
+**Line 1 — overall training summary:**
 ```
 Iter 10 | loss=-0.0023 | reward mean=0.762 std=0.231 | batch_acc=83.1% | groups=16 skipped=0 | lr=9.12e-06 | 43.2s
 ```
 
-| Field | Healthy target |
-|---|---|
-| `loss` | Should trend **more negative** as the policy assigns higher probability to winning solutions |
-| `reward mean` | Trending up over time; the primary learning signal |
-| `std` | Must stay > 0.05; collapse to 0 means all K solutions are identical (mode collapse) |
-| `batch_acc` | Fraction of rollouts with reward > 0.5; fast proxy for "correct + well-formatted" |
-| `skipped` | Groups where all K rewards were identical; 0–2/iter is healthy |
-| `lr` | Should follow warmup then cosine decay |
+**Line 2 — question generation accuracy** (only when `--self-play-ratio > 0`):
+```
+  Question generation: 5/5 valid (100%) | q_reward=0.621 | q_acc=80.0% (>0.5 quality) | topic=0.74 diff=0.68 clarity=0.71 novelty=0.55 solvability=0.69
+```
+
+**Live tqdm bar** (updated per group):
+```
+Iter 10 GRPO groups:  75%|███████▌  | 12/16 [00:38<00:12  mean_r=0.762, loss=-0.003, skip=0, q_acc=80%, q_rew=0.621]
+```
+
+**Field-by-field health guide:**
+
+| Field | Healthy range | Warning |
+|---|---|---|
+| `loss` | Trending more negative | Stuck at 0 = all groups skipped (variance collapse) |
+| `reward mean` | Trending upward over iterations | Flat or declining = check reward pipeline |
+| `std` | > 0.05 | ≤ 0.05 = mode collapse (all K solutions identical) |
+| `batch_acc` | > 50% and trending up | < 30% for many iters = model not learning |
+| `skipped` | 0–2/iter | > half of groups = increase `--temperature` |
+| `q_gen_valid_rate` | ≥ 90% | Low = model generating blank/nonsense questions |
+| `q_quality_rate` (q_acc) | ≥ 50% and rising | Low = model generating poor questions; check topic templates |
+| `q_topic_match` | ≥ 0.6 | Low = model ignoring curriculum instruction |
+| `q_solvability` | ≥ 0.5 | Low = model generating unsolvable questions |
+| `lr` | Warmup → cosine decay | Stuck at min = schedule misconfigured |
 
 ### 11.3 PPO log files
 

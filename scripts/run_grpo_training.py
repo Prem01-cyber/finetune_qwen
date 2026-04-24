@@ -364,16 +364,19 @@ def compute_self_play_reward(
     target_topic: str,
     target_difficulty: float,
     math_env: CurriculumMathEnvironment,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, Dict]:
     """Score a self-generated question + solution (self-play path).
 
-    Returns (combined_reward, question_reward, solution_reward).
+    Returns (combined_reward, question_reward, solution_reward, q_metrics).
 
     Reward breakdown: R = 0.40×question_quality + 0.60×solution_quality,
     where question_quality captures topic match, difficulty fit, clarity,
     novelty, and solvability — completing the Theme #4 self-improvement loop
     where the model is rewarded for generating *good challenges*, not only
     for solving them.
+
+    q_metrics contains the full question quality breakdown:
+      topic_match, difficulty_fit, clarity, novelty, solvability, overall_score
     """
     result = math_env.compute_reward(
         question=question,
@@ -385,7 +388,20 @@ def compute_self_play_reward(
     q_reward  = float(result.get("question_reward", 0.0))
     sol_score = result.get("solution_metrics", {})
     s_reward  = float(sol_score.get("overall_score", 0.0)) if isinstance(sol_score, dict) else 0.0
-    return combined, q_reward, s_reward
+
+    # Extract per-component question quality scores for granular logging.
+    q_metrics_raw = result.get("question_metrics", {})
+    q_metrics: Dict = {
+        "overall_score":    float(q_metrics_raw.get("overall_score",    q_reward)),
+        "topic_match":      float(q_metrics_raw.get("topic_match",      0.0)),
+        "difficulty_fit":   float(q_metrics_raw.get("difficulty_fit",   0.0)),
+        "clarity":          float(q_metrics_raw.get("clarity",          0.0)),
+        "novelty":          float(q_metrics_raw.get("novelty",          {}).get("combined", 0.0))
+                            if isinstance(q_metrics_raw.get("novelty"), dict)
+                            else float(q_metrics_raw.get("novelty",     0.0)),
+        "solvability":      float(q_metrics_raw.get("solvability",      0.0)),
+    }
+    return combined, q_reward, s_reward, q_metrics
 
 
 @torch.no_grad()
@@ -1255,11 +1271,21 @@ def main() -> None:
         cur_lr = optimizer.param_groups[0]["lr"]
         logger.info("LR this iteration: %.2e", cur_lr)
 
-        all_rewards: List[float] = []
+        all_rewards:   List[float] = []
         all_q_rewards: List[float] = []   # question_reward for self-play groups only
+        # Per-component question quality accumulators
+        _qc_topic:      List[float] = []
+        _qc_diff:       List[float] = []
+        _qc_clarity:    List[float] = []
+        _qc_novelty:    List[float] = []
+        _qc_solvability: List[float] = []
+
         skipped = 0
         n_groups = 0
         n_self_play = 0
+        q_gen_attempts  = 0    # total generate_question() calls
+        q_gen_valid     = 0    # non-empty questions produced (len > 10 chars)
+        q_quality_good  = 0    # self-play groups where question_reward > 0.5
         total_loss_val = 0.0
 
         # Determine how many of this iteration's groups use self-play question
@@ -1294,6 +1320,7 @@ def main() -> None:
                 # 2. Model generates the question from the instruction.
                 #    This is the "proposer" role in Theme #4 self-improvement:
                 #    the model creates its own challenge.
+                q_gen_attempts += 1
                 question = generate_question(
                     model=model,
                     tokenizer=tokenizer,
@@ -1301,9 +1328,16 @@ def main() -> None:
                     max_new_tokens=128,   # questions are short
                     device=device,
                 )
-                if not question.strip():
+                # A valid question must have at least some substance.
+                # Reject single-word, empty, or nonsensical outputs.
+                if len(question.strip()) < 10:
+                    logger.debug(
+                        "Self-play: generated question too short (%d chars), skipping group.",
+                        len(question.strip()),
+                    )
                     skipped += 1
                     continue
+                q_gen_valid += 1
                 n_self_play += 1
                 gold = None   # no gold answer — rewarded on question quality
             else:
@@ -1355,20 +1389,29 @@ def main() -> None:
 
             # --- Score each solution (self-play: Q+S reward; grounded: S only) ---
             rewards = []
+            _sp_q_rew_this_group: List[float] = []
             for sol in solutions:
                 if use_self_play:
                     # compute_reward = 0.40×question_quality + 0.60×solution_quality
                     # This is the core Theme #4 signal: the model is rewarded
                     # for generating a well-formed, appropriately difficult,
                     # solvable question AND for solving it correctly.
-                    r, q_rew, _ = compute_self_play_reward(
+                    r, q_rew, _, q_met = compute_self_play_reward(
                         question=question,
                         solution=sol,
                         target_topic=target_topic,
                         target_difficulty=target_difficulty,
                         math_env=math_env,
                     )
+                    _sp_q_rew_this_group.append(q_rew)
                     all_q_rewards.append(q_rew)
+                    # Collect per-component breakdown (same question, all K solutions
+                    # get the same q_metrics — average to reduce noise).
+                    _qc_topic.append(q_met["topic_match"])
+                    _qc_diff.append(q_met["difficulty_fit"])
+                    _qc_clarity.append(q_met["clarity"])
+                    _qc_novelty.append(q_met["novelty"])
+                    _qc_solvability.append(q_met["solvability"])
                 else:
                     r = compute_grounded_reward(
                         question=question,
@@ -1378,6 +1421,13 @@ def main() -> None:
                     )
                 rewards.append(r)
             all_rewards.extend(rewards)
+
+            # A self-play group is "accurate" if the question it generated scored
+            # above 0.5 on question quality — meaning it was clear, on-topic,
+            # appropriately difficult, and solvable.
+            if use_self_play and _sp_q_rew_this_group:
+                if float(np.mean(_sp_q_rew_this_group)) > 0.5:
+                    q_quality_good += 1
 
             # --- Update difficulty stats (grounded questions only — self-play
             #     questions are ephemeral and have no stable key) ---
@@ -1400,11 +1450,11 @@ def main() -> None:
 
             if group_loss is None:
                 skipped += 1
-                pbar.set_postfix(
-                    mean_r=f"{np.mean(rewards):.3f}",
-                    skip=skipped,
-                    loss="skip",
-                )
+                _pf: Dict = dict(mean_r=f"{np.mean(rewards):.3f}", skip=skipped, loss="skip")
+                if n_self_play > 0 and all_q_rewards:
+                    _q_acc_pct = 100.0 * q_quality_good / max(1, n_self_play)
+                    _pf["q_acc"] = f"{_q_acc_pct:.0f}%"
+                pbar.set_postfix(**_pf)
                 continue
 
             # Backprop immediately — frees this group's computation graph.
@@ -1412,11 +1462,19 @@ def main() -> None:
             group_loss.backward()
             total_loss_val += group_loss.item()
             n_groups += 1
-            pbar.set_postfix(
+            _pf = dict(
                 mean_r=f"{np.mean(rewards):.3f}",
                 loss=f"{group_loss.item():.4f}",
                 skip=skipped,
             )
+            if n_self_play > 0 and all_q_rewards:
+                # Show live question-gen accuracy in the tqdm bar.
+                # q_acc = fraction of self-play groups whose generated question
+                # scored > 0.5 on quality (clear, on-topic, solvable).
+                _q_acc_pct = 100.0 * q_quality_good / max(1, n_self_play)
+                _pf["q_acc"] = f"{_q_acc_pct:.0f}%"
+                _pf["q_rew"]  = f"{float(np.mean(all_q_rewards)):.3f}"
+            pbar.set_postfix(**_pf)
 
         # --- Gradient step: normalise accumulated grads then step ---
         if n_groups > 0:
@@ -1437,35 +1495,65 @@ def main() -> None:
         scheduler.step()
 
         iter_time = time.perf_counter() - iter_start
-        mean_r = float(np.mean(all_rewards)) if all_rewards else 0.0
-        std_r  = float(np.std(all_rewards)) if all_rewards else 0.0
-        acc_r  = float(np.mean([r > 0.5 for r in all_rewards])) if all_rewards else 0.0
-        mean_q_r = float(np.mean(all_q_rewards)) if all_q_rewards else 0.0
+        mean_r   = float(np.mean(all_rewards))             if all_rewards   else 0.0
+        std_r    = float(np.std(all_rewards))              if all_rewards   else 0.0
+        acc_r    = float(np.mean([r > 0.5 for r in all_rewards])) if all_rewards else 0.0
+        mean_q_r = float(np.mean(all_q_rewards))           if all_q_rewards else 0.0
+
+        # Question generation accuracy metrics (self-play only)
+        q_gen_valid_rate = (q_gen_valid   / q_gen_attempts)  if q_gen_attempts  > 0 else 0.0
+        q_quality_rate   = (q_quality_good / n_self_play)    if n_self_play     > 0 else 0.0
+        # Per-component averages (all non-empty across K solutions × groups)
+        mean_q_topic     = float(np.mean(_qc_topic))       if _qc_topic      else 0.0
+        mean_q_diff      = float(np.mean(_qc_diff))        if _qc_diff       else 0.0
+        mean_q_clarity   = float(np.mean(_qc_clarity))     if _qc_clarity    else 0.0
+        mean_q_novelty   = float(np.mean(_qc_novelty))     if _qc_novelty    else 0.0
+        mean_q_solvab    = float(np.mean(_qc_solvability)) if _qc_solvability else 0.0
 
         _cur_lr = optimizer.param_groups[0]["lr"]
-        _sp_str = (
-            f" | self_play={n_self_play}/{n_groups} q_reward={mean_q_r:.3f}"
-            if n_self_play > 0 else ""
-        )
+
+        # ── Primary summary line ─────────────────────────────────────────────
         logger.info(
             "Iter %d | loss=%.4f | reward mean=%.3f std=%.3f | "
-            "batch_acc=%.1f%% | groups=%d skipped=%d%s | lr=%.2e | %.1fs",
+            "batch_acc=%.1f%% | groups=%d skipped=%d | lr=%.2e | %.1fs",
             iteration, loss_val, mean_r, std_r,
-            100 * acc_r, n_groups, skipped, _sp_str, _cur_lr, iter_time,
+            100 * acc_r, n_groups, skipped, _cur_lr, iter_time,
         )
 
+        # ── Question-generation accuracy line (only when self-play is active) ─
+        if n_self_play > 0:
+            logger.info(
+                "  Question generation: %d/%d valid (%.0f%%) | "
+                "q_reward=%.3f | q_acc=%.1f%% (>0.5 quality) | "
+                "topic=%.2f diff=%.2f clarity=%.2f novelty=%.2f solvability=%.2f",
+                q_gen_valid, q_gen_attempts, 100 * q_gen_valid_rate,
+                mean_q_r, 100 * q_quality_rate,
+                mean_q_topic, mean_q_diff, mean_q_clarity,
+                mean_q_novelty, mean_q_solvab,
+            )
+
         iter_metrics: Dict = {
-            "iteration": iteration,
-            "loss": loss_val,
-            "mean_reward": mean_r,
-            "std_reward": std_r,
-            "batch_accuracy": acc_r,
-            "n_groups": n_groups,
-            "n_self_play_groups": n_self_play,
-            "mean_question_reward": mean_q_r,
-            "skipped_groups": skipped,
-            "learning_rate": _cur_lr,
-            "iter_time_s": iter_time,
+            "iteration":             iteration,
+            "loss":                  loss_val,
+            "mean_reward":           mean_r,
+            "std_reward":            std_r,
+            "batch_accuracy":        acc_r,
+            "n_groups":              n_groups,
+            "skipped_groups":        skipped,
+            "learning_rate":         _cur_lr,
+            "iter_time_s":           iter_time,
+            # ── Question-generation metrics ─────────────────────────────────
+            "n_self_play_groups":    n_self_play,
+            "q_gen_attempts":        q_gen_attempts,
+            "q_gen_valid":           q_gen_valid,
+            "q_gen_valid_rate":      round(q_gen_valid_rate, 4),
+            "mean_question_reward":  round(mean_q_r, 4),
+            "q_quality_rate":        round(q_quality_rate, 4),
+            "q_topic_match":         round(mean_q_topic,   4),
+            "q_difficulty_fit":      round(mean_q_diff,    4),
+            "q_clarity":             round(mean_q_clarity, 4),
+            "q_novelty":             round(mean_q_novelty, 4),
+            "q_solvability":         round(mean_q_solvab,  4),
         }
 
         # --- Eval ---
