@@ -114,13 +114,18 @@ LOG_FILE="$LOG_DIR/${RUN_NAME}.log"
 echo "[launch] run_name = $RUN_NAME"
 echo "[launch] log_file = $LOG_FILE"
 
-# ── Smoke test ───────────────────────────────────────────────────────────
+# ── Smoke test (15 samples, 2 iters, ~3 min) ─────────────────────────────
 #
 #   bash launch_grpo.sh \
 #     --num-iterations 2 --questions-per-iter 4 --group-size 4 \
-#     --max-new-tokens 128 --eval-every 100 --save-every 0 \
-#     --skip-initial-eval --no-prm --kl-coef 0 --math-mix-ratio 0 \
-#     --run-name smoke_grpo
+#     --max-new-tokens 128 --eval-every 1 --eval-max-samples 15 \
+#     --eval-max-new-tokens 256 --save-every 0 --keep-last 0 \
+#     --math-mix-ratio 0 --self-play-ratio 0 \
+#     --output-dir checkpoints/grpo_smoke --run-name smoke
+#
+#   Plots are auto-saved to checkpoints/grpo_smoke/smoke/plots/ after training.
+#   Generate from an existing run at any time:
+#     python scripts/plot_grpo_run.py --latest
 #
 # ── Train ────────────────────────────────────────────────────────────────
 #

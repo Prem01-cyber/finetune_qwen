@@ -1740,6 +1740,29 @@ def main() -> None:
     )
     logger.info("Summary written to %s", log_dir / "summary.json")
 
+    # ── Auto-generate demo plots ───────────────────────────────────────────────
+    _metrics_jsonl = out_dir / "metrics.jsonl"
+    if _metrics_jsonl.exists():
+        try:
+            import importlib
+            if importlib.util.find_spec("matplotlib") is None:
+                logger.warning(
+                    "matplotlib not installed — skipping auto-plot. "
+                    "Install with: pip install matplotlib  then run: "
+                    "python scripts/plot_grpo_run.py %s",
+                    _metrics_jsonl,
+                )
+            else:
+                from scripts.plot_grpo_run import generate_plots as _gen_plots
+                _plot_dir = _gen_plots(_metrics_jsonl)
+                logger.info("Plots saved → %s", _plot_dir)
+        except Exception as _plot_exc:
+            logger.warning(
+                "Plot generation failed (%s: %s). "
+                "Run manually: python scripts/plot_grpo_run.py %s",
+                type(_plot_exc).__name__, _plot_exc, _metrics_jsonl,
+            )
+
     # Explicit teardown (atexit is the safety net for crashes; calling here
     # ensures everything is flushed and closed before the process returns
     # normally — atexit won't double-close because _teardown_logging is
