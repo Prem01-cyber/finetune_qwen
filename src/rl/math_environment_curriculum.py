@@ -223,22 +223,38 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         question_reward = float(question_result["overall_score"])
         solution_reward = float(solution_result["combined_score"])
-        # Q/Sol = 0.4/0.6 (was 0.3/0.7): gives the policy nearly 2× more
-        # gradient on question-generation without sacrificing the solution
-        # signal.  This is the "Self-Improvement" half of the loop — the
-        # model must learn to produce good problems, not just solve them.
-        base_combined_score = 0.4 * question_reward + 0.6 * solution_reward
+        format_score = float(solution_result["format_score"])
+        # Gate the question reward on having a parseable solution: reward
+        # shape is not supposed to praise a nice-looking question paired
+        # with a broken solution.  We treat "consensus reached" as the
+        # non-PRM analogue of "PRM succeeded" here.
+        sol_valid = bool(consensus_info.get("has_majority", False))
+        effective_question_reward = question_reward if sol_valid else 0.0
+
+        # Q/Sol = 0.4/0.6 (was 0.3/0.7).
+        base_combined_score = (
+            0.4 * effective_question_reward + 0.6 * solution_reward
+        )
+
+        # Format floor (mirrors the PRM path): broken structure caps the
+        # reward at 0.3 regardless of how the consensus scored.
+        format_floor_active = format_score < 0.5
+        format_cap = 0.3 if format_floor_active else 1.0
+        base_combined_score = min(base_combined_score, format_cap)
+
         expert_adjustment = self.expert_panel.apply_expert_preferences(
             base_reward=base_combined_score,
             question_metrics=question_result,
             solution_metrics={
-                "correctness": solution_result["sympy_score"],
-                "consensus_score": solution_result["consensus_score"],
-                "format_compliance": solution_result["format_score"],
+                # Shaping now keys on format only — correctness/consensus
+                # already live inside ``solution_reward`` so feeding them
+                # back in would double-count.
+                "format_compliance": format_score,
             },
             iteration=self.curriculum_manager.current_iteration,
         )
         combined_score = float(expert_adjustment["adjusted_reward"])
+        combined_score = max(0.0, min(format_cap, combined_score))
 
         solution_success = bool(consensus_info.get("has_majority", False)) and bool(
             consensus_info.get("primary_matches_majority", False)
@@ -319,13 +335,21 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         prm_degraded = bool(prm_result.get("degraded", False))
 
         # If the PRM degraded (empty solution, tokeniser mismatch, truncation),
-        # fall back to SymPy+format so we never emit a NaN reward.  The
-        # degraded flag is logged so we can track frequency.
+        # the output is effectively unparseable.  Prior behavior was to fall
+        # back on SymPy+format, but the upstream ``base_combined_score`` also
+        # blends in the question reward — so the policy got a positive signal
+        # for producing a broken solution as long as the *question* looked
+        # fine.  We now treat a degraded PRM as a hard zero on the solution
+        # reward; the question reward is gated below so the full combined
+        # score also collapses.
         if prm_degraded or prm_num_steps == 0:
-            solution_reward = 0.6 * sympy_score + 0.4 * format_score
+            solution_reward = 0.0
+            sol_valid = False
             logger.info(
-                "PRM degraded (%s); falling back to SymPy/format. sol_reward=%.3f",
-                prm_result.get("degraded_reason", "unknown"), solution_reward,
+                "PRM degraded (%s); sol_reward set to 0.0 (sympy=%.2f, format=%.2f).",
+                prm_result.get("degraded_reason", "unknown"),
+                sympy_score,
+                format_score,
             )
         else:
             solution_reward = (
@@ -334,6 +358,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 + 0.15 * sympy_score
                 + 0.10 * format_score
             )
+            sol_valid = True
         solution_reward = max(0.0, min(1.0, solution_reward))
 
         question_result = self.question_evaluator.evaluate(
@@ -355,21 +380,42 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         )
         question_reward = float(question_result["overall_score"])
 
+        # Gate the question-quality bonus on having a parseable solution.
+        # A great-looking question with a broken solution is not progress
+        # toward self-improvement — it's the policy gaming whichever
+        # signal is easier to produce.
+        effective_question_reward = question_reward if sol_valid else 0.0
+
         # Q/Sol = 0.4/0.6 — see note in compute_reward (non-PRM path).
-        # The self-improvement theme requires the policy to be graded on
-        # the quality of the questions it generates, not just on solutions.
-        base_combined_score = 0.4 * question_reward + 0.6 * solution_reward
+        base_combined_score = (
+            0.4 * effective_question_reward + 0.6 * solution_reward
+        )
+
+        # Format floor: if the solution structure is broken (<0.5 format),
+        # cap the overall reward at 0.3 regardless of how much the PRM
+        # likes the prose.  Previously we saw combined=0.83 with
+        # Format=0.30, i.e. the PRM "approved" an output that didn't have
+        # parseable Step/Final Answer lines — pure reward hacking.
+        format_floor_active = format_score < 0.5
+        format_cap = 0.3 if format_floor_active else 1.0
+        base_combined_score = min(base_combined_score, format_cap)
+
         expert_adjustment = self.expert_panel.apply_expert_preferences(
             base_reward=base_combined_score,
             question_metrics=question_result,
             solution_metrics={
-                "correctness": prm_mean,        # PRM is our best correctness proxy
-                "consensus_score": prm_mean,    # kept for legacy keys
+                # Only format_compliance still influences shaping — the
+                # PRM/correctness signal lives inside ``solution_reward``
+                # already and must not be double-counted here.
                 "format_compliance": format_score,
             },
             iteration=self.curriculum_manager.current_iteration,
         )
         combined_score = float(expert_adjustment["adjusted_reward"])
+        # Re-clip after additive shaping + respect the format cap one more
+        # time so the shaping can't lift a badly-formatted solution back
+        # above the cap.
+        combined_score = max(0.0, min(format_cap, combined_score))
 
         # Treat "policy produced solid per-step correctness" as success
         # for curriculum mastery tracking.
@@ -382,12 +428,28 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             measured_difficulty=float(question_result["measured_difficulty"]),
         )
 
+        modifier_val = float(expert_adjustment.get("reward_modifier", 0.0))
+        floor_tag = " FLOOR" if format_floor_active else ""
+        valid_tag = "" if sol_valid else " [SOL_INVALID]"
         logger.info(
-            "PRM reward: combined=%.3f | sol=%.3f = 0.55×PRM_mean(%.2f) + "
-            "0.20×PRM_min(%.2f) + 0.15×SymPy(%.2f) + 0.10×Format(%.2f) | "
-            "steps=%d final_step=%.2f",
-            combined_score, solution_reward, prm_mean, prm_min, sympy_score,
-            format_score, prm_num_steps, prm_final,
+            "PRM reward%s: combined=%.3f = clip(base=%.3f + mod=%+.3f, cap=%.2f)%s "
+            "| Q=%.2f sol=%.3f | "
+            "sol=0.55*PRM_mean(%.2f)+0.20*PRM_min(%.2f)+0.15*SymPy(%.2f)+0.10*Format(%.2f) "
+            "| steps=%d final_step=%.2f",
+            valid_tag,
+            combined_score,
+            base_combined_score,
+            modifier_val,
+            format_cap,
+            floor_tag,
+            effective_question_reward,
+            solution_reward,
+            prm_mean,
+            prm_min,
+            sympy_score,
+            format_score,
+            prm_num_steps,
+            prm_final,
         )
 
         # Shape a consensus-style verification_details dict so downstream
