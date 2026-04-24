@@ -183,7 +183,7 @@ python -u scripts/run_grpo_training.py \
     --base-model checkpoints/dual_task_v1 \
     --output-dir checkpoints/grpo \
     --gsm8k-data data/sft/gsm8k_sft.jsonl \
-    --eval-data-path data/sft/dual_task_val.jsonl \
+    --eval-data-path data/sft/gsm8k_test.jsonl \
     --num-iterations 100 \
     --group-size 8 \
     --questions-per-iter 16 \
@@ -196,7 +196,7 @@ python -u scripts/run_grpo_training.py \
     --warmup-iters 5 \
     --min-lr-ratio 0.1 \
     --difficulty-alpha 3.0 \
-    --self-play-ratio 0.35 \
+    --self-play-ratio 0.15 \
     --math-mix-ratio 0.3 \
     --math-max-difficulty 3 \
     --overlong-filter \
