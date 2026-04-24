@@ -155,6 +155,15 @@ echo "[launch] log_file = $LOG_FILE"
 #                             Level 3 ≈ AMC-10.  Levels 4-5 are too hard for a 1.5B
 #                             model to reliably get any reward signal from.
 #
+#   --self-play-ratio 0.3     30% of groups use SELF-PLAY: the model generates its own
+#                             question from a curriculum instruction, then solves it.
+#                             Reward = 0.40×question_quality + 0.60×solution_quality.
+#                             This is the core Theme #4 self-improvement loop — the model
+#                             is rewarded not only for solving correctly but for creating
+#                             well-formed, appropriately difficult, solvable challenges.
+#                             The remaining 70% use GROUNDED (dataset) questions with
+#                             gold-answer reward — the primary accuracy anchor.
+#
 #   --num-iterations 100      ~90s/iter on A100 → 100 iters ≈ 3.5 h total.
 #
 #   --eval-every 10           10 eval checkpoints over 100 iters.
@@ -180,6 +189,7 @@ python -u scripts/run_grpo_training.py \
     --warmup-iters 3 \
     --min-lr-ratio 0.1 \
     --difficulty-alpha 2.0 \
+    --self-play-ratio 0.3 \
     --math-mix-ratio 0.3 \
     --math-max-difficulty 3 \
     --overlong-filter \

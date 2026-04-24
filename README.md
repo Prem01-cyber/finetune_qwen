@@ -4,6 +4,10 @@
 > A self-improving reinforcement learning system where a language model generates
 > math challenges, solves them, and learns from multi-signal verification-driven rewards.
 
+> **📘 Non-technical overview?** See **[README_OVERVIEW.md](README_OVERVIEW.md)** —
+> a plain-language walkthrough of what this project does and why it matters,
+> without any RL / math jargon.
+
 ---
 
 ## Table of Contents
@@ -14,6 +18,12 @@
 4. [GRPO Advanced Features](#4-grpo-advanced-features)
 5. [PPO Path (original)](#5-ppo-path-original)
 6. [System Architecture](#6-system-architecture)
+   - 6.1 [End-to-End Architecture and Dataflow](#61-end-to-end-architecture-and-dataflow)
+   - 6.2 [Reward Computation Graph](#62-reward-computation-graph)
+   - 6.3 [Curriculum Control Flow](#63-curriculum-control-flow)
+   - 6.4 [GRPO Training Loop — Step-by-Step](#64-grpo-training-loop--step-by-step)
+   - 6.5 [RL Validation / Evaluation Flow](#65-rl-validation--evaluation-flow)
+   - 6.6 [GRPO Iteration Timing Breakdown](#66-grpo-iteration-timing-breakdown)
 7. [Mathematical Foundation](#7-mathematical-foundation)
 8. [Reward System](#8-reward-system)
 9. [Curriculum Learning](#9-curriculum-learning)
@@ -364,70 +374,378 @@ Any checkpoint produced before these fixes is equivalent to the SFT baseline:
 
 ## 6. System Architecture
 
-### 6.1 End-to-End Dataflow
+This section documents the complete system. Every diagram is a faithful
+map of code in the repository — every node corresponds to at least one
+module under `src/rl/`, `src/self_play/`, `src/openenv/`, or `scripts/`.
+
+### 6.1 End-to-End Architecture and Dataflow
+
+The complete pipeline wires four layers together:
+**(A)** the policy interaction layer that generates challenges and solutions,
+**(B)** the verification + scoring layer that turns raw text into a scalar reward,
+**(C)** the recursive memory layer that keeps high-quality trajectories around
+for later replay (PPO) or difficulty-adaptive resampling (GRPO),
+and **(D)** the learning layer that applies the gradient step.
 
 ```mermaid
 flowchart TD
-    subgraph A["Policy Layer"]
-        CSEL[Curriculum selector<br/>topic + difficulty]
-        QGEN[Question generation]
-        SGEN[Solution generation × K]
-        TRAJ[Trajectories]
+    subgraph A["A — Policy Interaction Layer"]
+        I[Instruction seed]:::core
+        CSEL[Curriculum selector<br/>topic + target difficulty]:::core
+        QGEN[Question generation phase]:::core
+        SGEN[Solution generation phase<br/>× K solutions in GRPO]:::core
+        TRAJ[Trajectory with token-level transitions]:::core
     end
 
-    subgraph B["Verification & Reward Layer"]
-        PRM[Qwen2.5-Math-PRM-7B<br/>per-step scores]
-        SYM[SymPy step verifier]
-        GT[GSM8K gold-anchor]
-        FMT[Format scorer]
-        REW[Reward combiner<br/>0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format]
+    subgraph B["B — Verification and Scoring Layer"]
+        QCLS[Question classifier<br/>topic + confidence]:::reward
+        QEVAL[Question quality evaluator<br/>topic, difficulty, clarity,<br/>novelty, solvability]:::reward
+        PRM[Qwen2.5-Math-PRM-7B<br/>per-step correctness prob]:::reward
+        TV[Triple verifier N=3<br/>legacy fallback when --no-prm]:::reward
+        SYM[Symbolic arithmetic verifier<br/>SymPy step-by-step]:::reward
+        CONS[Consensus voting + strength<br/>fallback only]:::reward
+        GT[GSM8K / MATH gold-answer check<br/>grounded rollouts only]:::reward
+        SOL[Solution score aggregator<br/>0.55·PRM_mean + 0.20·PRM_min<br/>+ 0.15·SymPy + 0.10·Format]:::reward
+        BASE[Base reward combiner<br/>self-play: 0.4·Q + 0.6·S<br/>grounded: 0.60·correct + 0.15·PRM<br/>+ 0.15·SymPy + 0.10·Format]:::reward
+        EXP[Simulated expert panel<br/>phase-conditioned modifier<br/>m ∈ −0.3..0.3]:::reward
+        FINAL[Final clipped reward R ∈ 0..1]:::reward
     end
 
-    subgraph C["GRPO Optimiser"]
-        ADV[Group z-score advantages<br/>A_i = (R_i - mean) / std]
-        ISCLIP[IS clip ratio ε=0.2]
-        KL[KL penalty vs ref policy β=0.04]
-        GRAD[AdamW step + LR schedule]
+    subgraph C["C — Recursive Memory / Sampling Layer"]
+        QF[Quality gate<br/>R ≥ 0.7 + SymPy ok + consensus]:::memory
+        NOV{Novel enough?<br/>trigram Jaccard ≥ 0.7}:::decision
+        RB[Generational replay buffer<br/>PPO only — capacity 500]:::memory
+        MIX[Fresh / replay mixer<br/>PPO adaptive ratio]:::memory
+        DSAMP[Difficulty-adaptive sampler<br/>GRPO — weight ∝ p·&#40;1−p&#41;^α]:::memory
+        MATHDS[MATH dataset mixer<br/>30% MATH + 70% GSM8K]:::memory
     end
 
-    subgraph D["Curriculum & Sampling"]
-        DIFF[Difficulty-adaptive sampling<br/>α=2.0]
-        OVL[Overlong filter]
-        MATH[MATH dataset 30% mix]
+    subgraph D["D — Learning Layer"]
+        PPO_BOX["PPO path<br/>GAE advantages → clipped policy + value<br/>KL early-stop + replay buffer"]:::core
+        GRPO_BOX["GRPO path (recommended)<br/>group z-score advantages<br/>IS clip ratio ε=0.2<br/>ref-policy KL β=0.04<br/>single AdamW step / iter"]:::core
+        MET[Metrics + observability<br/>metrics.jsonl / console / best_policy]:::core
     end
 
+    I --> CSEL
     CSEL --> QGEN
     QGEN --> SGEN
-    SGEN --> PRM & SYM & GT & FMT
-    PRM & SYM & GT & FMT --> REW
-    REW --> ADV
-    ADV --> ISCLIP --> KL --> GRAD
-    GRAD --> CSEL
-    DIFF --> QGEN
-    MATH --> QGEN
-    SGEN --> OVL --> ADV
+    SGEN --> TRAJ
+
+    QGEN --> QCLS
+    QCLS --> QEVAL
+    SGEN --> PRM
+    SGEN --> SYM
+    SGEN --> GT
+    SGEN --> TV
+    TV --> CONS
+    PRM --> SOL
+    SYM --> SOL
+    CONS --> SOL
+    GT --> SOL
+    QEVAL --> BASE
+    SOL --> BASE
+    BASE --> EXP
+    EXP --> FINAL
+    FINAL --> TRAJ
+
+    TRAJ --> QF
+    QF --> NOV
+    NOV -- yes --> RB
+    NOV -- no --> MET
+
+    RB --> MIX
+    TRAJ --> MIX
+    MIX --> PPO_BOX
+    TRAJ --> GRPO_BOX
+    DSAMP --> QGEN
+    MATHDS --> QGEN
+
+    PPO_BOX --> MET
+    GRPO_BOX --> MET
+
+    PPO_BOX  -. improved policy .-> QGEN
+    GRPO_BOX -. improved policy .-> QGEN
+    MET -. curriculum feedback .-> CSEL
+    MET -. expert phase progression .-> EXP
+    MET -. replay / sampler adaptation .-> MIX
+    MET -. per-question win-rate .-> DSAMP
+
+    classDef core    fill:#e8f4fd,stroke:#1e88e5,stroke-width:2px,color:#000
+    classDef reward  fill:#fff7e6,stroke:#f57c00,stroke-width:2px,color:#000
+    classDef memory  fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#000
+    classDef decision fill:#fce4ec,stroke:#c2185b,stroke-width:2px,color:#000
 ```
 
-### 6.2 Reward Computation
+### 6.2 Reward Computation Graph
 
-Two reward paths feed the same optimiser:
+Two reward paths feed the same optimizer: **self-play** (the policy
+generates both the question and the solution — PPO default) and
+**grounded** (the policy solves a real GSM8K or MATH problem and is
+scored against its gold final answer — GRPO default).
 
 ```mermaid
 flowchart TD
-    subgraph SP["Self-play path (optional, default off in GRPO)"]
-        QM[Question quality<br/>topic + clarity + novelty]
-        SP_SOL[0.55×PRM_mean + 0.20×PRM_min<br/>+ 0.15×SymPy + 0.10×Format]
-        RBASE_SP[R_base = 0.4×Q + 0.6×S]
+    subgraph SP["Self-play path (70% of PPO batch by default)"]
+        QM[Question metrics:<br/>topic match, difficulty fit,<br/>clarity, novelty, solvability]
+        SP_SOL[Solution metrics:<br/>0.55·PRM_mean + 0.20·PRM_min<br/>+ 0.15·SymPy + 0.10·Format]
+        QAGG[Q aggregate]
+        SAGG_SP[S aggregate]
+        RBASE_SP[R_base = 0.4·Q + 0.6·S]
     end
 
-    subgraph GR["Grounded path (GSM8K + MATH)"]
-        GT_MATCH[gt_match = 1 iff pred == gold]
-        GR_SOL[0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×Format]
+    subgraph GR["Grounded path (30% of PPO batch, 100% of GRPO)"]
+        GT_MATCH[gt_match = 1 iff model's<br/>Final Answer ≡ gold &#40;SymPy&#41;]
+        GR_SOL[R_sol = 0.60·gt_match<br/>+ 0.15·PRM_mean<br/>+ 0.15·SymPy + 0.10·Format]
+        RBASE_GR[R_base = R_sol<br/>no question reward on grounded]
     end
 
-    GR_SOL --> RF[R_final]
-    RBASE_SP --> RF
+    PHASE[Expert phase selection<br/>pedagogy → accuracy → challenge]
+    MOD[reward modifier in −0.3..0.3]
+    CLAMP[clip to 0, 1]
+    RF[R_final]
+
+    QM --> QAGG
+    SP_SOL --> SAGG_SP
+    QAGG --> RBASE_SP
+    SAGG_SP --> RBASE_SP
+    GT_MATCH --> GR_SOL
+    GR_SOL --> RBASE_GR
+    RBASE_SP --> PHASE
+    RBASE_GR --> PHASE
+    PHASE --> MOD
+    MOD --> CLAMP
+    CLAMP --> RF
 ```
+
+### 6.3 Curriculum Control Flow
+
+The curriculum state machine (PPO path) owns per-topic success rates
+and difficulty targets, driving the next-topic selection with a
+Goldilocks sweet-spot policy.
+
+```mermaid
+flowchart TD
+    PERF[Per-topic performance state]
+    SEL[Compute topic probabilities]
+    SS{In sweet spot<br/>0.4 to 0.7?}:::decision
+    DIFF{Success too high<br/>or too low?}:::decision
+    RET{Retention due?}:::decision
+    FAIL{Persistent failures?}:::decision
+    ADJ[Adjust difficulty target]
+    STALE[Apply staleness/diversity weighting]
+    RETACT[Retention intervention]
+    RESET[Emergency reset / pause policy]
+    NEXT[Next topic + difficulty]
+
+    PERF --> SEL
+    SEL --> STALE
+    STALE --> SS
+    SS --> DIFF
+    DIFF -- yes --> ADJ
+    DIFF -- no --> NEXT
+    ADJ --> RET
+    RET -- yes --> RETACT
+    RET -- no --> FAIL
+    RETACT --> FAIL
+    FAIL -- yes --> RESET
+    FAIL -- no --> NEXT
+    RESET --> NEXT
+
+    classDef decision fill:#fce4ec,stroke:#c2185b,stroke-width:2px,color:#000
+```
+
+### 6.4 GRPO Training Loop — Step-by-Step
+
+This is the exact control flow implemented in `scripts/run_grpo_training.py::main()`.
+Each box maps to a code section; the numbers in parentheses match the
+iteration log messages you see on the console.
+
+```mermaid
+flowchart TD
+    START([bash launch_grpo.sh])
+    PRE[Pre-flight: nvidia-smi<br/>ENV vars: PYTORCH_CUDA_ALLOC_CONF,<br/>OMP_NUM_THREADS, HF_HUB_ENABLE_HF_TRANSFER]
+    LOG[Set up logging:<br/>TeeStream stdout/stderr → file<br/>FileHandler on root logger<br/>config.json snapshot]
+
+    subgraph INIT["ONE-TIME INITIALISATION"]
+        LOAD_TOK[Load tokenizer<br/>Copy chat_template from base model<br/>if missing &#40;adapter checkpoints&#41;]
+        LOAD_MODEL[Load policy model<br/>• PEFT adapter → merge_and_unload&#40;&#41;<br/>• Re-enable requires_grad &#40;PEFT bug fix&#41;<br/>• Flash-Attn 2 auto-select]
+        LOAD_REF[Deep-copy frozen reference policy<br/>if kl_coef &gt; 0]
+        LOAD_DATA[Load GSM8K 8792 QA pairs<br/>+ MATH dataset &#40;qwedsacf/competition_math&#41;<br/>filter difficulty ≤ 3, numeric only]
+        LOAD_PRM[Load Qwen2.5-Math-PRM-7B<br/>4-bit bitsandbytes ~7 GB VRAM]
+        LOAD_ENV[Instantiate CurriculumMathEnvironment<br/>value_model=None &#40;no critic needed&#41;]
+        SCHED[Set up AdamW + SequentialLR:<br/>LinearLR warmup &#40;3 iters&#41;<br/>→ CosineAnnealingLR &#40;min=0.1×lr&#41;]
+    end
+
+    subgraph EVAL0["INITIAL EVALUATION &#40;iter 0&#41;"]
+        EVAL0_RUN[evaluate_gsm8k<br/>N=250 samples, greedy decoding<br/>apply_chat_template + extract Final Answer]
+        BASELINE[Record best_accuracy = eval_0]
+    end
+
+    subgraph ITER["PER-ITERATION LOOP &#40;N iterations&#41;"]
+        SAMP[1&#41; Sample questions_batch<br/>difficulty-adaptive weighting<br/>w ∝ p·&#40;1−p&#41;^α across win-rate]
+        GEN[2&#41; Batched generation<br/>1 × model.generate&#40;num_return_sequences=K&#41;<br/>K solutions per question in parallel]
+        OLP[3&#41; Compute old_log_probs<br/>single batched forward pass<br/>stored for IS clip ratio]
+        OVL_F[4&#41; Overlong filter<br/>drop solutions at max_new_tokens<br/>skip group if all K truncated]
+        REW_C[5&#41; Reward computation per solution<br/>CurriculumMathEnvironment.compute_grounded_reward<br/>0.60·correct + 0.15·PRM + 0.15·SymPy + 0.10·Format]
+        ADV_C[6&#41; Group z-score advantages<br/>A_i = &#40;R_i − mean&#41; / &#40;std + 1e-8&#41;<br/>skip group if std &lt; 1e-8<br/>clip to −5..5]
+        LOSS[7&#41; GRPO loss per group<br/>L = −Σ A_i · min&#40;ρ, clip&#40;ρ, 1±ε&#41;&#41;<br/>+ β · KL&#40;π_θ ‖ π_ref&#41;]
+        BWD[8&#41; group_loss.backward&#40;&#41;<br/>accumulate gradients across groups]
+        NORM[9&#41; Normalise by N_groups<br/>avoids OOM from summed graphs]
+        CLIP[10&#41; clip_grad_norm_ max_grad_norm=0.5]
+        OPT[11&#41; optimizer.step&#40;&#41; + zero_grad&#40;&#41;<br/>scheduler.step&#40;&#41;]
+        WR_UPDATE[12&#41; Update per-question win-rate<br/>track wins, attempts for next sample]
+        LOG_IT[13&#41; Write metrics.jsonl row<br/>loss, reward, batch_acc, lr, time]
+    end
+
+    subgraph EVALN["PERIODIC EVALUATION"]
+        EVAL_COND{iter % eval_every == 0?}
+        EVAL_RUN[evaluate_gsm8k<br/>N=eval_max_samples]
+        BEST_CHECK{eval &gt; best_accuracy?}
+        SAVE_BEST[Save model to best_policy/<br/>full-weight save]
+        SAVE_ITER[Save model to iter_NNNN/<br/>prune old: keep_last=3]
+    end
+
+    END_OK[summary.json written<br/>teardown logging<br/>remove handlers, close files]
+    END([Run complete])
+
+    START --> PRE --> LOG
+    LOG --> LOAD_TOK --> LOAD_MODEL --> LOAD_REF --> LOAD_DATA --> LOAD_PRM --> LOAD_ENV --> SCHED
+    SCHED --> EVAL0_RUN --> BASELINE
+    BASELINE --> SAMP
+    SAMP --> GEN --> OLP --> OVL_F --> REW_C --> ADV_C --> LOSS --> BWD
+    BWD -->|accumulate over all groups| BWD
+    BWD --> NORM --> CLIP --> OPT --> WR_UPDATE --> LOG_IT
+    LOG_IT --> EVAL_COND
+    EVAL_COND -- no --> ITER_CHECK{more iters?}
+    EVAL_COND -- yes --> EVAL_RUN --> BEST_CHECK
+    BEST_CHECK -- yes --> SAVE_BEST --> SAVE_ITER
+    BEST_CHECK -- no --> SAVE_ITER
+    SAVE_ITER --> ITER_CHECK
+    ITER_CHECK -- yes --> SAMP
+    ITER_CHECK -- no --> END_OK --> END
+
+    style START fill:#c8e6c9,stroke:#2e7d32
+    style END fill:#c8e6c9,stroke:#2e7d32
+    style EVAL0_RUN fill:#fff7e6,stroke:#f57c00
+    style EVAL_RUN fill:#fff7e6,stroke:#f57c00
+    style SAVE_BEST fill:#b2dfdb,stroke:#00695c
+    style SAVE_ITER fill:#b2dfdb,stroke:#00695c
+```
+
+**Where each step lives in code** (`scripts/run_grpo_training.py`):
+
+| Step | Function |
+|---|---|
+| 1 — Sample questions | `_sample_by_difficulty(qa_pairs, N, alpha)` |
+| 2 — Batched generation | `generate_solutions_batched(model, tokenizer, prompt, K)` |
+| 3 — Old log-probs | Inside `generate_solutions_batched` — single batched forward pass |
+| 4 — Overlong filter | `if args.overlong_filter:` block in main loop |
+| 5 — Reward | `math_env.compute_grounded_reward(question, solution, gold)` |
+| 6 — Advantages | Inline `(r - mean) / (std + 1e-8)` then `np.clip(-5, 5)` |
+| 7 — Loss | `grpo_loss_for_group(..., clip_eps, kl_coef, ref_model)` |
+| 8–11 — Backward & step | `group_loss.backward()` → normalise → clip → `optimizer.step()` |
+| 12 — Win-rate update | `_q_wins[q] += int(correct)`, `_q_attempts[q] += 1` |
+| 13 — Metrics | `_append_metrics_csv({...})` writes one JSON row to `metrics.jsonl` |
+
+### 6.5 RL Validation / Evaluation Flow
+
+Validation runs at two touchpoints: **iter 0** (baseline)
+and **every `--eval-every` iterations** thereafter.
+The best checkpoint across the whole run is kept in `best_policy/`.
+
+```mermaid
+flowchart TD
+    TRIG[Training iteration complete]
+    COND{iteration % eval_every == 0?}
+    SKIP[Skip — continue training]
+
+    subgraph EV["GSM8K Evaluation &#40;scripts/eval_sft_inference.py&#41;"]
+        LOAD_EVAL[Load eval problems<br/>N = eval_max_samples &#40;default 250&#41;]
+        LOOP_Q[For each question q]
+        BUILD_P[Build prompt via<br/>tokenizer.apply_chat_template&#40;&#41;<br/>→ system + user message]
+        GREEDY[model.generate&#40;&#41;<br/>do_sample=False &#40;greedy&#41;<br/>max_new_tokens=512<br/>stop on &lt;|im_end|&gt; / eos]
+        DECODE[Decode response tokens<br/>skip_special_tokens=True]
+        EXTRACT[extract_final_answer_numeric_str&#40;&#41;<br/>regex + SymPy normalisation]
+        NORM[Normalise pred and gold:<br/>strip $, commas<br/>int if &#40;f.is_integer&#40;&#41;&#41; else float]
+        SYMPYEQ[sympy.simplify&#40;pred − gold&#41; == 0<br/>handles 1.5 ≡ 3/2 ≡ $1.50]
+        ACC[Accumulate correct / total]
+    end
+
+    RESULT[Iteration eval_accuracy]
+    IMPROVE{eval_acc &gt; best_accuracy?}
+    SAVE_BEST[Save full-weight to best_policy/<br/>update best_accuracy]
+    SAVE_CKPT[Save iter_NNNN/ checkpoint<br/>prune to keep_last]
+    LOG_M[Append accuracy to metrics.jsonl<br/>write summary.json]
+    CONT[Continue training]
+
+    TRIG --> COND
+    COND -- no --> SKIP --> CONT
+    COND -- yes --> LOAD_EVAL --> LOOP_Q
+    LOOP_Q --> BUILD_P --> GREEDY --> DECODE --> EXTRACT --> NORM --> SYMPYEQ --> ACC
+    ACC --> LOOP_Q
+    LOOP_Q -->|all done| RESULT
+    RESULT --> IMPROVE
+    IMPROVE -- yes --> SAVE_BEST --> SAVE_CKPT
+    IMPROVE -- no --> SAVE_CKPT
+    SAVE_CKPT --> LOG_M --> CONT
+
+    style TRIG fill:#e3f2fd,stroke:#1565c0
+    style RESULT fill:#fff7e6,stroke:#f57c00
+    style SAVE_BEST fill:#b2dfdb,stroke:#00695c
+```
+
+**Why greedy decoding (and not sampling) during evaluation:**
+
+1. **Reproducibility.** `do_sample=False` gives byte-identical output for the
+   same prompt + model, so "better accuracy" means the model, not the RNG.
+2. **Benchmark parity.** This is the standard GSM8K evaluation protocol
+   (greedy, T=0), so our numbers are directly comparable to upstream results.
+3. **Cheap.** No sampling, no nucleus filtering — just argmax of logits.
+
+**Answer extraction** is deliberately permissive so the training reward and
+the eval accuracy disagree only on *actual reasoning errors*, not on
+formatting edge cases:
+
+| Input | Extracted | Normalised |
+|---|---|---|
+| `"...Final Answer: 42"` | `42` | `42` |
+| `"Final Answer: $8.40"` | `8.40` | `8.4` |
+| `"The answer is 1,200."` | `1,200` | `1200` |
+| `"Final Answer: 3/2"` | `3/2` | `1.5` (via SymPy) |
+| `"Final Answer: 2.50"` | `2.50` | `2.5` |
+
+**Where eval lives in code:**
+- Top-level orchestration: `scripts/run_grpo_training.py::main()` — calls
+  `evaluate_gsm8k()` at iter 0 and every `args.eval_every` iterations.
+- Eval loop: `scripts/eval_sft_inference.py::evaluate_gsm8k()` — loads
+  problems, runs greedy gen per question, extracts + compares.
+- Answer extraction: `src/sft/solution_format.py::extract_final_answer_numeric_str()`.
+- SymPy normalisation: `src/sft/sympy_normalize.py`.
+
+### 6.6 GRPO Iteration Timing Breakdown
+
+Observed on the `smoke_grpo_full` run, A100 80 GB PCIe, K=4, 8 q/iter,
+max_new_tokens=256, PRM on. Times scale roughly linearly with K × q_per_iter × max_new_tokens.
+
+| Step | Wall-clock (K=4, 8 q, T=256) | Wall-clock (K=8, 16 q, T=512, defaults) |
+|---|---|---|
+| Sample + build prompts | <0.1 s | <0.1 s |
+| **Batched generation (8 × K × T tokens)** | ~3 s | ~20 s |
+| Batched old_log_probs | ~0.4 s | ~2 s |
+| Reward: PRM scoring (4-bit, CPU→GPU transfers) | ~1–2 s | ~6–10 s |
+| Reward: SymPy + format (pure Python) | ~0.5 s | ~1 s |
+| Loss + backward × N_groups | ~1 s | ~5 s |
+| Optimizer step + LR scheduler | <0.1 s | ~0.2 s |
+| Metrics write | <0.1 s | <0.1 s |
+| **Total / iter** | **~7–10 s** | **~35–50 s** |
+| **Total 100 iters (no eval)** | — | **~1 h** |
+| Add 10 × GSM8K eval (250 samples each) | — | **~2 h** |
+| **Full 100-iter run** | — | **~3 h** |
+
+Each GSM8K eval (250 samples) takes ~10 minutes, dominated by greedy
+generation on the policy. This is the single largest consumer of wall-clock
+after generation itself, which is why `--eval-every 10` is the default
+(1 eval per ~35 min of training) rather than the more conservative `5`.
 
 ---
 

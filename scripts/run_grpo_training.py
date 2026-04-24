@@ -345,7 +345,9 @@ def compute_grounded_reward(
     gold_final: str,
     math_env: CurriculumMathEnvironment,
 ) -> float:
-    """Thin wrapper re-using the existing reward pipeline.
+    """Score a solution against a known gold answer (grounded path).
+
+    Reward breakdown: 0.60×correct + 0.15×PRM_mean + 0.15×SymPy + 0.10×format.
     PRM is handled inside math_env (loaded at startup); no need to pass it here.
     """
     result = math_env.compute_grounded_reward(
@@ -354,6 +356,94 @@ def compute_grounded_reward(
         gold_final=gold_final,
     )
     return float(result["combined_score"])
+
+
+def compute_self_play_reward(
+    question: str,
+    solution: str,
+    target_topic: str,
+    target_difficulty: float,
+    math_env: CurriculumMathEnvironment,
+) -> Tuple[float, float, float]:
+    """Score a self-generated question + solution (self-play path).
+
+    Returns (combined_reward, question_reward, solution_reward).
+
+    Reward breakdown: R = 0.40×question_quality + 0.60×solution_quality,
+    where question_quality captures topic match, difficulty fit, clarity,
+    novelty, and solvability — completing the Theme #4 self-improvement loop
+    where the model is rewarded for generating *good challenges*, not only
+    for solving them.
+    """
+    result = math_env.compute_reward(
+        question=question,
+        solution=solution,
+        target_topic=target_topic,
+        target_difficulty=target_difficulty,
+    )
+    combined  = float(result["combined_score"])
+    q_reward  = float(result.get("question_reward", 0.0))
+    sol_score = result.get("solution_metrics", {})
+    s_reward  = float(sol_score.get("overall_score", 0.0)) if isinstance(sol_score, dict) else 0.0
+    return combined, q_reward, s_reward
+
+
+@torch.no_grad()
+def generate_question(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    instruction: str,
+    max_new_tokens: int,
+    device: torch.device,
+) -> str:
+    """Generate a math question from a curriculum instruction.
+
+    The instruction (e.g. "Create a 2-step word problem about money in a
+    shopping context") is formatted with the chat template so the SFT-trained
+    model responds in its expected style.
+
+    Returns the raw decoded question text (no special tokens).
+    """
+    system = (
+        "You are a math problem creator. "
+        "Given an instruction, write a clear, solvable math word problem. "
+        "Write only the problem statement — no solution, no explanation."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": instruction},
+    ]
+    try:
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:
+        prompt = f"{system}\n\n{instruction}\n"
+
+    enc = tokenizer(
+        prompt, return_tensors="pt", truncation=True, max_length=512
+    ).to(device)
+    prompt_len = enc["input_ids"].shape[1]
+
+    stop_ids: List[int] = []
+    if tokenizer.eos_token_id is not None:
+        stop_ids.append(tokenizer.eos_token_id)
+    im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if isinstance(im_end, int) and im_end not in stop_ids:
+        stop_ids.append(im_end)
+
+    out = model.generate(
+        input_ids=enc["input_ids"],
+        attention_mask=enc["attention_mask"],
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=0.9,   # slightly higher than solutions for diversity
+        top_p=0.95,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        eos_token_id=stop_ids or None,
+        use_cache=True,
+    )
+    return tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +821,17 @@ def main() -> None:
         help="Keep only the last K iter_* checkpoints on disk (0 = keep all). "
              "best_policy/ is never pruned.",
     )
+    parser.add_argument(
+        "--self-play-ratio", type=float, default=0.3,
+        help="Fraction of each question batch that uses SELF-PLAY (model generates the "
+             "question from a curriculum instruction, then solves it, rewarded on "
+             "0.40 × question_quality + 0.60 × solution_quality). "
+             "The remaining (1 - ratio) uses GROUNDED questions from GSM8K / MATH with "
+             "gold-answer reward. "
+             "0.0 = fully grounded (original behaviour), 1.0 = fully self-play. "
+             "Default 0.3 — mirrors the PPO default of 30%% grounded / 70%% self-play "
+             "(inverted here because grounded is our primary accuracy signal).",
+    )
     args = parser.parse_args()
 
     # ── Run identity ─────────────────────────────────────────────────────────
@@ -836,12 +937,14 @@ def main() -> None:
     logger.info(
         "Run config: K=%d N=%d lr=%.1e T=%.2f max_new=%d | "
         "clip_eps=%.2f kl_coef=%.4f warmup=%d | diff_alpha=%.1f | "
+        "self_play=%.0f%% grounded=%.0f%% | "
         "math_mix=%.0f%% math_maxdiff=%d | overlong_filter=%s | "
         "eval_every=%d eval_N=%d | grad_clip=%.2f save_every=%d keep_last=%d",
         args.group_size, args.questions_per_iter, args.learning_rate,
         args.temperature, args.max_new_tokens,
         args.clip_eps, args.kl_coef, args.warmup_iters,
         args.difficulty_alpha,
+        100 * args.self_play_ratio, 100 * (1 - args.self_play_ratio),
         100 * args.math_mix_ratio, args.math_max_difficulty,
         args.overlong_filter,
         args.eval_every, args.eval_max_samples,
@@ -1153,9 +1256,15 @@ def main() -> None:
         logger.info("LR this iteration: %.2e", cur_lr)
 
         all_rewards: List[float] = []
+        all_q_rewards: List[float] = []   # question_reward for self-play groups only
         skipped = 0
         n_groups = 0
+        n_self_play = 0
         total_loss_val = 0.0
+
+        # Determine how many of this iteration's groups use self-play question
+        # generation vs grounded (dataset) questions.
+        n_self_play_target = int(round(len(questions_batch) * args.self_play_ratio))
 
         # Zero gradients once before the loop — we accumulate them via
         # per-group .backward() calls instead of building one giant graph.
@@ -1167,9 +1276,43 @@ def main() -> None:
         optimizer.zero_grad()
 
         pbar = tqdm(questions_batch, desc=f"Iter {iteration} GRPO groups", unit="q")
-        for qa in pbar:
-            question = qa["question"]
-            gold = qa["gold_final"]
+        for _group_idx, qa in enumerate(pbar):
+
+            # ── Decide: self-play (model generates question) or grounded ─────
+            # First n_self_play_target groups use self-play; the rest use the
+            # grounded dataset question.  Interleaving is simple and stable.
+            use_self_play = (
+                args.self_play_ratio > 0.0
+                and n_self_play < n_self_play_target
+            )
+
+            if use_self_play:
+                # ── SELF-PLAY BRANCH ─────────────────────────────────────────
+                # 1. Sample a curriculum instruction (topic + difficulty target)
+                instruction, target_topic, target_difficulty = math_env.sample_instruction()
+
+                # 2. Model generates the question from the instruction.
+                #    This is the "proposer" role in Theme #4 self-improvement:
+                #    the model creates its own challenge.
+                question = generate_question(
+                    model=model,
+                    tokenizer=tokenizer,
+                    instruction=instruction,
+                    max_new_tokens=128,   # questions are short
+                    device=device,
+                )
+                if not question.strip():
+                    skipped += 1
+                    continue
+                n_self_play += 1
+                gold = None   # no gold answer — rewarded on question quality
+            else:
+                # ── GROUNDED BRANCH ──────────────────────────────────────────
+                # Use pre-existing dataset question with known gold answer.
+                question = qa["question"]
+                gold = qa["gold_final"]
+                target_topic = "grounded"
+                target_difficulty = 0.5
 
             # --- Generate K solutions (batched — single model.generate call) ---
             solution_prompt = math_env.format_solution_prompt(question)
@@ -1210,22 +1353,38 @@ def main() -> None:
                     skipped += 1
                     continue
 
-            # --- Score each solution ---
+            # --- Score each solution (self-play: Q+S reward; grounded: S only) ---
             rewards = []
             for sol in solutions:
-                r = compute_grounded_reward(
-                    question=question,
-                    solution=sol,
-                    gold_final=gold,
-                    math_env=math_env,
-                )
+                if use_self_play:
+                    # compute_reward = 0.40×question_quality + 0.60×solution_quality
+                    # This is the core Theme #4 signal: the model is rewarded
+                    # for generating a well-formed, appropriately difficult,
+                    # solvable question AND for solving it correctly.
+                    r, q_rew, _ = compute_self_play_reward(
+                        question=question,
+                        solution=sol,
+                        target_topic=target_topic,
+                        target_difficulty=target_difficulty,
+                        math_env=math_env,
+                    )
+                    all_q_rewards.append(q_rew)
+                else:
+                    r = compute_grounded_reward(
+                        question=question,
+                        solution=sol,
+                        gold_final=gold,
+                        math_env=math_env,
+                    )
                 rewards.append(r)
             all_rewards.extend(rewards)
 
-            # --- Update difficulty stats ---
-            _key = _question_key(question)
-            _q_attempts[_key] += len(solutions)
-            _q_wins[_key] += sum(1 for r in rewards if r > 0.5)
+            # --- Update difficulty stats (grounded questions only — self-play
+            #     questions are ephemeral and have no stable key) ---
+            if not use_self_play:
+                _key = _question_key(question)
+                _q_attempts[_key] += len(solutions)
+                _q_wins[_key] += sum(1 for r in rewards if r > 0.5)
 
             # --- GRPO loss (IS clip + optional KL penalty) + immediate backward ---
             group_loss = grpo_loss_for_group(
@@ -1281,13 +1440,18 @@ def main() -> None:
         mean_r = float(np.mean(all_rewards)) if all_rewards else 0.0
         std_r  = float(np.std(all_rewards)) if all_rewards else 0.0
         acc_r  = float(np.mean([r > 0.5 for r in all_rewards])) if all_rewards else 0.0
+        mean_q_r = float(np.mean(all_q_rewards)) if all_q_rewards else 0.0
 
         _cur_lr = optimizer.param_groups[0]["lr"]
+        _sp_str = (
+            f" | self_play={n_self_play}/{n_groups} q_reward={mean_q_r:.3f}"
+            if n_self_play > 0 else ""
+        )
         logger.info(
             "Iter %d | loss=%.4f | reward mean=%.3f std=%.3f | "
-            "batch_acc=%.1f%% | groups=%d skipped=%d | lr=%.2e | %.1fs",
+            "batch_acc=%.1f%% | groups=%d skipped=%d%s | lr=%.2e | %.1fs",
             iteration, loss_val, mean_r, std_r,
-            100 * acc_r, n_groups, skipped, _cur_lr, iter_time,
+            100 * acc_r, n_groups, skipped, _sp_str, _cur_lr, iter_time,
         )
 
         iter_metrics: Dict = {
@@ -1297,6 +1461,8 @@ def main() -> None:
             "std_reward": std_r,
             "batch_accuracy": acc_r,
             "n_groups": n_groups,
+            "n_self_play_groups": n_self_play,
+            "mean_question_reward": mean_q_r,
             "skipped_groups": skipped,
             "learning_rate": _cur_lr,
             "iter_time_s": iter_time,
