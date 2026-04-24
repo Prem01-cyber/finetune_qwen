@@ -1621,17 +1621,28 @@ def main() -> None:
                 eval_res.get("total", 0),
             )
 
-            # ── Best-checkpoint: step accuracy is the sole criterion ─────────
-            if cur_step_acc > best_step_acc:
-                best_step_acc = cur_step_acc
+            # ── Best-checkpoint: step_acc primary, prm_mean tiebreaker ─────
+            # Save when step_acc strictly improves, OR when step_acc ties but
+            # prm_mean is higher (the model's reasoning quality improved even
+            # though it didn't cross another step_acc threshold bucket).
+            step_improved = cur_step_acc > best_step_acc
+            prm_tiebreak  = (cur_step_acc == best_step_acc
+                             and cur_prm_mean > best_prm_mean + 1e-4)
+            if step_improved or prm_tiebreak:
+                reason = (
+                    f"step_acc {100*cur_step_acc:.1f}%"
+                    if step_improved
+                    else f"PRM_mean {cur_prm_mean:.4f} > {best_prm_mean:.4f}"
+                )
+                best_step_acc = max(best_step_acc, cur_step_acc)
                 best_prm_mean = max(best_prm_mean, cur_prm_mean)
-                best_accuracy = cur_step_acc   # keep best_accuracy == best_step_acc
+                best_accuracy = best_step_acc
                 best_path = out_dir / "best_policy"
                 model.save_pretrained(str(best_path))
                 tokenizer.save_pretrained(str(best_path))
                 logger.info(
-                    "New best saved to %s  (step_acc %.1f%%  PRM_mean %.3f)",
-                    best_path, 100 * cur_step_acc, cur_prm_mean,
+                    "New best saved to %s  (%s  PRM_mean %.3f)",
+                    best_path, reason, cur_prm_mean,
                 )
 
             iter_metrics.update(eval_res)
