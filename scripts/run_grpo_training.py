@@ -276,16 +276,14 @@ def load_math_dataset(
     # Download from HuggingFace
     logger.info(
         "MATH dataset not found locally — downloading from HuggingFace "
-        "(lighteval/MATH, difficulty ≤ %d, numeric answers only)...",
+        "(qwedsacf/competition_math, difficulty ≤ %d, numeric answers only)...",
         max_difficulty,
     )
-    # Try multiple HF sources in priority order.
-    # Each entry is (repo_id, extra_kwargs) — extra_kwargs forwarded to load_dataset.
+    # Try HF sources in priority order.  Only keep sources confirmed reachable;
+    # lighteval/MATH and hendrycks/competition_math have network/naming issues.
     _HF_SOURCES = [
-        ("qwedsacf/competition_math",  {}),                      # reliable mirror
-        ("lighteval/MATH-Hard",        {"name": "default"}),     # hard subset
-        ("lighteval/MATH",             {}),
-        ("hendrycks/competition_math", {}),
+        ("qwedsacf/competition_math", {}),           # reliable public mirror
+        ("lighteval/MATH-Hard",       {"name": "default"}),  # hard subset
     ]
     ds = None
     for hf_name, hf_kwargs in _HF_SOURCES:
