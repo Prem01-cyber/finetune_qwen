@@ -390,16 +390,36 @@ def compute_self_play_reward(
     s_reward  = float(sol_score.get("overall_score", 0.0)) if isinstance(sol_score, dict) else 0.0
 
     # Extract per-component question quality scores for granular logging.
+    # Each component may be a plain number OR a dict (e.g. {"score": 0.7, ...}).
+    # _scalar() safely extracts a float from either representation.
+    def _scalar(val: Any, sub_key: str = "score") -> float:
+        if val is None:
+            return 0.0
+        if isinstance(val, dict):
+            # Try common sub-keys that environment implementations use.
+            for k in (sub_key, "combined", "overall_score", "value", "score"):
+                if k in val:
+                    return float(val[k])
+            # Fall back to the first numeric value found.
+            for v in val.values():
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+            return 0.0
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.0
+
     q_metrics_raw = result.get("question_metrics", {})
     q_metrics: Dict = {
-        "overall_score":    float(q_metrics_raw.get("overall_score",    q_reward)),
-        "topic_match":      float(q_metrics_raw.get("topic_match",      0.0)),
-        "difficulty_fit":   float(q_metrics_raw.get("difficulty_fit",   0.0)),
-        "clarity":          float(q_metrics_raw.get("clarity",          0.0)),
-        "novelty":          float(q_metrics_raw.get("novelty",          {}).get("combined", 0.0))
-                            if isinstance(q_metrics_raw.get("novelty"), dict)
-                            else float(q_metrics_raw.get("novelty",     0.0)),
-        "solvability":      float(q_metrics_raw.get("solvability",      0.0)),
+        "overall_score":  _scalar(q_metrics_raw.get("overall_score",  q_reward)),
+        "topic_match":    _scalar(q_metrics_raw.get("topic_match",    0.0)),
+        "difficulty_fit": _scalar(q_metrics_raw.get("difficulty_fit", 0.0)),
+        "clarity":        _scalar(q_metrics_raw.get("clarity",        0.0)),
+        "novelty":        _scalar(q_metrics_raw.get("novelty",        0.0), sub_key="combined"),
+        "solvability":    _scalar(q_metrics_raw.get("solvability",    0.0)),
     }
     return combined, q_reward, s_reward, q_metrics
 
