@@ -372,6 +372,28 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
+    # SFT adapter checkpoints often don't save chat_template, which causes
+    # tokenizer.apply_chat_template() to raise an error inside evaluate_gsm8k
+    # — silently swallowed there, giving 0% accuracy even for a capable model.
+    # Mirror the fix from run_ppo_training_curriculum.py: load the template
+    # from the base model when it's missing.
+    if tokenizer.chat_template is None:
+        _base_model_name = "Qwen/Qwen2.5-Math-1.5B-Instruct"
+        _meta_file = Path(args.base_model) / "pipeline_meta.json"
+        if _meta_file.exists():
+            _meta = json.loads(_meta_file.read_text(encoding="utf-8"))
+            _base_model_name = _meta.get("base_model", _base_model_name)
+        logger.info(
+            "Tokenizer has no chat_template; loading from base model %s", _base_model_name
+        )
+        try:
+            _base_tok = AutoTokenizer.from_pretrained(_base_model_name, trust_remote_code=True)
+            if _base_tok.chat_template is not None:
+                tokenizer.chat_template = _base_tok.chat_template
+                logger.info("Chat template loaded successfully.")
+        except Exception as _e:
+            logger.warning("Could not load chat template from base model: %s", _e)
+
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         torch_dtype=torch.bfloat16,

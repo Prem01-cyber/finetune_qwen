@@ -1,4 +1,4 @@
-# AxiomForge-RL: Recursive Math Self-Improvement with PPO
+# AxiomForge-RL: Recursive Math Self-Improvement with PPO + GRPO
 
 > **OpenEnv Apr 2026 Hackathon — Theme #4: Self-Improvement**
 > See [`HACKATHON.md`](HACKATHON.md) for the full rubric mapping.
@@ -11,11 +11,20 @@ Core innovation: the agent does not optimize against a fixed benchmark distribut
 
 **Base model:** Qwen2.5-Math-1.5B-Instruct, warm-started with a dual-task SFT checkpoint.
 **Environment:** curriculum-aware math arena exposed as an OpenEnv-compliant FastAPI service.
-**Training:** single-GPU PPO with adaptive curriculum, `Qwen2.5-Math-PRM-7B` step-level rewards on self-play rollouts, GSM8K ground-truth-anchored rollouts (default 30 %), and a generational replay buffer.
+**Training (two paths share the same environment and reward pipeline):**
+
+| Path | Optimiser | What you get |
+|---|---|---|
+| **PPO** (original) | Clipped PPO + GAE + ValueHead critic + generational replay | Full self-improvement loop with curriculum phases and replay buffer; more complex, harder to stabilise on long sequences. |
+| **GRPO** (recommended for fast results) | Group Relative PO — within-group z-score advantages, no critic, no GAE | Dramatically simpler and more stable; proven on math RL (DeepSeek-Math, Qwen-Math, DAPO). Recommended starting point. |
+
+Both share the same reward pipeline (`Qwen2.5-Math-PRM-7B` + SymPy + format + GSM8K gold-anchor), the same OpenEnv environment, and the same dual-task SFT warm start. You can run either without touching the environment code.
 
 ### Quick links
-- [Quickstart](#9-quickstart)
-- [Extensive training command (1× A100 PCIE)](#91-extensive-training-1-a100-pcie)
+- [Quickstart (GRPO — recommended)](#95-grpo-quickstart-recommended-path)
+- [Quickstart (PPO)](#9-quickstart)
+- [GRPO mathematical formulation](#34-grpo-objective-recommended-alternative-to-ppo)
+- [PPO mathematical formulation](#32-ppo-objective)
 - [Repository layout](#11-repository-layout)
 - [OpenEnv / HF Space deployment](#12-openenv-deployment)
 - [Before/after demo](#13-beforeafter-demo)
@@ -32,6 +41,19 @@ Two silent-but-devastating bugs were caught during a late-stage code audit:
 5. **Flash-Attention 2 enabled everywhere.** Policy, ValueHead backbone, and PRM scorer all auto-pick `flash_attention_2` via `src/utils/attn_backend.py::select_attn_implementation()` when the `flash-attn` wheel is installed, falling back to SDPA otherwise.  Flash gives ~1.5-2.5× faster attention plus O(T) (not O(T²)) attention memory, so when it's active we also auto-disable gradient checkpointing (force it back on via `--grad-checkpoint` if you bump batch size).
 
 All details (what was wrong, how it manifested, what to look for) are in the commit history and the `Monitoring` section below.  Any checkpoints under `checkpoints/ppo_curriculum/iteration_*` that predate these fixes are equivalent to the SFT baseline and should **not** be resumed from.
+
+### Why GRPO was added (short version)
+
+Even after those five fixes, PPO on a 1.5 B-param policy with **sparse terminal rewards** on ~400-token trajectories is structurally fragile — every iteration it has to keep a ValueHead critic, a `λ^400≈0` GAE decay, and a single outlier-KL batch from tripping early-stop while the rest of the budget sits idle (logged as `updates=5/52, KL-stopped@epoch1/2`). GRPO sidesteps all three:
+
+| Failure mode seen in PPO | GRPO fix |
+|---|---|
+| `value_loss` ≈ 275 (critic can't regress terminal return under bf16) | No critic at all — GRPO doesn't need one. |
+| `approx_kl` mean ≈ 0.002 but one batch spikes to 0.085 → 5% budget used | One gradient step per iteration; no per-batch KL gate, no early-stop oscillation. |
+| GAE decay `λ^t` zeros out the gradient at the first token of a long response | No GAE. Each solution token gets the same sign of advantage (`A_i = (R_i − mean_R) / std_R`). |
+| Reward scale varies per phase → critic has to relearn every phase transition | Advantages are group-relative per question, so *any* reward scale gives a clean ±1-ish signal. |
+
+See `scripts/run_grpo_training.py` (~600 lines, one file, no inheritance) for the full implementation and §3.4 below for the math.
 
 ---
 
@@ -274,6 +296,41 @@ G_t = \hat{A}_t + V(s_t)
 $$
 
 With $\gamma=1.0$ and $\lambda=0.95$, this setup emphasizes full-episode credit assignment while controlling variance.
+
+### 3.4 GRPO Objective (recommended alternative to PPO)
+
+Group Relative Policy Optimization [(DeepSeek-Math, 2024)](https://arxiv.org/abs/2402.03300) drops the critic entirely and replaces per-token GAE with **within-group z-score advantages**.  For each prompt $q$ we sample $K$ solutions (default $K{=}4$), score each with the reward pipeline in §4, and compute:
+
+$$
+A_i \;=\; \frac{R_i - \bar R}{\sigma_R + \varepsilon}, \qquad i = 1, \dots, K
+$$
+
+where $\bar R$ and $\sigma_R$ are the mean and std of the $K$ rewards *for this prompt only*.  Groups with $\sigma_R < 10^{-8}$ (all solutions got the same reward — nothing to learn from) are skipped.  Advantages are then clipped to $[-5, 5]$ to keep one outlier from dominating the step.
+
+The GRPO loss for one group is the negative advantage-weighted **mean** log-probability across response tokens (not sum — response-length normalisation avoids favouring longer responses):
+
+$$
+\mathcal{L}_{\text{GRPO}}(q) \;=\; -\frac{1}{K}\sum_{i=1}^{K} A_i \cdot
+\frac{1}{T_i}\sum_{t=1}^{T_i} \log \pi_\theta\!\left(a_{i,t} \mid s_{i, <t}\right)
+$$
+
+with a global AdamW step over one iteration's worth of groups.  The gradient is clean:
+
+- If even **one** of the $K$ solutions is correct, that solution gets $A_i > 0$ while the wrong ones get $A_i < 0$.  The model is pushed toward the correct trajectory and away from the wrong ones **in the same update**.
+- Because we only need the ratio, GRPO is agnostic to reward scale or distribution — the PPO headaches around value-function regression under changing reward phases are gone.
+
+Comparison at a glance:
+
+| Component | PPO (§3.2–3.3) | GRPO (§3.4) |
+|---|---|---|
+| Critic $V_\phi$ | required | **none** |
+| Advantage | GAE: $\hat A_t = \sum_l (\gamma\lambda)^l \delta_{t+l}$ | group z-score: $(R_i - \bar R) / \sigma_R$ |
+| Update stability on long sequences | fragile (GAE decay $\lambda^T$) | stable (same $A$ for every token) |
+| KL early-stop | per-batch — one outlier trips the whole iter | one gradient step per iter — no oscillation |
+| Extra GPU memory | ValueHead backbone (~3 GB) | none |
+| Proven on math RL | rare (needs heavy tuning) | standard (DeepSeek-Math, Qwen-Math, DAPO) |
+
+Both the PPO and GRPO runners share the exact same reward pipeline (§4), the same PRM scorer, and the same OpenEnv environment — only the policy-update loop differs.
 
 ---
 
@@ -614,6 +671,7 @@ Core modules in the system:
 | Replay quality gate | Enforces admission thresholds and novelty requirements |
 | Curriculum-aware environment | Executes dual-task rollouts and reward assembly |
 | PPO training runner | Orchestrates rollout collection, GAE, PPO updates, evaluation, and logging |
+| GRPO training runner | Alternate optimiser: samples K solutions/question, computes group z-score advantages, and applies a single critic-free gradient step per iteration |
 | OpenEnv environment wrapper | Exposes the arena as `reset` / `step` / `state` over FastAPI |
 | Proposer-Solver arena | Named single-method entry point for Theme #4 self-play episodes |
 | ZPD difficulty controller | Introspects curriculum sweet-spot / mastered / struggling buckets |
@@ -798,19 +856,104 @@ Eval policy fingerprint: embed_l2=1234.56 embed_sha8=ab12cd34 embed_trainable=Tr
 | `prm/mean_of_means` | ≥ 0.4 on PRM runs; `prm/degraded_count` ≈ 0 |
 | `eval/accuracy` | net positive delta vs. initial SFT eval |
 
+### 9.5 GRPO quickstart (recommended path)
+
+GRPO reuses the same dual-task SFT checkpoint, the same PRM, and the same grounded reward pipeline — **it just swaps the PPO update loop for a simpler group-relative update**.  There is no ValueHead, no GAE buffer, no KL trip, and no replay buffer in the GRPO path, so the loop is a single self-contained script:
+
+```bash
+# Full run (30 iters × 16 questions × 4 solutions each = 1,920 scored rollouts)
+bash launch_grpo.sh
+
+# 3-iter smoke test (no PRM, skip initial eval; ~15-20 min on A100)
+bash launch_grpo.sh \
+    --num-iterations 3 \
+    --questions-per-iter 8 \
+    --no-prm \
+    --skip-initial-eval \
+    --run-name smoke_grpo
+```
+
+Or call the runner directly for full flag control:
+
+```bash
+python scripts/run_grpo_training.py \
+    --base-model checkpoints/dual_task_v1 \
+    --output-dir checkpoints/grpo \
+    --gsm8k-data data/sft/gsm8k_sft.jsonl \
+    --eval-data-path data/sft/dual_task_val.jsonl \
+    --num-iterations 30 \
+    --group-size 4 \
+    --questions-per-iter 16 \
+    --learning-rate 5e-6 \
+    --max-new-tokens 400 \
+    --temperature 0.8 \
+    --eval-every 5 \
+    --eval-max-samples 250 \
+    --use-prm \
+    --run-name "grpo_$(date +%Y%m%d_%H%M)"
+```
+
+**Key GRPO-only flags** (see [`scripts/run_grpo_training.py`](scripts/run_grpo_training.py)):
+
+| Flag | Default | Role |
+|---|---|---|
+| `--group-size` | `4` | $K$, number of solutions sampled per question per group. Higher $K$ = more signal per question, more VRAM (quadratic in sequence length). |
+| `--questions-per-iter` | `16` | Groups per iteration (one gradient step aggregates all groups' losses). |
+| `--learning-rate` | `5e-6` | AdamW LR. GRPO is more forgiving than PPO here — `1e-5` also works. |
+| `--temperature` | `0.8` | Sampling temperature during rollouts. Needs to be non-trivial so $K$ solutions *differ*, otherwise $\sigma_R\approx 0$ and the group is skipped. |
+| `--max-grad-norm` | `1.0` | Global gradient clipping (also clips the z-score advantages to `[-5, 5]` inside the loss). |
+| `--use-prm` / `--no-prm` | on | Same as PPO: PRM adds step-level correctness signal but costs ~5 GB of 4-bit VRAM. |
+
+**What the per-iteration log looks like:**
+
+```
+Iter 3 | loss=-0.4128 | reward mean=0.402 std=0.281 | batch_acc=38.3% | groups=14 skipped=2 | 512.3s
+Iter 4 | loss=-0.6037 | reward mean=0.467 std=0.248 | batch_acc=46.9% | groups=15 skipped=1 | 505.1s
+Iter 5 | loss=-0.7281 | reward mean=0.513 std=0.230 | batch_acc=53.1% | groups=16 skipped=0 | 507.8s
+Evaluating GSM8K (250 samples)...
+GSM8K Accuracy: 67.20% (168/250) | best=67.20%
+```
+
+**How to read it:**
+- `loss` should trend **more negative** as the policy learns to assign higher probability to high-advantage (correct) solutions.
+- `reward mean` should trend up iteration-over-iteration; this is the primary "am I learning?" signal.
+- `std` must stay above ~0.05 — if it collapses to zero you're in mode collapse (all $K$ solutions identical, groups skipped).
+- `skipped` groups are harmless but wasted compute; if `skipped ≥ questions/2` for several iters, bump `--temperature` to `0.9–1.0` to increase rollout diversity.
+- `batch_acc` = fraction of rollouts with reward > 0.5 (a coarse proxy for "right answer + reasonable format"); this is the fastest-moving signal before GSM8K eval fires at `--eval-every`.
+
+**Expected timeline on one A100-80GB** (1.5B policy, K=4, 16 q/iter, PRM on):
+
+| Iterations | Wall-clock | GSM8K accuracy signal |
+|---|---|---|
+| 1–5 | ~45 min | Mean reward climbing from ~0.35 → ~0.50; format-broken outputs disappear. |
+| 5–15 | ~1.5 h | GSM8K accuracy starts moving, typically **+2–5 pp** over SFT baseline. |
+| 15–30 | ~2 h | Continued lift; expect **+5–8 pp** total over 30 iterations. |
+
+Checkpoints are saved every iteration at `checkpoints/grpo/<run-name>/iter_NNNN/`, and the best policy (highest GSM8K eval) is kept at `checkpoints/grpo/<run-name>/best_policy/`. Metrics stream as JSONL to `metrics.jsonl` in the same directory — easy to `jq` or load into pandas for a reward curve.
+
 ---
 
 ## 10. Implementation Stack
 
 ### 10.1 Training
 
+**Shared across both paths:**
+- **Curriculum-aware environment** ([`src/rl/math_environment_curriculum.py`](src/rl/math_environment_curriculum.py)) drives dual-task (question-gen + solution-gen) episodes and owns the full reward pipeline (PRM + SymPy + format + GSM8K-gold anchoring).
+- **Process Reward Model scorer** ([`src/rl/prm_scorer.py`](src/rl/prm_scorer.py)) serves both PPO and GRPO.
+- Global GPU performance knobs (TF32 matmul, cuDNN benchmark, Flash-Attention 2 auto-detect via [`src/utils/attn_backend.py`](src/utils/attn_backend.py)) are set at import time so every kernel benefits from them.
+
+**PPO path (original, full self-improvement loop):**
 - **Custom single-GPU PPO** ([`src/rl/ppo_trainer.py`](src/rl/ppo_trainer.py)) with GAE advantage estimation, clipped policy + value losses, entropy bonus, and early-stop on KL.
-- **Rollout buffer** ([`src/rl/rollout_buffer.py`](src/rl/rollout_buffer.py)) stores per-token transitions and log-probs; `compute_advantages()` runs GAE.
+- **Rollout buffer** ([`src/rl/rollout_buffer.py`](src/rl/rollout_buffer.py)) stores per-token transitions and log-probs; `compute_advantages()` runs GAE with advantage normalisation + clipping to `[-5, 5]`.
+- **ValueHead critic** ([`src/rl/value_network.py`](src/rl/value_network.py)) wraps a frozen backbone with an MLP head that regresses $V_\phi(s_t)$.
 - **Generational replay** ([`src/rl/replay_buffer.py`](src/rl/replay_buffer.py)) admits high-quality trajectories under strict novelty + correctness gates; mixed back into fresh rollouts with an adaptive ratio.
-- **Curriculum-aware environment** ([`src/rl/math_environment_curriculum.py`](src/rl/math_environment_curriculum.py)) drives dual-task (question-gen + solution-gen) episodes.
 - **PPO-training runner** ([`scripts/run_ppo_training_curriculum.py`](scripts/run_ppo_training_curriculum.py)) orchestrates rollouts, updates, eval, checkpointing, curriculum bookkeeping, and CSV logging.
 
-Global GPU performance knobs (TF32 matmul, cuDNN benchmark) are set at import time in the training runner so every kernel benefits from them.
+**GRPO path (recommended for fast, stable results):**
+- **GRPO runner** ([`scripts/run_grpo_training.py`](scripts/run_grpo_training.py)): ~600 lines, single-file, no inheritance. Samples $K$ solutions per prompt, scores each via the shared reward pipeline, computes within-group z-score advantages, and applies one AdamW step per iteration.
+- **Reward reuse**: the runner instantiates `CurriculumMathEnvironment(value_model=None, …)` purely to reach its `compute_grounded_reward()` method — no critic is ever loaded, so GRPO uses ~3 GB less GPU memory than PPO.
+- **No GAE / no replay / no KL trip**: advantages are group-relative and the single gradient step per iteration means there is no KL early-stop oscillation.
+- **Launch wrapper** ([`launch_grpo.sh`](launch_grpo.sh)) pre-fills the flags matching §9.5.
 
 ### 10.2 Verification (rewards)
 
@@ -849,8 +992,10 @@ Global GPU performance knobs (TF32 matmul, cuDNN benchmark) are set at import ti
 Finetune_qwen/
 |-- README.md                      <-- this file
 |-- HACKATHON.md                   <-- rubric mapping, Theme #4 justification
+|-- openenv.yaml                   <-- OpenEnv manifest (task phases, reward structure, endpoints)
 |-- requirements.txt               <-- training deps (superset of deployment/requirements.txt)
 |-- launch_ppo_training.sh         <-- thin launcher for PPO training
+|-- launch_grpo.sh                 <-- thin launcher for GRPO training (recommended)
 |
 |-- src/
 |   |-- openenv/                   <-- OpenEnv-compliant wrapper (new)
@@ -890,7 +1035,8 @@ Finetune_qwen/
 |       `-- csv_logger.py          per-iteration metric streaming
 |
 |-- scripts/
-|   |-- run_ppo_training_curriculum.py   main training entrypoint
+|   |-- run_ppo_training_curriculum.py   PPO training entrypoint (critic + GAE + replay)
+|   |-- run_grpo_training.py        GRPO training entrypoint (group-relative, no critic)
 |   |-- demo_before_after.py       baseline vs trained accuracy comparison
 |   |-- eval_sft_inference.py      GSM8K eval utilities (used by training)
 |   |-- dual_task_sft_pipeline.py  SFT upstream pipeline
@@ -961,15 +1107,24 @@ The `deployment/README.md` front-matter is already valid Space YAML (title, emoj
 
 ## 13. Before/after demo
 
-Once training produces a checkpoint, run the deterministic baseline-vs-trained comparison:
+Once training produces a checkpoint (either path), run the deterministic baseline-vs-trained comparison:
 
 ```bash
+# PPO checkpoint:
 python scripts/demo_before_after.py \
     --baseline-model Qwen/Qwen2.5-Math-1.5B-Instruct \
     --trained-model checkpoints/ppo_curriculum/iteration_050/policy \
     --problems data/sft/dual_task_val.jsonl \
     --max-samples 100 \
     --records-out reports/demo_iter50.json
+
+# GRPO checkpoint (best_policy/ is the highest-eval checkpoint, auto-saved):
+python scripts/demo_before_after.py \
+    --baseline-model Qwen/Qwen2.5-Math-1.5B-Instruct \
+    --trained-model checkpoints/grpo/<run-name>/best_policy \
+    --problems data/sft/dual_task_val.jsonl \
+    --max-samples 100 \
+    --records-out reports/demo_grpo_best.json
 ```
 
 Output:

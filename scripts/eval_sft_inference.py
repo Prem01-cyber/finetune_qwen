@@ -367,6 +367,8 @@ def evaluate_gsm8k(
 
     correct = 0
     total = len(rows)
+    _n_errors = 0
+    _MAX_ERROR_WARNINGS = 3   # surface the first few failures loudly
 
     # tqdm gives us a live progress bar with ETA; the `postfix` surfaces the
     # running accuracy so long runs are interpretable mid-flight.  Falls back
@@ -396,7 +398,20 @@ def evaluate_gsm8k(
             if match:
                 correct += 1
         except Exception as exc:
-            _logger.debug(f"Sample {i} error: {exc}")
+            _n_errors += 1
+            if _n_errors <= _MAX_ERROR_WARNINGS:
+                _logger.warning(
+                    "evaluate_gsm8k: sample %d raised an exception (%s: %s). "
+                    "If all samples fail the score will be 0%% — check that the "
+                    "tokenizer has a chat_template set.",
+                    i, type(exc).__name__, exc,
+                )
+            elif _n_errors == _MAX_ERROR_WARNINGS + 1:
+                _logger.warning(
+                    "evaluate_gsm8k: suppressing further per-sample error logs "
+                    "(%d errors so far).", _n_errors,
+                )
+            _logger.debug(f"Sample {i} error: {exc}", exc_info=True)
 
         done = i + 1
         pbar.set_postfix(
