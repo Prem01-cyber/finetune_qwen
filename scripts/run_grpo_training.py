@@ -41,10 +41,12 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import copy
 import csv
 import json
 import logging
 import random
+import re
 import shutil
 import sys
 import time
@@ -187,6 +189,140 @@ def load_gsm8k(path: str) -> List[Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# MATH harder dataset
+# ---------------------------------------------------------------------------
+
+def _extract_boxed(text: str) -> Optional[str]:
+    r"""Extract the content of the first ``\boxed{...}`` in *text*."""
+    m = re.search(r"\\boxed\{([^}]*)\}", text)
+    return m.group(1).strip() if m else None
+
+
+def _boxed_to_numeric(answer: str) -> Optional[str]:
+    """
+    Convert a ``\\boxed{...}`` answer to a plain numeric string.
+
+    Returns a string of the form ``"42"`` or ``"3.5000"`` when the answer
+    is a recognisable integer, decimal, or simple fraction (``3/4`` or
+    ``\\frac{3}{4}``).  Returns ``None`` for symbolic / multi-part answers
+    like ``3\\sqrt{2}`` or ``(1, 2)``.
+    """
+    ans = answer.strip()
+    # Direct integer
+    try:
+        return str(int(ans))
+    except ValueError:
+        pass
+    # Direct float (includes "3.5", "0.75", etc.)
+    try:
+        v = float(ans)
+        return str(int(v)) if v == int(v) else f"{v:.4f}"
+    except ValueError:
+        pass
+    # LaTeX fraction  \frac{num}{den}
+    m = re.fullmatch(r"\\frac\{(\d+)\}\{(\d+)\}", ans)
+    if m:
+        num, den = int(m.group(1)), int(m.group(2))
+        if den:
+            v = num / den
+            return str(int(v)) if v == int(v) else f"{v:.4f}"
+    # Plain fraction  num/den
+    m = re.fullmatch(r"(\d+)/(\d+)", ans)
+    if m:
+        num, den = int(m.group(1)), int(m.group(2))
+        if den:
+            v = num / den
+            return str(int(v)) if v == int(v) else f"{v:.4f}"
+    return None
+
+
+def load_math_dataset(
+    local_path: Optional[str] = None,
+    cache_path: str = "data/math/math_numeric.jsonl",
+    max_difficulty: int = 3,
+) -> List[Dict[str, str]]:
+    """
+    Load a subset of the MATH competition dataset filtered to problems with
+    numerically-verifiable answers (integers, decimals, simple fractions).
+
+    Loading order
+    -------------
+    1. ``local_path`` if provided and the file exists.
+    2. ``cache_path`` if that file exists (written on first HF download).
+    3. HuggingFace ``competition_math`` dataset; filtered + written to
+       ``cache_path`` for subsequent runs.
+
+    Only problems with ``Level ≤ max_difficulty`` are included.  Difficulty
+    1-2 ≈ AMC-8 level (comparable to hard GSM8K); difficulty 3 ≈ AMC-10.
+    Levels 4-5 are graduate-level and usually too hard for a 1.5B model to
+    get any reward signal from (win_rate ≈ 0 → skipped groups every iter).
+    """
+    for candidate in filter(None, [local_path, cache_path]):
+        p = Path(candidate)
+        if p.exists():
+            pairs: List[Dict[str, str]] = []
+            with p.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            pairs.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+            if pairs:
+                logger.info("Loaded %d MATH pairs from %s", len(pairs), p)
+                return pairs
+
+    # Download from HuggingFace
+    logger.info(
+        "MATH dataset not found locally — downloading from HuggingFace "
+        "(competition_math, difficulty ≤ %d, numeric answers only)...",
+        max_difficulty,
+    )
+    try:
+        from datasets import load_dataset  # type: ignore
+        ds = load_dataset("competition_math", split="train", trust_remote_code=True)
+    except Exception as exc:
+        logger.warning(
+            "Could not load MATH dataset from HuggingFace (%s). "
+            "Proceeding with GSM8K only.", exc,
+        )
+        return []
+
+    pairs = []
+    for item in ds:
+        level_str = item.get("level", "Level 5")
+        try:
+            level = int(level_str.split()[-1])
+        except (ValueError, IndexError):
+            level = 5
+        if level > max_difficulty:
+            continue
+
+        question = item.get("problem", "").strip()
+        solution = item.get("solution", "")
+        boxed    = _extract_boxed(solution)
+        if not boxed:
+            continue
+        numeric  = _boxed_to_numeric(boxed)
+        if not numeric:
+            continue
+        pairs.append({"question": question, "gold_final": numeric})
+
+    if pairs:
+        out_p = Path(cache_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with out_p.open("w", encoding="utf-8") as f:
+            for p_item in pairs:
+                f.write(json.dumps(p_item) + "\n")
+        logger.info("Cached %d MATH numeric pairs to %s", len(pairs), out_p)
+    else:
+        logger.warning("No MATH pairs passed the numeric filter — check the dataset.")
+
+    return pairs
+
+
+# ---------------------------------------------------------------------------
 # Reward
 # ---------------------------------------------------------------------------
 
@@ -291,35 +427,59 @@ def generate_solutions_batched(
         )
         # out: [K, prompt_len + padded_response_len]
 
+    # ── 1. Build masks and decode solutions ──────────────────────────────────
     solutions: List[str] = []
     input_ids_list: List[torch.Tensor] = []
     response_masks: List[torch.Tensor] = []
-    old_log_probs: List[torch.Tensor] = []
 
     pad_id_t = torch.tensor(pad_id, device=device, dtype=out.dtype)
+    for i in range(K):
+        full_ids = out[i]
+        response_section = full_ids[prompt_len:]
+        mask = torch.zeros(full_ids.shape[0], dtype=torch.bool, device=device)
+        mask[prompt_len:] = response_section != pad_id_t
+        solution = tokenizer.decode(response_section, skip_special_tokens=True)
+        solutions.append(solution)
+        input_ids_list.append(full_ids)
+        response_masks.append(mask)
+
+    # ── 2. Batched old_log_probs — ONE forward pass for all K sequences ───────
+    # The old sequential approach called compute_sequence_log_prob K times
+    # (K separate CPU→GPU round-trips + K forward passes).  A single batched
+    # forward pass over out[K, total_len] gives the same result K× faster.
+    #
+    # Attention mask: always attend to prompt tokens; attend to response tokens
+    # only where they are non-pad.  This matches what the model saw during
+    # model.generate() and prevents padding from distorting log probs.
+    old_log_probs: List[torch.Tensor] = []
     with torch.no_grad():
+        attn_mask_lp = (out != pad_id_t)          # [K, total_len]
+        attn_mask_lp[:, :prompt_len] = True        # prompt always attended
+
+        batch_logits = model(
+            input_ids=out,
+            attention_mask=attn_mask_lp.long(),
+            use_cache=False,
+            return_dict=True,
+        ).logits  # [K, total_len, vocab]
+
         for i in range(K):
-            full_ids = out[i]  # [total_len]
+            full_ids = out[i]
+            mask = response_masks[i]
 
-            # Vectorised mask: True for actual (non-pad) response tokens.
-            # Prompt tokens are always False; trailing pad tokens are False.
-            response_section = full_ids[prompt_len:]
-            response_nonpad = response_section != pad_id_t
+            shift_logits = batch_logits[i, :-1]      # [total_len-1, vocab]
+            shift_labels  = full_ids[1:]              # [total_len-1]
+            shift_mask    = mask[1:]                  # [total_len-1]
 
-            mask = torch.zeros(full_ids.shape[0], dtype=torch.bool, device=device)
-            mask[prompt_len:] = response_nonpad
-
-            solution = tokenizer.decode(
-                response_section, skip_special_tokens=True
+            lp_tokens = F.log_softmax(shift_logits, dim=-1)[
+                torch.arange(shift_logits.size(0), device=device),
+                shift_labels,
+            ]  # [total_len-1]
+            resp_lps = lp_tokens[shift_mask]
+            old_log_probs.append(
+                resp_lps.sum().detach() if resp_lps.numel() > 0
+                else torch.tensor(0.0, device=device)
             )
-
-            # Capture old log prob (before any gradient update) for IS clip.
-            old_lp = compute_sequence_log_prob(model, full_ids, mask)
-
-            solutions.append(solution)
-            input_ids_list.append(full_ids)
-            response_masks.append(mask)
-            old_log_probs.append(old_lp.detach())
 
     return solutions, input_ids_list, response_masks, old_log_probs
 
@@ -369,24 +529,27 @@ def grpo_loss_for_group(
     rewards: List[float],
     old_log_probs: List[torch.Tensor],
     clip_eps: float = 0.2,
+    kl_coef: float = 0.0,
+    ref_model: Optional[AutoModelForCausalLM] = None,
     eps: float = 1e-8,
 ) -> Optional[torch.Tensor]:
     """
     Compute GRPO loss for a group of K solutions to the same question.
 
-    When ``clip_eps > 0``, applies a PPO-style importance-sampling clip:
+    IS clip (``clip_eps > 0``):
+        ratio  = π_θ(response) / π_old(response)   [sequence level]
+        L_GRPO = -min(ratio × A, clip(ratio, 1-ε, 1+ε) × A) / T
 
-        ratio  = π_θ(response) / π_old(response)         [sequence level]
-        surr1  = ratio  × A / T
-        surr2  = clip(ratio, 1-ε, 1+ε) × A / T
-        L_i    = -min(surr1, surr2)                       [pessimistic pick]
+    Reference-policy KL penalty (``kl_coef > 0``, ``ref_model`` required):
+        KL(π_θ ‖ π_ref) ≈ (log π_θ − log π_ref) / T   per sequence
+        L_total = L_GRPO + β × KL
 
-    This prevents the policy from taking large steps driven by individual
-    high-advantage groups — crucial at 1e-5 LR where the model is already
-    moving quickly.  Setting clip_eps=0 falls back to plain GRPO.
+    The KL term acts as an anchor: it prevents the policy from drifting so
+    far from its starting point that it forgets the SFT knowledge baked in
+    during dual_task_v1 fine-tuning.  β=0.04 is a conservative starting
+    value (matches DeepSeekMath GRPO default).
 
-    Skips groups where all rewards are identical (zero gradient signal).
-    Returns None if skipped.
+    Returns None if all rewards are identical (zero gradient signal).
     """
     rewards_arr = np.array(rewards, dtype=np.float32)
     std_r = rewards_arr.std()
@@ -412,10 +575,8 @@ def grpo_loss_for_group(
 
         adv_t = torch.tensor(adv, dtype=new_lp.dtype, device=_device)
 
+        # ── GRPO surrogate (with optional IS clip) ────────────────────────
         if clip_eps > 0:
-            # Sequence-level IS ratio: exp(log π_new - log π_old)
-            # ratio ≈ 1.0 at the start of training (on-policy) and drifts as
-            # the policy updates accumulate.  The clip prevents outsized steps.
             ratio = torch.exp(new_lp - old_lp.to(_device).detach())
             surr_unclipped = ratio * adv_t / n_response
             surr_clipped   = (
@@ -424,8 +585,18 @@ def grpo_loss_for_group(
             )
             loss_i = -torch.min(surr_unclipped, surr_clipped)
         else:
-            # Plain GRPO: no IS correction
             loss_i = -(adv_t * new_lp / n_response)
+
+        # ── Reference-policy KL penalty ───────────────────────────────────
+        # KL(π_θ ‖ π_ref) = mean_token(log π_θ − log π_ref)
+        # Adding +β×KL to the minimisation objective penalises drift from
+        # the reference (frozen) checkpoint.  This is differentiable through
+        # new_lp; ref_lp is always detached (no grad through frozen model).
+        if kl_coef > 0.0 and ref_model is not None:
+            with torch.no_grad():
+                ref_lp = compute_sequence_log_prob(ref_model, ids, mask)
+            kl_per_token = (new_lp - ref_lp.to(_device).detach()) / n_response
+            loss_i = loss_i + kl_coef * kl_per_token
 
         group_loss = group_loss + loss_i
         n_valid += 1
@@ -491,6 +662,24 @@ def main() -> None:
     parser.add_argument("--skip-initial-eval", action="store_true")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--kl-coef", type=float, default=0.04,
+        help="Reference-policy KL penalty coefficient β. 0 = disabled. Default 0.04.",
+    )
+    parser.add_argument(
+        "--math-data", type=str, default=None,
+        help="Path to MATH dataset JSONL. If absent, downloads from HuggingFace "
+             "(competition_math) and caches to data/math/math_numeric.jsonl.",
+    )
+    parser.add_argument(
+        "--math-mix-ratio", type=float, default=0.3,
+        help="Fraction of each question batch drawn from MATH (vs GSM8K). "
+             "0 = GSM8K only, 1 = MATH only. Default 0.3.",
+    )
+    parser.add_argument(
+        "--math-max-difficulty", type=int, default=3,
+        help="Maximum MATH difficulty level to include (1-5). Default 3.",
+    )
     parser.add_argument(
         "--clip-eps", type=float, default=0.2,
         help="Importance-sampling clip ratio ε (PPO-style clip applied inside GRPO). "
@@ -633,12 +822,15 @@ def main() -> None:
         )
     logger.info(
         "Run config: K=%d N=%d lr=%.1e T=%.2f max_new=%d | "
-        "clip_eps=%.2f warmup=%d | diff_alpha=%.1f overlong_filter=%s | "
+        "clip_eps=%.2f kl_coef=%.4f warmup=%d | diff_alpha=%.1f | "
+        "math_mix=%.0f%% math_maxdiff=%d | overlong_filter=%s | "
         "eval_every=%d eval_N=%d | grad_clip=%.2f save_every=%d keep_last=%d",
         args.group_size, args.questions_per_iter, args.learning_rate,
         args.temperature, args.max_new_tokens,
-        args.clip_eps, args.warmup_iters,
-        args.difficulty_alpha, args.overlong_filter,
+        args.clip_eps, args.kl_coef, args.warmup_iters,
+        args.difficulty_alpha,
+        100 * args.math_mix_ratio, args.math_max_difficulty,
+        args.overlong_filter,
         args.eval_every, args.eval_max_samples,
         args.max_grad_norm, args.save_every, args.keep_last,
     )
@@ -746,6 +938,24 @@ def main() -> None:
         f"{n_params:,}", f"{n_total:,}", 100.0 * n_params / max(n_total, 1),
     )
 
+    # ── Reference policy (frozen copy) ───────────────────────────────────────
+    # A deep copy of the policy at t=0, kept frozen forever.  Used in the KL
+    # penalty to anchor the policy against catastrophic forgetting of SFT
+    # knowledge: L += β × (log π_θ - log π_ref) / T.
+    # Memory cost: ~3 GB (1.5B × 2 bytes BF16) — negligible on 80 GB.
+    ref_model: Optional[AutoModelForCausalLM] = None
+    if args.kl_coef > 0.0:
+        logger.info(
+            "Creating frozen reference policy (kl_coef=%.4f, ~%.1f GB VRAM)...",
+            args.kl_coef, sum(p.numel() for p in model.parameters()) * 2 / 1e9,
+        )
+        ref_model = copy.deepcopy(model)
+        ref_model.requires_grad_(False)
+        ref_model.eval()
+        logger.info("Reference policy ready.")
+    else:
+        logger.info("KL coef = 0 — no reference policy created.")
+
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=args.learning_rate,
@@ -783,10 +993,30 @@ def main() -> None:
     )
 
     # ── Load data ────────────────────────────────────────────────────────────
-    qa_pairs = load_gsm8k(args.gsm8k_data)
-    if not qa_pairs:
+    gsm8k_pairs = load_gsm8k(args.gsm8k_data)
+    if not gsm8k_pairs:
         logger.error("No GSM8K data found — cannot train. Exiting.")
         sys.exit(1)
+
+    # Optional MATH dataset mixing
+    math_pairs: List[Dict[str, str]] = []
+    if args.math_mix_ratio > 0.0:
+        math_pairs = load_math_dataset(
+            local_path=args.math_data,
+            max_difficulty=args.math_max_difficulty,
+        )
+        if math_pairs:
+            logger.info(
+                "MATH mixing: %.0f%% MATH (%d problems) + %.0f%% GSM8K (%d problems)",
+                100 * args.math_mix_ratio, len(math_pairs),
+                100 * (1 - args.math_mix_ratio), len(gsm8k_pairs),
+            )
+        else:
+            logger.warning("No MATH pairs loaded — using GSM8K only.")
+
+    # Combined pool used for difficulty sampling; kept separate for VRAM-aware
+    # batch construction (sampler draws from each pool proportionally).
+    qa_pairs = gsm8k_pairs  # for reward env (all GSM8K gold answers needed)
 
     # ── Load PRM (optional) ─────────────────────────────────────────────────
     prm_scorer: Optional[ProcessRewardScorer] = None
@@ -891,10 +1121,21 @@ def main() -> None:
         logger.info("GRPO ITERATION %d/%d", iteration, args.num_iterations)
         logger.info("=" * 70)
 
-        # Sample questions — difficulty-weighted when --difficulty-alpha > 0.
-        questions_batch = _sample_by_difficulty(
-            qa_pairs, args.questions_per_iter, alpha=args.difficulty_alpha
-        )
+        # Sample questions — difficulty-weighted from the mixed pool.
+        # When math_pairs is non-empty, draw proportionally: N*ratio from MATH
+        # and N*(1-ratio) from GSM8K.  The difficulty sampler handles each pool
+        # independently so MATH problems get their own win-rate tracking.
+        if math_pairs and args.math_mix_ratio > 0.0:
+            n_math  = max(1, round(args.questions_per_iter * args.math_mix_ratio))
+            n_gsm8k = max(1, args.questions_per_iter - n_math)
+            math_batch  = _sample_by_difficulty(math_pairs,  n_math,  alpha=args.difficulty_alpha)
+            gsm8k_batch = _sample_by_difficulty(gsm8k_pairs, n_gsm8k, alpha=args.difficulty_alpha)
+            questions_batch = math_batch + gsm8k_batch
+            random.shuffle(questions_batch)
+        else:
+            questions_batch = _sample_by_difficulty(
+                gsm8k_pairs, args.questions_per_iter, alpha=args.difficulty_alpha
+            )
         cur_lr = optimizer.param_groups[0]["lr"]
         logger.info("LR this iteration: %.2e", cur_lr)
 
@@ -973,7 +1214,7 @@ def main() -> None:
             _q_attempts[_key] += len(solutions)
             _q_wins[_key] += sum(1 for r in rewards if r > 0.5)
 
-            # --- GRPO loss (with IS clip ratio) + immediate backward ---
+            # --- GRPO loss (IS clip + optional KL penalty) + immediate backward ---
             group_loss = grpo_loss_for_group(
                 model=model,
                 input_ids_list=input_ids_list,
@@ -981,6 +1222,8 @@ def main() -> None:
                 rewards=rewards,
                 old_log_probs=old_log_probs_list,
                 clip_eps=args.clip_eps,
+                kl_coef=args.kl_coef,
+                ref_model=ref_model,
             )
 
             if group_loss is None:

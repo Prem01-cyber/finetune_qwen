@@ -114,39 +114,54 @@ LOG_FILE="$LOG_DIR/${RUN_NAME}.log"
 echo "[launch] run_name = $RUN_NAME"
 echo "[launch] log_file = $LOG_FILE"
 
+# ── Smoke test ───────────────────────────────────────────────────────────
+#
+#   bash launch_grpo.sh \
+#     --num-iterations 2 --questions-per-iter 4 --group-size 4 \
+#     --max-new-tokens 128 --eval-every 100 --save-every 0 \
+#     --skip-initial-eval --no-prm --kl-coef 0 --math-mix-ratio 0 \
+#     --run-name smoke_grpo
+#
 # ── Train ────────────────────────────────────────────────────────────────
 #
 # What each flag does on this hardware:
 #
 #   --group-size 8            K=8 batched in ONE model.generate call — near-100%
 #                             GPU utilisation vs the old sequential K=8 loop.
-#                             Halved wall-time per iteration → 2× iterations in 4.5 h.
 #
-#   --questions-per-iter 16   N=16 groups per step; gradient is already well-conditioned
-#                             at this size — going higher adds wall-time without signal.
+#   --questions-per-iter 16   N=16 groups per step (well-conditioned gradient).
 #
-#   --clip-eps 0.2            PPO-style IS clip: prevents any single high-advantage
-#                             group from spiking the policy at 1e-5 LR.
+#   --clip-eps 0.2            PPO-style IS clip: prevents policy spikes at 1e-5 LR.
 #
-#   --warmup-iters 3          Linear LR ramp: 1e-6 → 1e-5 over 3 iterations so the
-#                             first gradient step doesn't jolt a freshly-merged model.
+#   --kl-coef 0.04            Reference-policy KL penalty: anchors the policy to the
+#                             SFT starting checkpoint.  Prevents forgetting GSM8K
+#                             facts learned during dual_task_v1 training.
+#                             β=0.04 matches DeepSeekMath-GRPO default.
 #
-#   --min-lr-ratio 0.1        Cosine decays to 1e-6 (10% of peak) by iteration 100.
+#   --warmup-iters 3          Linear LR ramp: 1e-6 → 1e-5 over 3 iterations.
+#
+#   --min-lr-ratio 0.1        Cosine decays to 1e-6 (10% of peak) by iter 100.
 #
 #   --difficulty-alpha 2.0    Difficulty-weighted sampling: questions where the model
 #                             scores 40-60% of K=8 solutions are sampled most often.
-#                             Questions it always gets right / wrong are deprioritised.
 #
-#   --num-iterations 100      With batched generation, each iter is ~90s on A100,
-#                             so 100 iters ≈ 3.5 h + eval overhead.  Much more signal
-#                             than the previous 30-iter limit.
+#   --math-mix-ratio 0.3      30% of each question batch comes from MATH competition
+#                             dataset (difficulty ≤ 3), 70% from GSM8K.  MATH problems
+#                             expose the model to harder multi-step reasoning and raise
+#                             the accuracy ceiling beyond GSM8K's ~85% saturation.
+#                             First run downloads + caches to data/math/math_numeric.jsonl.
 #
-#   --eval-every 10           10 eval points over 100 iters — still a clear curve.
+#   --math-max-difficulty 3   Level 1-2 ≈ AMC-8 (comparable to hard GSM8K).
+#                             Level 3 ≈ AMC-10.  Levels 4-5 are too hard for a 1.5B
+#                             model to reliably get any reward signal from.
 #
-#   --save-every 10           Save checkpoint every 10 iters; best_policy/ always saved
-#                             when accuracy improves regardless of this flag.
+#   --num-iterations 100      ~90s/iter on A100 → 100 iters ≈ 3.5 h total.
 #
-#   --keep-last 3             Keep the 3 newest iter_* checkpoints on disk (~9 GB).
+#   --eval-every 10           10 eval checkpoints over 100 iters.
+#
+#   --save-every 10           Save every 10 iters; best_policy/ saved on any improvement.
+#
+#   --keep-last 3             Rolling window of 3 iter_* checkpoints (~9 GB).
 #
 python -u scripts/run_grpo_training.py \
     --base-model checkpoints/dual_task_v1 \
@@ -161,9 +176,12 @@ python -u scripts/run_grpo_training.py \
     --temperature 0.8 \
     --max-grad-norm 0.5 \
     --clip-eps 0.2 \
+    --kl-coef 0.04 \
     --warmup-iters 3 \
     --min-lr-ratio 0.1 \
     --difficulty-alpha 2.0 \
+    --math-mix-ratio 0.3 \
+    --math-max-difficulty 3 \
     --overlong-filter \
     --eval-every 10 \
     --eval-max-samples 250 \
