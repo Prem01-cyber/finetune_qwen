@@ -1044,8 +1044,17 @@ Full `metrics.jsonl` schema (one JSON object per line):
   "q_novelty":           0.55,
   "q_solvability":       0.69,
 
-  "accuracy":            0.672,
-  "best_accuracy":       0.672
+  "accuracy":              0.745,
+  "step_acc":              0.745,
+  "step_acc_50":           0.912,
+  "prm_mean":              0.847,
+  "prm_min_mean":          0.612,
+  "n_steps_total":         287,
+  "prm_degraded_frac":     0.02,
+
+  "final_answer_accuracy": 0.633,
+  "final_answer_correct":  19,
+  "total":                 30
 }
 ```
 
@@ -1058,6 +1067,12 @@ Full `metrics.jsonl` schema (one JSON object per line):
 | `q_gen_valid_rate` | `q_gen_valid / q_gen_attempts` — generation success rate |
 | `mean_question_reward` | Average of all K×n_self_play question-quality scores this iteration |
 | `q_quality_rate` | Fraction of self-play groups whose mean question_reward > 0.5 (the "question generation accuracy") |
+| **`prm_mean`** | **Average PRM score across all reasoning steps of all eval solutions — the primary reasoning-quality metric** |
+| **`step_acc`** | **Fraction of steps scoring > 0.7 — "step accuracy at the high-quality bar"** |
+| `step_acc_50` | Fraction of steps scoring > 0.50 — passing bar |
+| `prm_min_mean` | Average of each solution's weakest step — catches systematic reasoning errors |
+| `n_steps_total` | Total reasoning steps evaluated (proportional to eval_max_samples × avg solution depth) |
+| `prm_degraded_frac` | Fraction of eval solutions where PRM found no extractable steps (should be < 5%) |
 | `q_topic_match` | Avg topic-match component: did the generated question match the requested topic? |
 | `q_difficulty_fit` | Avg difficulty-fit component: was the generated question at the target difficulty? |
 | `q_clarity` | Avg clarity score (structural heuristics) |
@@ -1078,25 +1093,42 @@ Iter 10 | loss=-0.0023 | reward mean=0.762 std=0.231 | batch_acc=83.1% | groups=
   Question generation: 5/5 valid (100%) | q_reward=0.621 | q_acc=80.0% (>0.5 quality) | topic=0.74 diff=0.68 clarity=0.71 novelty=0.55 solvability=0.69
 ```
 
-**Live tqdm bar** (updated per group):
+**Eval output (every `--eval-every` iterations):**
 ```
-Iter 10 GRPO groups:  75%|███████▌  | 12/16 [00:38<00:12  mean_r=0.762, loss=-0.003, skip=0, q_acc=80%, q_rew=0.621]
+Step Accuracy   : 74.5% (PRM>0.7) | best=72.1% | PRM_mean=0.847 (best=0.831) | step_acc(>0.5)=91.2% | prm_min_mean=0.612 | n_steps=287
+  (debug) Final-answer: 63.3% (19/30)
 ```
+
+**Live tqdm bar during evaluation** (step quality is the primary display):
+```
+GSM8K eval:  60%|██████    | 18/30 [00:53<00:35  step_acc=74.5%, prm=0.847, ans=19/30]
+```
+
+**Why step accuracy is the sole metric:**
+
+Final-answer accuracy is a coarse binary signal. A model can improve every reasoning step — going from a 3-step wrong answer to a 4-step near-correct answer — and final-answer accuracy registers zero improvement. The PRM scores every individual step and exposes this incremental reasoning quality directly.
+
+> **`step_acc` (fraction of reasoning steps scoring > 0.7) is THE accuracy metric. `prm_mean` is the headline score. Final-answer accuracy is a secondary debug field only — it drives nothing.**
+
+The `best_policy` checkpoint is saved whenever `step_acc` improves.
 
 **Field-by-field health guide:**
 
-| Field | Healthy range | Warning |
-|---|---|---|
-| `loss` | Trending more negative | Stuck at 0 = all groups skipped (variance collapse) |
-| `reward mean` | Trending upward over iterations | Flat or declining = check reward pipeline |
-| `std` | > 0.05 | ≤ 0.05 = mode collapse (all K solutions identical) |
-| `batch_acc` | > 50% and trending up | < 30% for many iters = model not learning |
-| `skipped` | 0–2/iter | > half of groups = increase `--temperature` |
-| `q_gen_valid_rate` | ≥ 90% | Low = model generating blank/nonsense questions |
-| `q_quality_rate` (q_acc) | ≥ 50% and rising | Low = model generating poor questions; check topic templates |
-| `q_topic_match` | ≥ 0.6 | Low = model ignoring curriculum instruction |
-| `q_solvability` | ≥ 0.5 | Low = model generating unsolvable questions |
-| `lr` | Warmup → cosine decay | Stuck at min = schedule misconfigured |
+| Field | Source | Healthy range | Warning |
+|---|---|---|---|
+| `loss` | Training | Trending more negative | Stuck at 0 = variance collapse |
+| `reward mean` | Training | Trending upward | Flat = check reward pipeline |
+| `std` | Training | > 0.05 | ≤ 0.05 = mode collapse |
+| `batch_acc` | Training | > 50% | < 30% sustained = not learning |
+| `skipped` | Training | 0–2/iter | > half = increase `--temperature` |
+| **`step_acc`** (PRM>0.7) | **Eval** | **≥ 65% and rising** | **Declining = reward shaping regression** |
+| **`prm_mean`** | **Eval** | **Trending up over iters** | **Flat = model not improving reasoning quality** |
+| `step_acc_50` | Eval | ≥ 85% | Low = basic step coherence failing |
+| `prm_min_mean` | Eval | ≥ 0.55 | Low = systematic weak steps (error propagation) |
+| `final_answer_accuracy` | Eval (debug) | Lags step_acc | Can be flat while step_acc rises — expected |
+| `q_gen_valid_rate` | Training | ≥ 90% | Low = blank/nonsense question generation |
+| `q_quality_rate` (q_acc) | Training | ≥ 50% and rising | Low = poor self-play questions |
+| `lr` | Training | Warmup → cosine decay | Stuck at min = schedule misconfigured |
 
 ### 11.3 PPO log files
 

@@ -741,7 +741,16 @@ def evaluate_policy(
     eval_data_path: str,
     max_samples: int,
     max_new_tokens: int,
+    prm_scorer: Optional[Any] = None,
 ) -> Dict[str, object]:
+    """Run GSM8K evaluation with optional PRM step-quality scoring.
+
+    When *prm_scorer* is supplied the evaluation scores every reasoning step
+    and returns step-level quality metrics alongside final-answer accuracy.
+    Step quality (``step_acc``, ``prm_mean``) is the *primary* improvement
+    signal: it captures incremental reasoning gains that binary final-answer
+    accuracy misses entirely.
+    """
     if not Path(eval_data_path).exists():
         return {"accuracy": 0.0, "correct": 0, "total": 0}
     model.eval()
@@ -751,6 +760,7 @@ def evaluate_policy(
         data_path=eval_data_path,
         max_samples=max_samples,
         max_new_tokens=max_new_tokens,
+        prm_scorer=prm_scorer,
     )
     model.train()
     return results
@@ -1243,14 +1253,32 @@ def main() -> None:
         initial_eval = evaluate_policy(
             model, tokenizer,
             args.eval_data_path, args.eval_max_samples, args.eval_max_new_tokens,
+            prm_scorer=prm if args.use_prm else None,
         )
-        logger.info("GSM8K Accuracy: %.2f%% (%d/%d)",
-                    100 * initial_eval["accuracy"],
-                    initial_eval["correct"], initial_eval["total"])
+        # "accuracy" == step_acc when prm_scorer is active (see evaluate_gsm8k)
+        logger.info(
+            "Step Accuracy   : %.1f%% (PRM>0.7) | PRM_mean=%.3f | "
+            "step_acc(>0.5)=%.1f%% | prm_min_mean=%.3f | n_steps=%d",
+            100 * initial_eval.get("step_acc", 0.0),
+            initial_eval.get("prm_mean", 0.0),
+            100 * initial_eval.get("step_acc_50", 0.0),
+            initial_eval.get("prm_min_mean", 0.0),
+            initial_eval.get("n_steps_total", 0),
+        )
+        logger.info(
+            "  (debug) Final-answer accuracy: %.1f%% (%d/%d)",
+            100 * initial_eval.get("final_answer_accuracy", 0.0),
+            initial_eval.get("final_answer_correct", 0),
+            initial_eval.get("total", 0),
+        )
         metrics_log.append({"iteration": 0, **initial_eval})
-        best_accuracy = float(initial_eval.get("accuracy", 0.0))
+        best_accuracy = float(initial_eval.get("accuracy",  0.0))  # = step_acc
+        best_step_acc = float(initial_eval.get("step_acc",  0.0))
+        best_prm_mean = float(initial_eval.get("prm_mean",  0.0))
     else:
         best_accuracy = 0.0
+        best_step_acc = 0.0
+        best_prm_mean = 0.0
 
     # ── Training ─────────────────────────────────────────────────────────────
     for iteration in range(1, args.num_iterations + 1):
@@ -1568,20 +1596,44 @@ def main() -> None:
             eval_res = evaluate_policy(
                 model, tokenizer,
                 args.eval_data_path, args.eval_max_samples, args.eval_max_new_tokens,
+                prm_scorer=prm if args.use_prm else None,
             )
-            gsm8k_acc = float(eval_res.get("accuracy", 0.0))
+            # "accuracy" == step_acc when prm_scorer is active (see evaluate_gsm8k)
+            cur_step_acc = float(eval_res.get("accuracy",  best_step_acc))
+            cur_prm_mean = float(eval_res.get("prm_mean",  best_prm_mean))
+
+            # ── Primary metric: step-level reasoning quality ─────────────────
             logger.info(
-                "GSM8K Accuracy: %.2f%% (%d/%d) | best=%.2f%%",
-                100 * gsm8k_acc,
-                eval_res["correct"], eval_res["total"],
-                100 * best_accuracy,
+                "Step Accuracy   : %.1f%% (PRM>0.7) | best=%.1f%% | "
+                "PRM_mean=%.3f (best=%.3f) | step_acc(>0.5)=%.1f%% | "
+                "prm_min_mean=%.3f | n_steps=%d",
+                100 * cur_step_acc,   100 * best_step_acc,
+                cur_prm_mean,         best_prm_mean,
+                100 * eval_res.get("step_acc_50", 0.0),
+                eval_res.get("prm_min_mean", 0.0),
+                eval_res.get("n_steps_total", 0),
             )
-            if gsm8k_acc > best_accuracy:
-                best_accuracy = gsm8k_acc
+            # ── Secondary debug line: final-answer accuracy ──────────────────
+            logger.info(
+                "  (debug) Final-answer: %.1f%% (%d/%d)",
+                100 * eval_res.get("final_answer_accuracy", 0.0),
+                eval_res.get("final_answer_correct", 0),
+                eval_res.get("total", 0),
+            )
+
+            # ── Best-checkpoint: step accuracy is the sole criterion ─────────
+            if cur_step_acc > best_step_acc:
+                best_step_acc = cur_step_acc
+                best_prm_mean = max(best_prm_mean, cur_prm_mean)
+                best_accuracy = cur_step_acc   # keep best_accuracy == best_step_acc
                 best_path = out_dir / "best_policy"
                 model.save_pretrained(str(best_path))
                 tokenizer.save_pretrained(str(best_path))
-                logger.info("New best saved to %s", best_path)
+                logger.info(
+                    "New best saved to %s  (step_acc %.1f%%  PRM_mean %.3f)",
+                    best_path, 100 * cur_step_acc, cur_prm_mean,
+                )
+
             iter_metrics.update(eval_res)
 
         # --- Save checkpoint (respect --save-every / --keep-last) ---
@@ -1627,16 +1679,22 @@ def main() -> None:
             "skipped_groups": iter_metrics.get("skipped_groups", 0),
             "learning_rate":  iter_metrics.get("learning_rate", 0.0),
             "iter_time_s":    iter_metrics.get("iter_time_s", 0.0),
-            # eval columns are empty ("") on non-eval iterations so the CSV
-            # stays columnar without shifting anything.
+            # Final-answer eval (empty on non-eval iterations to keep CSV columnar)
             "gsm8k_accuracy": iter_metrics.get("accuracy", ""),
             "gsm8k_correct":  iter_metrics.get("correct", ""),
             "gsm8k_total":    iter_metrics.get("total", ""),
+            # Step-quality eval (primary improvement signal)
+            "prm_mean":       iter_metrics.get("prm_mean", ""),
+            "step_acc":       iter_metrics.get("step_acc", ""),
+            "step_acc_50":    iter_metrics.get("step_acc_50", ""),
+            "prm_min_mean":   iter_metrics.get("prm_min_mean", ""),
+            "n_steps_total":  iter_metrics.get("n_steps_total", ""),
         })
 
     logger.info("=" * 70)
     logger.info("GRPO training complete.")
-    logger.info("Best GSM8K accuracy : %.2f%%", 100 * best_accuracy)
+    logger.info("Best step accuracy  : %.1f%% (PRM > 0.7)", 100 * best_step_acc)
+    logger.info("Best PRM mean score : %.3f", best_prm_mean)
     logger.info("Checkpoints         : %s", out_dir)
     logger.info("Logs                : %s", log_dir)
     logger.info("Console log         : %s", console_log_path)
@@ -1644,14 +1702,16 @@ def main() -> None:
 
     # ── Final summary ─────────────────────────────────────────────────────────
     summary: Dict[str, Any] = {
-        "run_name": run_name,
-        "best_accuracy": best_accuracy,
+        "run_name":        run_name,
+        "best_accuracy":   best_step_acc,   # accuracy == step_acc throughout
+        "best_step_acc":   best_step_acc,
+        "best_prm_mean":   best_prm_mean,
         "total_iterations": args.num_iterations,
         "checkpoints_dir": str(out_dir),
-        "log_dir": str(log_dir),
-        "console_log": str(console_log_path),
-        "metrics_csv": str(_metrics_csv_path),
-        "metrics_jsonl": str(out_dir / "metrics.jsonl"),
+        "log_dir":         str(log_dir),
+        "console_log":     str(console_log_path),
+        "metrics_csv":     str(_metrics_csv_path),
+        "metrics_jsonl":   str(out_dir / "metrics.jsonl"),
     }
     (log_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, default=str), encoding="utf-8"

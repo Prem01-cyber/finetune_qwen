@@ -299,24 +299,45 @@ def evaluate_gsm8k(
     max_new_tokens: int = 512,
     temperature: float = 0.0,
     top_p: float = 1.0,
+    prm_scorer: Any = None,
+    step_quality_threshold: float = 0.7,
 ) -> dict:
     """
     Evaluate *model* on a GSM8K-formatted JSONL file.
 
-    Called by ``scripts/run_ppo_training.py`` at each eval step.
+    Called by ``scripts/run_ppo_training.py`` and ``scripts/run_grpo_training.py``
+    at each eval step.
 
     Args:
-        model          : AutoModelForCausalLM (already loaded, on correct device).
-        tokenizer      : Matching AutoTokenizer.
-        data_path      : Path to JSONL with {question, answer} rows.
-                         Falls back to the HuggingFace hub split when not found.
-        max_samples    : Evaluation cap (for speed during training).
-        max_new_tokens : Generation budget per problem.
-        temperature    : Sampling temperature (0 → greedy).
-        top_p          : Nucleus sampling p.
+        model                  : AutoModelForCausalLM (already loaded, on correct device).
+        tokenizer              : Matching AutoTokenizer.
+        data_path              : Path to JSONL with {question, answer} rows.
+                                 Falls back to the HuggingFace hub split when not found.
+        max_samples            : Evaluation cap (for speed during training).
+        max_new_tokens         : Generation budget per problem.
+        temperature            : Sampling temperature (0 → greedy).
+        top_p                  : Nucleus sampling p.
+        prm_scorer             : Optional ProcessRewardScorer instance.  When provided
+                                 the evaluation scores every reasoning *step* and reports
+                                 step-level quality metrics alongside final-answer accuracy.
+                                 This is the primary measure of reasoning improvement —
+                                 final-answer accuracy is a coarse binary signal that
+                                 masks incremental step-quality gains.
+        step_quality_threshold : Steps with PRM score above this value count as
+                                 "high-quality".  Default 0.7.
 
     Returns:
-        dict with keys: accuracy, correct, total, exact_match_rate
+        dict with keys:
+            accuracy            – final-answer exact-match rate
+            correct / total
+            exact_match_rate    – alias for accuracy
+            # PRM step quality fields (only present when prm_scorer is not None):
+            prm_mean            – avg PRM score across all steps of all solutions
+            prm_min_mean        – avg of per-solution weakest-step scores
+            step_acc            – fraction of steps scoring > step_quality_threshold
+            step_acc_50         – fraction of steps scoring > 0.50 (passing bar)
+            n_steps_total       – total reasoning steps evaluated
+            prm_degraded_frac   – fraction of solutions where PRM found no steps
     """
     import logging as _logging
     _logger = _logging.getLogger(__name__)
@@ -370,9 +391,13 @@ def evaluate_gsm8k(
     _n_errors = 0
     _MAX_ERROR_WARNINGS = 3   # surface the first few failures loudly
 
+    # PRM step-quality accumulators — populated only when prm_scorer is provided.
+    _all_step_scores: list[float] = []   # every individual step score
+    _sol_min_scores:  list[float] = []   # weakest step per solution
+    _prm_degraded    = 0                 # solutions where PRM found no steps
+
     # tqdm gives us a live progress bar with ETA; the `postfix` surfaces the
-    # running accuracy so long runs are interpretable mid-flight.  Falls back
-    # gracefully in non-TTY environments (tqdm.auto picks notebook vs plain).
+    # running accuracy AND step quality so long runs are interpretable mid-flight.
     pbar = tqdm(
         rows,
         total=total,
@@ -382,6 +407,7 @@ def evaluate_gsm8k(
         leave=True,
     )
     for i, row in enumerate(pbar):
+        pred_text = ""
         try:
             pred_text = _generate(
                 model=model,
@@ -413,20 +439,84 @@ def evaluate_gsm8k(
                 )
             _logger.debug(f"Sample {i} error: {exc}", exc_info=True)
 
-        done = i + 1
-        pbar.set_postfix(
-            acc=f"{correct / done:.1%}",
-            correct=f"{correct}/{done}",
-            refresh=False,
-        )
+        # --- PRM step-quality scoring ---
+        # This is the *primary* improvement signal: how well does the model
+        # reason step-by-step, independent of whether the final number matches.
+        if prm_scorer is not None and pred_text:
+            try:
+                prm_result = prm_scorer.score_solution(
+                    question=row["question"],
+                    solution=pred_text,
+                )
+                if prm_result.get("degraded", False) or not prm_result.get("step_scores"):
+                    _prm_degraded += 1
+                else:
+                    step_scores = prm_result["step_scores"]
+                    _all_step_scores.extend(step_scores)
+                    _sol_min_scores.append(prm_result["min_score"])
+            except Exception as prm_exc:
+                _logger.debug("PRM scoring failed for sample %d: %s", i, prm_exc)
+                _prm_degraded += 1
 
-    accuracy = correct / total if total > 0 else 0.0
-    return {
-        "accuracy": accuracy,
-        "correct": correct,
-        "total": total,
-        "exact_match_rate": accuracy,
-    }
+        done = i + 1
+        # Primary display: step quality when PRM is active, final-answer otherwise.
+        if _all_step_scores:
+            _n_good_live = sum(1 for s in _all_step_scores if s > step_quality_threshold)
+            _pf: dict = dict(
+                step_acc=f"{_n_good_live / len(_all_step_scores):.1%}",
+                prm=f"{sum(_all_step_scores) / len(_all_step_scores):.3f}",
+                ans=f"{correct}/{done}",
+            )
+        else:
+            _pf = dict(acc=f"{correct / done:.1%}", correct=f"{correct}/{done}")
+        pbar.set_postfix(**_pf, refresh=False)
+
+    # ── Compute final-answer accuracy (kept as a debug field only) ─────────
+    final_answer_accuracy = correct / total if total > 0 else 0.0
+
+    # ── Compute step-quality metrics (the primary accuracy signal) ──────────
+    n_steps   = len(_all_step_scores)
+    n_good_70 = sum(1 for s in _all_step_scores if s > step_quality_threshold)
+    n_good_50 = sum(1 for s in _all_step_scores if s > 0.50)
+    step_acc   = round(n_good_70 / n_steps, 4) if n_steps else 0.0
+    prm_mean   = round(sum(_all_step_scores) / n_steps, 4) if n_steps else 0.0
+    prm_min_mn = round(sum(_sol_min_scores) / len(_sol_min_scores), 4) if _sol_min_scores else 0.0
+    step_acc50 = round(n_good_50 / n_steps, 4) if n_steps else 0.0
+
+    if prm_scorer is not None:
+        # Step accuracy is THE accuracy metric — it directly measures reasoning
+        # quality, not the coarse binary final-answer signal.
+        # "accuracy" = step_acc so that all downstream code (best-checkpoint
+        # saving, metrics logging) automatically uses the step-quality measure.
+        result: dict = {
+            "accuracy":              step_acc,        # PRIMARY: step quality
+            "step_acc":              step_acc,
+            "step_acc_50":           step_acc50,
+            "prm_mean":              prm_mean,
+            "prm_min_mean":          prm_min_mn,
+            "n_steps_total":         n_steps,
+            "prm_degraded_frac":     round(_prm_degraded / total, 4) if total else 0.0,
+            # Final-answer kept as secondary debug field — not used for anything
+            "final_answer_accuracy": final_answer_accuracy,
+            "final_answer_correct":  correct,
+            "total":                 total,
+        }
+    else:
+        # No PRM available — fall back to final-answer accuracy with a warning.
+        _logger.warning(
+            "evaluate_gsm8k: no prm_scorer provided — falling back to final-answer "
+            "accuracy.  This is a coarse binary signal; pass prm_scorer for real "
+            "step-quality measurement."
+        )
+        result = {
+            "accuracy":              final_answer_accuracy,
+            "step_acc":              0.0,
+            "prm_mean":              0.0,
+            "final_answer_accuracy": final_answer_accuracy,
+            "final_answer_correct":  correct,
+            "total":                 total,
+        }
+    return result
 
 
 if __name__ == "__main__":
