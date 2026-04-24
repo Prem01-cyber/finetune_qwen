@@ -279,11 +279,19 @@ def load_math_dataset(
         "(lighteval/MATH, difficulty ≤ %d, numeric answers only)...",
         max_difficulty,
     )
+    # Try multiple HF sources in priority order.
+    # Each entry is (repo_id, extra_kwargs) — extra_kwargs forwarded to load_dataset.
+    _HF_SOURCES = [
+        ("qwedsacf/competition_math",  {}),                      # reliable mirror
+        ("lighteval/MATH-Hard",        {"name": "default"}),     # hard subset
+        ("lighteval/MATH",             {}),
+        ("hendrycks/competition_math", {}),
+    ]
     ds = None
-    for hf_name in ("lighteval/MATH", "hendrycks/competition_math"):
+    for hf_name, hf_kwargs in _HF_SOURCES:
         try:
             from datasets import load_dataset  # type: ignore
-            ds = load_dataset(hf_name, split="train", trust_remote_code=True)
+            ds = load_dataset(hf_name, split="train", trust_remote_code=True, **hf_kwargs)
             logger.info("Loaded HuggingFace dataset: %s (%d items)", hf_name, len(ds))
             break
         except Exception as exc:
