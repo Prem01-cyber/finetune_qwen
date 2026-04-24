@@ -391,13 +391,33 @@ def evaluate_gsm8k(
     _n_errors = 0
     _MAX_ERROR_WARNINGS = 3   # surface the first few failures loudly
 
-    # PRM step-quality accumulators — populated only when prm_scorer is provided.
-    _all_step_scores: list[float] = []   # every individual step score
-    _sol_min_scores:  list[float] = []   # weakest step per solution
-    _prm_degraded    = 0                 # solutions where PRM found no steps
+    # PRM per-solution accumulators.
+    #
+    # For each solution we compute:
+    #   step_frac  = good_steps / total_steps  (fraction of steps passing threshold)
+    #   mean_score = mean of all step scores   (continuous quality signal)
+    #   min_score  = worst step score           (error locator)
+    #
+    # We then macro-average these over all solutions so every solution
+    # contributes equally regardless of how many steps it contains.
+    #
+    # Key metrics reported:
+    #   step_frac_mean  = E[good_steps_i / total_steps_i]
+    #                     "On average, X% of each solution's steps were correct"
+    #                     — row-level step accuracy, macro-averaged (PRIMARY DISPLAY)
+    #   prm_mean        = E[mean_score_i]
+    #                     Continuous quality, most sensitive to small improvements
+    #                     — used for checkpoint saving (tiebreaker on step_frac_mean)
+    #   step_acc        = fraction of solutions where step_frac >= threshold
+    #                     Binary pass/fail per solution (comparable to final-answer acc)
+    #   step_acc_strict = fraction of solutions where ALL steps >= threshold
+    _sol_step_fracs:   list[float] = []   # good_steps/total_steps per solution
+    _sol_mean_scores:  list[float] = []   # mean step score per solution
+    _sol_min_scores:   list[float] = []   # min step score per solution
+    _sol_step_pass:    list[int]   = []   # 1 if step_frac >= threshold
+    _sol_step_strict:  list[int]   = []   # 1 if ALL steps >= threshold
+    _prm_degraded = 0                     # solutions where PRM found no steps
 
-    # tqdm gives us a live progress bar with ETA; the `postfix` surfaces the
-    # running accuracy AND step quality so long runs are interpretable mid-flight.
     pbar = tqdm(
         rows,
         total=total,
@@ -420,8 +440,7 @@ def evaluate_gsm8k(
             )
             pred_final = extract_final_answer_numeric_str(pred_text) or ""
             gold_final = row["gold_final"]
-            match = _equiv_expr(pred_final, gold_final)
-            if match:
+            if _equiv_expr(pred_final, gold_final):
                 correct += 1
         except Exception as exc:
             _n_errors += 1
@@ -439,9 +458,7 @@ def evaluate_gsm8k(
                 )
             _logger.debug(f"Sample {i} error: {exc}", exc_info=True)
 
-        # --- PRM step-quality scoring ---
-        # This is the *primary* improvement signal: how well does the model
-        # reason step-by-step, independent of whether the final number matches.
+        # ── PRM per-solution step-quality scoring ─────────────────────────────
         if prm_scorer is not None and pred_text:
             try:
                 prm_result = prm_scorer.score_solution(
@@ -451,65 +468,92 @@ def evaluate_gsm8k(
                 if prm_result.get("degraded", False) or not prm_result.get("step_scores"):
                     _prm_degraded += 1
                 else:
-                    step_scores = prm_result["step_scores"]
-                    _all_step_scores.extend(step_scores)
-                    _sol_min_scores.append(prm_result["min_score"])
+                    scores   = prm_result["step_scores"]
+                    n_steps  = len(scores)
+                    n_good   = sum(1 for s in scores if s >= step_quality_threshold)
+
+                    # Row-level step fraction: what fraction of THIS solution's
+                    # steps passed the threshold.  Macro-averaged below.
+                    sol_frac   = n_good / n_steps
+                    sol_mean   = prm_result["mean_score"]
+                    sol_min    = prm_result["min_score"]
+                    all_pass   = (n_good == n_steps)
+
+                    _sol_step_fracs.append(sol_frac)
+                    _sol_mean_scores.append(sol_mean)
+                    _sol_min_scores.append(sol_min)
+                    # Binary: solution passes if its row-level fraction >= threshold
+                    _sol_step_pass.append(1 if sol_frac >= step_quality_threshold else 0)
+                    _sol_step_strict.append(1 if all_pass else 0)
             except Exception as prm_exc:
                 _logger.debug("PRM scoring failed for sample %d: %s", i, prm_exc)
                 _prm_degraded += 1
 
         done = i + 1
-        # Primary display: step quality when PRM is active, final-answer otherwise.
-        if _all_step_scores:
-            _n_good_live = sum(1 for s in _all_step_scores if s > step_quality_threshold)
+        # Live tqdm: step_frac_mean (row-level, macro-averaged) + prm_mean.
+        if _sol_step_fracs:
             _pf: dict = dict(
-                step_acc=f"{_n_good_live / len(_all_step_scores):.1%}",
-                prm=f"{sum(_all_step_scores) / len(_all_step_scores):.3f}",
+                step_frac=f"{sum(_sol_step_fracs) / len(_sol_step_fracs):.1%}",
+                prm=f"{sum(_sol_mean_scores) / len(_sol_mean_scores):.3f}",
                 ans=f"{correct}/{done}",
             )
         else:
             _pf = dict(acc=f"{correct / done:.1%}", correct=f"{correct}/{done}")
         pbar.set_postfix(**_pf, refresh=False)
 
-    # ── Compute final-answer accuracy (kept as a debug field only) ─────────
+    # ── Final-answer accuracy (debug field only) ───────────────────────────
     final_answer_accuracy = correct / total if total > 0 else 0.0
 
-    # ── Compute step-quality metrics (the primary accuracy signal) ──────────
-    n_steps   = len(_all_step_scores)
-    n_good_70 = sum(1 for s in _all_step_scores if s > step_quality_threshold)
-    n_good_50 = sum(1 for s in _all_step_scores if s > 0.50)
-    step_acc   = round(n_good_70 / n_steps, 4) if n_steps else 0.0
-    prm_mean   = round(sum(_all_step_scores) / n_steps, 4) if n_steps else 0.0
-    prm_min_mn = round(sum(_sol_min_scores) / len(_sol_min_scores), 4) if _sol_min_scores else 0.0
-    step_acc50 = round(n_good_50 / n_steps, 4) if n_steps else 0.0
+    # ── Step-quality metrics (primary) ─────────────────────────────────────
+    n_scored = len(_sol_step_fracs)   # solutions where PRM succeeded
+
+    # C — Row-level step fraction, macro-averaged (PRIMARY DISPLAY METRIC)
+    #     = average of (good_steps / total_steps) computed per solution
+    #     Interpretation: "on average X% of each solution's steps were correct"
+    step_frac_mean  = round(sum(_sol_step_fracs)   / n_scored, 4) if n_scored else 0.0
+
+    # D — Continuous PRM mean (CHECKPOINT-SAVING SIGNAL)
+    #     = average of per-solution mean step scores (no threshold)
+    #     Most sensitive to small quality improvements.
+    prm_mean        = round(sum(_sol_mean_scores)  / n_scored, 4) if n_scored else 0.0
+
+    # Binary — solutions where row-level step_frac >= threshold
+    step_acc        = round(sum(_sol_step_pass)    / n_scored, 4) if n_scored else 0.0
+
+    # Strict — solutions where EVERY step >= threshold
+    step_acc_strict = round(sum(_sol_step_strict)  / n_scored, 4) if n_scored else 0.0
+
+    # Worst-step quality (error locator)
+    prm_min_mean    = round(sum(_sol_min_scores)   / n_scored, 4) if n_scored else 0.0
 
     if prm_scorer is not None:
-        # Step accuracy is THE accuracy metric — it directly measures reasoning
-        # quality, not the coarse binary final-answer signal.
-        # "accuracy" = step_acc so that all downstream code (best-checkpoint
-        # saving, metrics logging) automatically uses the step-quality measure.
         result: dict = {
-            "accuracy":              step_acc,        # PRIMARY: step quality
-            "step_acc":              step_acc,
-            "step_acc_50":           step_acc50,
+            # PRIMARY DISPLAY: row-level step fraction, macro-averaged over solutions
+            "accuracy":              step_frac_mean,
+            "step_frac_mean":        step_frac_mean,
+            # CHECKPOINT SIGNAL: continuous PRM mean (most sensitive)
             "prm_mean":              prm_mean,
-            "prm_min_mean":          prm_min_mn,
-            "n_steps_total":         n_steps,
+            # BINARY: fraction of solutions whose step_frac >= threshold
+            "step_acc":              step_acc,
+            # STRICT: fraction where ALL steps >= threshold
+            "step_acc_strict":       step_acc_strict,
+            # ERROR LOCATOR: average worst step per solution
+            "prm_min_mean":          prm_min_mean,
+            "n_solutions_scored":    n_scored,
             "prm_degraded_frac":     round(_prm_degraded / total, 4) if total else 0.0,
-            # Final-answer kept as secondary debug field — not used for anything
+            # DEBUG: final-answer matching — drives nothing
             "final_answer_accuracy": final_answer_accuracy,
             "final_answer_correct":  correct,
             "total":                 total,
         }
     else:
-        # No PRM available — fall back to final-answer accuracy with a warning.
         _logger.warning(
             "evaluate_gsm8k: no prm_scorer provided — falling back to final-answer "
-            "accuracy.  This is a coarse binary signal; pass prm_scorer for real "
-            "step-quality measurement."
+            "accuracy.  Pass prm_scorer for real step-quality measurement."
         )
         result = {
             "accuracy":              final_answer_accuracy,
+            "step_frac_mean":        0.0,
             "step_acc":              0.0,
             "prm_mean":              0.0,
             "final_answer_accuracy": final_answer_accuracy,

@@ -1255,15 +1255,18 @@ def main() -> None:
             args.eval_data_path, args.eval_max_samples, args.eval_max_new_tokens,
             prm_scorer=prm if args.use_prm else None,
         )
-        # "accuracy" == step_acc when prm_scorer is active (see evaluate_gsm8k)
+        # "accuracy" == step_frac_mean (row-level step fraction, macro-averaged)
+        # prm_mean is the continuous quality signal used for checkpoint saving.
+        n_sc = initial_eval.get("n_solutions_scored", 0)
         logger.info(
-            "Step Accuracy   : %.1f%% (PRM>0.7) | PRM_mean=%.3f | "
-            "step_acc(>0.5)=%.1f%% | prm_min_mean=%.3f | n_steps=%d",
-            100 * initial_eval.get("step_acc", 0.0),
-            initial_eval.get("prm_mean", 0.0),
-            100 * initial_eval.get("step_acc_50", 0.0),
+            "Step Quality    : step_frac=%.1f%% | step_acc(frac≥0.7)=%.1f%% (%d/%d) | "
+            "strict(all≥0.7)=%.1f%% | PRM_mean=%.3f | prm_min=%.3f",
+            100 * initial_eval.get("step_frac_mean",  0.0),
+            100 * initial_eval.get("step_acc",        0.0),
+            round(initial_eval.get("step_acc", 0.0) * n_sc), n_sc,
+            100 * initial_eval.get("step_acc_strict", 0.0),
+            initial_eval.get("prm_mean",    0.0),
             initial_eval.get("prm_min_mean", 0.0),
-            initial_eval.get("n_steps_total", 0),
         )
         logger.info(
             "  (debug) Final-answer accuracy: %.1f%% (%d/%d)",
@@ -1272,9 +1275,9 @@ def main() -> None:
             initial_eval.get("total", 0),
         )
         metrics_log.append({"iteration": 0, **initial_eval})
-        best_accuracy = float(initial_eval.get("accuracy",  0.0))  # = step_acc
-        best_step_acc = float(initial_eval.get("step_acc",  0.0))
-        best_prm_mean = float(initial_eval.get("prm_mean",  0.0))
+        best_accuracy = float(initial_eval.get("accuracy",       0.0))  # = step_frac_mean
+        best_step_acc = float(initial_eval.get("step_frac_mean", 0.0))
+        best_prm_mean = float(initial_eval.get("prm_mean",       0.0))
     else:
         best_accuracy = 0.0
         best_step_acc = 0.0
@@ -1598,22 +1601,23 @@ def main() -> None:
                 args.eval_data_path, args.eval_max_samples, args.eval_max_new_tokens,
                 prm_scorer=prm if args.use_prm else None,
             )
-            # "accuracy" == step_acc when prm_scorer is active (see evaluate_gsm8k)
-            cur_step_acc = float(eval_res.get("accuracy",  best_step_acc))
-            cur_prm_mean = float(eval_res.get("prm_mean",  best_prm_mean))
+            # "accuracy" == step_frac_mean (row-level, macro-averaged)
+            cur_step_frac = float(eval_res.get("accuracy",       best_step_acc))
+            cur_prm_mean  = float(eval_res.get("prm_mean",       best_prm_mean))
+            n_scored      = eval_res.get("n_solutions_scored",   0)
 
-            # ── Primary metric: step-level reasoning quality ─────────────────
+            # ── Primary display: row-level step fraction + PRM mean ──────────
             logger.info(
-                "Step Accuracy   : %.1f%% (PRM>0.7) | best=%.1f%% | "
-                "PRM_mean=%.3f (best=%.3f) | step_acc(>0.5)=%.1f%% | "
-                "prm_min_mean=%.3f | n_steps=%d",
-                100 * cur_step_acc,   100 * best_step_acc,
-                cur_prm_mean,         best_prm_mean,
-                100 * eval_res.get("step_acc_50", 0.0),
+                "Step Quality    : step_frac=%.1f%% (best=%.1f%%) | "
+                "step_acc(frac≥0.7)=%.1f%% (%d/%d) | strict=%.1f%% | "
+                "PRM_mean=%.3f (best=%.3f) | prm_min=%.3f",
+                100 * cur_step_frac,  100 * best_step_acc,
+                100 * eval_res.get("step_acc", 0.0),
+                round(eval_res.get("step_acc", 0.0) * n_scored), n_scored,
+                100 * eval_res.get("step_acc_strict", 0.0),
+                cur_prm_mean, best_prm_mean,
                 eval_res.get("prm_min_mean", 0.0),
-                eval_res.get("n_steps_total", 0),
             )
-            # ── Secondary debug line: final-answer accuracy ──────────────────
             logger.info(
                 "  (debug) Final-answer: %.1f%% (%d/%d)",
                 100 * eval_res.get("final_answer_accuracy", 0.0),
@@ -1621,20 +1625,22 @@ def main() -> None:
                 eval_res.get("total", 0),
             )
 
-            # ── Best-checkpoint: step_acc primary, prm_mean tiebreaker ─────
-            # Save when step_acc strictly improves, OR when step_acc ties but
-            # prm_mean is higher (the model's reasoning quality improved even
-            # though it didn't cross another step_acc threshold bucket).
-            step_improved = cur_step_acc > best_step_acc
-            prm_tiebreak  = (cur_step_acc == best_step_acc
-                             and cur_prm_mean > best_prm_mean + 1e-4)
+            # ── Best-checkpoint: step_frac_mean primary, prm_mean tiebreaker ─
+            # Save when row-level step fraction improves, OR when it ties but
+            # the continuous PRM mean improved (detects quality gains below
+            # the resolution of the fraction metric).
+            step_improved = cur_step_frac > best_step_acc
+            prm_tiebreak  = (
+                abs(cur_step_frac - best_step_acc) < 1e-4
+                and cur_prm_mean > best_prm_mean + 1e-4
+            )
             if step_improved or prm_tiebreak:
                 reason = (
-                    f"step_acc {100*cur_step_acc:.1f}%"
+                    f"step_frac {100*cur_step_frac:.1f}%"
                     if step_improved
                     else f"PRM_mean {cur_prm_mean:.4f} > {best_prm_mean:.4f}"
                 )
-                best_step_acc = max(best_step_acc, cur_step_acc)
+                best_step_acc = max(best_step_acc, cur_step_frac)
                 best_prm_mean = max(best_prm_mean, cur_prm_mean)
                 best_accuracy = best_step_acc
                 best_path = out_dir / "best_policy"
@@ -1695,17 +1701,18 @@ def main() -> None:
             "gsm8k_correct":  iter_metrics.get("correct", ""),
             "gsm8k_total":    iter_metrics.get("total", ""),
             # Step-quality eval (primary improvement signal)
-            "prm_mean":       iter_metrics.get("prm_mean", ""),
-            "step_acc":       iter_metrics.get("step_acc", ""),
-            "step_acc_50":    iter_metrics.get("step_acc_50", ""),
-            "prm_min_mean":   iter_metrics.get("prm_min_mean", ""),
-            "n_steps_total":  iter_metrics.get("n_steps_total", ""),
+            "step_frac_mean":    iter_metrics.get("step_frac_mean",   ""),
+            "step_acc":          iter_metrics.get("step_acc",         ""),
+            "step_acc_strict":   iter_metrics.get("step_acc_strict",  ""),
+            "prm_mean":          iter_metrics.get("prm_mean",         ""),
+            "prm_min_mean":      iter_metrics.get("prm_min_mean",     ""),
+            "n_solutions_scored":iter_metrics.get("n_solutions_scored",""),
         })
 
     logger.info("=" * 70)
     logger.info("GRPO training complete.")
-    logger.info("Best step accuracy  : %.1f%% (PRM > 0.7)", 100 * best_step_acc)
-    logger.info("Best PRM mean score : %.3f", best_prm_mean)
+    logger.info("Best step_frac_mean : %.1f%% (avg row-level step fraction)", 100 * best_step_acc)
+    logger.info("Best PRM mean score : %.3f (continuous quality signal)", best_prm_mean)
     logger.info("Checkpoints         : %s", out_dir)
     logger.info("Logs                : %s", log_dir)
     logger.info("Console log         : %s", console_log_path)

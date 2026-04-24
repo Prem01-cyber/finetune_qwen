@@ -1095,22 +1095,34 @@ Iter 10 | loss=-0.0023 | reward mean=0.762 std=0.231 | batch_acc=83.1% | groups=
 
 **Eval output (every `--eval-every` iterations):**
 ```
-Step Accuracy   : 74.5% (PRM>0.7) | best=72.1% | PRM_mean=0.847 (best=0.831) | step_acc(>0.5)=91.2% | prm_min_mean=0.612 | n_steps=287
+Step Accuracy   : 74.5% (17/23 solutions, mean≥0.7) | best=72.1% | strict(all≥0.7)=60.9% | PRM_mean=0.847 (best=0.831) | prm_min_mean=0.612
   (debug) Final-answer: 63.3% (19/30)
 ```
 
 **Live tqdm bar during evaluation** (step quality is the primary display):
 ```
-GSM8K eval:  60%|██████    | 18/30 [00:53<00:35  step_acc=74.5%, prm=0.847, ans=19/30]
+GSM8K eval:  60%|██████    | 18/30 [00:53<00:35  step_acc=74.5%, prm=0.847, ans=12/18]
 ```
 
-**Why step accuracy is the sole metric:**
+**How step accuracy is calculated — per-solution, not per-step:**
 
-Final-answer accuracy is a coarse binary signal. A model can improve every reasoning step — going from a 3-step wrong answer to a 4-step near-correct answer — and final-answer accuracy registers zero improvement. The PRM scores every individual step and exposes this incremental reasoning quality directly.
+Each solution gets a single **pass/fail verdict**:
+- The PRM scores every reasoning step individually → list of scores in [0, 1]
+- Compute the **mean** of those step scores for the whole solution
+- PASS if `mean_score ≥ 0.7` | FAIL otherwise
 
-> **`step_acc` (fraction of reasoning steps scoring > 0.7) is THE accuracy metric. `prm_mean` is the headline score. Final-answer accuracy is a secondary debug field only — it drives nothing.**
+`step_acc = passed_solutions / total_solutions_scored`
 
-The `best_policy` checkpoint is saved whenever `step_acc` improves.
+This has the same denominator as final-answer accuracy — both are fractions over N solutions — making them directly comparable.
+
+> **Example:** Solution with steps `[0.95, 0.92, 0.38]` → mean=0.75 ≥ 0.7 → **PASS** (the model mostly reasoned correctly even if one step was weak).  
+> Solution with steps `[0.62, 0.55, 0.41]` → mean=0.53 < 0.7 → **FAIL** (overall reasoning quality is poor).
+
+`step_acc_strict` = fraction of solutions where **every** step scored ≥ 0.7 (the more demanding bar).
+
+> **`step_acc` is THE accuracy metric. `prm_mean` is average reasoning quality. Final-answer accuracy is a debug field only — it drives nothing.**
+
+The `best_policy` checkpoint is saved whenever `step_acc` improves, with `prm_mean` as tiebreaker.
 
 **Field-by-field health guide:**
 
