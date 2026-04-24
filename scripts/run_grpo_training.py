@@ -276,16 +276,23 @@ def load_math_dataset(
     # Download from HuggingFace
     logger.info(
         "MATH dataset not found locally — downloading from HuggingFace "
-        "(competition_math, difficulty ≤ %d, numeric answers only)...",
+        "(lighteval/MATH, difficulty ≤ %d, numeric answers only)...",
         max_difficulty,
     )
-    try:
-        from datasets import load_dataset  # type: ignore
-        ds = load_dataset("competition_math", split="train", trust_remote_code=True)
-    except Exception as exc:
+    ds = None
+    for hf_name in ("lighteval/MATH", "hendrycks/competition_math"):
+        try:
+            from datasets import load_dataset  # type: ignore
+            ds = load_dataset(hf_name, split="train", trust_remote_code=True)
+            logger.info("Loaded HuggingFace dataset: %s (%d items)", hf_name, len(ds))
+            break
+        except Exception as exc:
+            logger.warning("Could not load %s: %s — trying next source.", hf_name, exc)
+    if ds is None:
         logger.warning(
-            "Could not load MATH dataset from HuggingFace (%s). "
-            "Proceeding with GSM8K only.", exc,
+            "All MATH dataset sources failed. Proceeding with GSM8K only. "
+            "To load offline: download from https://github.com/hendrycks/math "
+            "and pass --math-data <path_to_jsonl>."
         )
         return []
 
