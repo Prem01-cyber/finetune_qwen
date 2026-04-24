@@ -299,45 +299,41 @@ def evaluate_gsm8k(
     max_new_tokens: int = 512,
     temperature: float = 0.0,
     top_p: float = 1.0,
-    prm_scorer: Any = None,
-    step_quality_threshold: float = 0.7,
+    reward_fn: Any = None,
 ) -> dict:
     """
-    Evaluate *model* on a GSM8K-formatted JSONL file.
-
-    Called by ``scripts/run_ppo_training.py`` and ``scripts/run_grpo_training.py``
-    at each eval step.
+    Evaluate *model* on a GSM8K-formatted JSONL file using the SAME scoring
+    function used during GRPO training.
 
     Args:
-        model                  : AutoModelForCausalLM (already loaded, on correct device).
-        tokenizer              : Matching AutoTokenizer.
-        data_path              : Path to JSONL with {question, answer} rows.
-                                 Falls back to the HuggingFace hub split when not found.
-        max_samples            : Evaluation cap (for speed during training).
-        max_new_tokens         : Generation budget per problem.
-        temperature            : Sampling temperature (0 → greedy).
-        top_p                  : Nucleus sampling p.
-        prm_scorer             : Optional ProcessRewardScorer instance.  When provided
-                                 the evaluation scores every reasoning *step* and reports
-                                 step-level quality metrics alongside final-answer accuracy.
-                                 This is the primary measure of reasoning improvement —
-                                 final-answer accuracy is a coarse binary signal that
-                                 masks incremental step-quality gains.
-        step_quality_threshold : Steps with PRM score above this value count as
-                                 "high-quality".  Default 0.7.
+        model        : AutoModelForCausalLM (already on correct device).
+        tokenizer    : Matching AutoTokenizer.
+        data_path    : Path to JSONL with {question, answer} rows.
+        max_samples  : Evaluation cap.
+        max_new_tokens / temperature / top_p : generation hyper-params.
+        reward_fn    : callable(question: str, solution: str, gold: str) -> dict
+                       Must return at minimum {"combined_score": float} and
+                       optionally {"gt_match": bool, "prm_mean_score": float,
+                       "sympy_score": float, "format_score": float}.
+                       When supplied the primary accuracy metric becomes the
+                       mean combined_score — identical to the GRPO training
+                       objective — so every component (correctness, PRM step
+                       quality, SymPy verification, format) contributes and
+                       improvements in any of them show up immediately.
+                       When None the function falls back to final-answer
+                       exact-match accuracy (coarse binary).
 
-    Returns:
-        dict with keys:
-            accuracy            – final-answer exact-match rate
-            correct / total
-            exact_match_rate    – alias for accuracy
-            # PRM step quality fields (only present when prm_scorer is not None):
-            prm_mean            – avg PRM score across all steps of all solutions
-            prm_min_mean        – avg of per-solution weakest-step scores
-            step_acc            – fraction of steps scoring > step_quality_threshold
-            step_acc_50         – fraction of steps scoring > 0.50 (passing bar)
-            n_steps_total       – total reasoning steps evaluated
-            prm_degraded_frac   – fraction of solutions where PRM found no steps
+    Returns dict keys:
+        accuracy          – mean combined_score per solution (or exact-match if no reward_fn)
+        combined_score    – same as accuracy (alias)
+        correct_rate      – fraction of solutions with gt_match == True
+        prm_mean          – mean PRM step-quality score per solution
+        sympy_mean        – mean SymPy verification score
+        format_mean       – mean format compliance score
+        n_scored          – solutions successfully scored by reward_fn
+        total             – total solutions evaluated
+        # fallback (no reward_fn):
+        exact_match_rate  – fraction of final answers matching gold
     """
     import logging as _logging
     _logger = _logging.getLogger(__name__)
@@ -387,178 +383,119 @@ def evaluate_gsm8k(
         return {"accuracy": 0.0, "correct": 0, "total": 0, "exact_match_rate": 0.0}
 
     correct = 0
-    total = len(rows)
+    total   = len(rows)
     _n_errors = 0
-    _MAX_ERROR_WARNINGS = 3   # surface the first few failures loudly
+    _MAX_ERROR_WARNINGS = 3
 
-    # PRM per-solution accumulators.
-    #
-    # For each solution we compute:
-    #   step_frac  = good_steps / total_steps  (fraction of steps passing threshold)
-    #   mean_score = mean of all step scores   (continuous quality signal)
-    #   min_score  = worst step score           (error locator)
-    #
-    # We then macro-average these over all solutions so every solution
-    # contributes equally regardless of how many steps it contains.
-    #
-    # Key metrics reported:
-    #   step_frac_mean  = E[good_steps_i / total_steps_i]
-    #                     "On average, X% of each solution's steps were correct"
-    #                     — row-level step accuracy, macro-averaged (PRIMARY DISPLAY)
-    #   prm_mean        = E[mean_score_i]
-    #                     Continuous quality, most sensitive to small improvements
-    #                     — used for checkpoint saving (tiebreaker on step_frac_mean)
-    #   step_acc        = fraction of solutions where step_frac >= threshold
-    #                     Binary pass/fail per solution (comparable to final-answer acc)
-    #   step_acc_strict = fraction of solutions where ALL steps >= threshold
-    _sol_step_fracs:   list[float] = []   # good_steps/total_steps per solution
-    _sol_mean_scores:  list[float] = []   # mean step score per solution
-    _sol_min_scores:   list[float] = []   # min step score per solution
-    _sol_step_pass:    list[int]   = []   # 1 if step_frac >= threshold
-    _sol_step_strict:  list[int]   = []   # 1 if ALL steps >= threshold
-    _prm_degraded = 0                     # solutions where PRM found no steps
+    # Per-solution reward accumulators (populated when reward_fn is supplied).
+    # Each element corresponds to one evaluated solution.
+    _combined:  list[float] = []   # full training objective score
+    _gt_match:  list[float] = []   # 1.0 / 0.0 — exact answer correct?
+    _prm_comp:  list[float] = []   # PRM step-quality component
+    _sympy_comp:list[float] = []   # SymPy verification component
+    _fmt_comp:  list[float] = []   # format compliance component
 
     pbar = tqdm(
-        rows,
-        total=total,
-        desc="GSM8K eval",
-        unit="q",
-        dynamic_ncols=True,
-        leave=True,
+        rows, total=total, desc="GSM8K eval",
+        unit="q", dynamic_ncols=True, leave=True,
     )
     for i, row in enumerate(pbar):
         pred_text = ""
         try:
             pred_text = _generate(
-                model=model,
-                tokenizer=tokenizer,
+                model=model, tokenizer=tokenizer,
                 problem=row["question"],
                 max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                greedy=greedy,
+                temperature=temperature, top_p=top_p, greedy=greedy,
             )
+            # Keep final-answer tracking for the debug line.
             pred_final = extract_final_answer_numeric_str(pred_text) or ""
-            gold_final = row["gold_final"]
-            if _equiv_expr(pred_final, gold_final):
+            if _equiv_expr(pred_final, row["gold_final"]):
                 correct += 1
         except Exception as exc:
             _n_errors += 1
             if _n_errors <= _MAX_ERROR_WARNINGS:
                 _logger.warning(
-                    "evaluate_gsm8k: sample %d raised an exception (%s: %s). "
-                    "If all samples fail the score will be 0%% — check that the "
-                    "tokenizer has a chat_template set.",
+                    "evaluate_gsm8k: sample %d raised %s: %s. "
+                    "If all fail check that tokenizer has a chat_template.",
                     i, type(exc).__name__, exc,
                 )
             elif _n_errors == _MAX_ERROR_WARNINGS + 1:
                 _logger.warning(
-                    "evaluate_gsm8k: suppressing further per-sample error logs "
-                    "(%d errors so far).", _n_errors,
+                    "evaluate_gsm8k: suppressing further errors (%d so far).",
+                    _n_errors,
                 )
-            _logger.debug(f"Sample {i} error: {exc}", exc_info=True)
+            _logger.debug("Sample %d error: %s", i, exc, exc_info=True)
 
-        # ── PRM per-solution step-quality scoring ─────────────────────────────
-        if prm_scorer is not None and pred_text:
+        # ── Apply the SAME reward function used during GRPO training ──────────
+        # reward_fn(question, solution, gold) -> dict with at minimum
+        # {"combined_score": float} and optionally the component breakdown.
+        # This makes the eval metric IDENTICAL to the training objective so
+        # every improvement — better reasoning steps, better formatting,
+        # better SymPy-verifiable chains — shows up immediately.
+        if reward_fn is not None and pred_text:
             try:
-                prm_result = prm_scorer.score_solution(
-                    question=row["question"],
-                    solution=pred_text,
-                )
-                if prm_result.get("degraded", False) or not prm_result.get("step_scores"):
-                    _prm_degraded += 1
-                else:
-                    scores   = prm_result["step_scores"]
-                    n_steps  = len(scores)
-                    n_good   = sum(1 for s in scores if s >= step_quality_threshold)
-
-                    # Row-level step fraction: what fraction of THIS solution's
-                    # steps passed the threshold.  Macro-averaged below.
-                    sol_frac   = n_good / n_steps
-                    sol_mean   = prm_result["mean_score"]
-                    sol_min    = prm_result["min_score"]
-                    all_pass   = (n_good == n_steps)
-
-                    _sol_step_fracs.append(sol_frac)
-                    _sol_mean_scores.append(sol_mean)
-                    _sol_min_scores.append(sol_min)
-                    # Binary: solution passes if its row-level fraction >= threshold
-                    _sol_step_pass.append(1 if sol_frac >= step_quality_threshold else 0)
-                    _sol_step_strict.append(1 if all_pass else 0)
-            except Exception as prm_exc:
-                _logger.debug("PRM scoring failed for sample %d: %s", i, prm_exc)
-                _prm_degraded += 1
+                r = reward_fn(row["question"], pred_text, row["gold_final"])
+                _combined.append(float(r.get("combined_score",   0.0)))
+                _gt_match.append(1.0 if r.get("gt_match", False) else 0.0)
+                _prm_comp.append(float(r.get("prm_mean_score",   0.0)))
+                _sympy_comp.append(float(r.get("sympy_score",    0.0)))
+                _fmt_comp.append(float(r.get("format_score",     0.0)))
+            except Exception as rfn_exc:
+                _logger.debug("reward_fn failed for sample %d: %s", i, rfn_exc)
 
         done = i + 1
-        # Live tqdm: step_frac_mean (row-level, macro-averaged) + prm_mean.
-        if _sol_step_fracs:
+        # Live bar: show training-objective score when available, else acc.
+        if _combined:
             _pf: dict = dict(
-                step_frac=f"{sum(_sol_step_fracs) / len(_sol_step_fracs):.1%}",
-                prm=f"{sum(_sol_mean_scores) / len(_sol_mean_scores):.3f}",
-                ans=f"{correct}/{done}",
+                score=f"{sum(_combined) / len(_combined):.3f}",
+                correct=f"{sum(_gt_match):.0f}/{len(_combined)}",
+                prm=f"{sum(_prm_comp) / len(_prm_comp):.3f}" if _prm_comp else "—",
             )
         else:
             _pf = dict(acc=f"{correct / done:.1%}", correct=f"{correct}/{done}")
         pbar.set_postfix(**_pf, refresh=False)
 
-    # ── Final-answer accuracy (debug field only) ───────────────────────────
-    final_answer_accuracy = correct / total if total > 0 else 0.0
+    # ── Aggregate ──────────────────────────────────────────────────────────
+    n_scored = len(_combined)
+    _avg = lambda lst: round(sum(lst) / len(lst), 4) if lst else 0.0
 
-    # ── Step-quality metrics (primary) ─────────────────────────────────────
-    n_scored = len(_sol_step_fracs)   # solutions where PRM succeeded
-
-    # C — Row-level step fraction, macro-averaged (PRIMARY DISPLAY METRIC)
-    #     = average of (good_steps / total_steps) computed per solution
-    #     Interpretation: "on average X% of each solution's steps were correct"
-    step_frac_mean  = round(sum(_sol_step_fracs)   / n_scored, 4) if n_scored else 0.0
-
-    # D — Continuous PRM mean (CHECKPOINT-SAVING SIGNAL)
-    #     = average of per-solution mean step scores (no threshold)
-    #     Most sensitive to small quality improvements.
-    prm_mean        = round(sum(_sol_mean_scores)  / n_scored, 4) if n_scored else 0.0
-
-    # Binary — solutions where row-level step_frac >= threshold
-    step_acc        = round(sum(_sol_step_pass)    / n_scored, 4) if n_scored else 0.0
-
-    # Strict — solutions where EVERY step >= threshold
-    step_acc_strict = round(sum(_sol_step_strict)  / n_scored, 4) if n_scored else 0.0
-
-    # Worst-step quality (error locator)
-    prm_min_mean    = round(sum(_sol_min_scores)   / n_scored, 4) if n_scored else 0.0
-
-    if prm_scorer is not None:
+    if reward_fn is not None:
+        combined_score = _avg(_combined)
         result: dict = {
-            # PRIMARY DISPLAY: row-level step fraction, macro-averaged over solutions
-            "accuracy":              step_frac_mean,
-            "step_frac_mean":        step_frac_mean,
-            # CHECKPOINT SIGNAL: continuous PRM mean (most sensitive)
-            "prm_mean":              prm_mean,
-            # BINARY: fraction of solutions whose step_frac >= threshold
-            "step_acc":              step_acc,
-            # STRICT: fraction where ALL steps >= threshold
-            "step_acc_strict":       step_acc_strict,
-            # ERROR LOCATOR: average worst step per solution
-            "prm_min_mean":          prm_min_mean,
-            "n_solutions_scored":    n_scored,
-            "prm_degraded_frac":     round(_prm_degraded / total, 4) if total else 0.0,
-            # DEBUG: final-answer matching — drives nothing
-            "final_answer_accuracy": final_answer_accuracy,
-            "final_answer_correct":  correct,
-            "total":                 total,
+            # PRIMARY: mean training-objective score — captures ALL components.
+            # Same formula as GRPO reward: 0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format
+            "accuracy":       combined_score,
+            "combined_score": combined_score,
+            # Component breakdown — tells you WHICH aspect is driving improvement.
+            "correct_rate":   _avg(_gt_match),
+            "prm_mean":       _avg(_prm_comp),
+            "sympy_mean":     _avg(_sympy_comp),
+            "format_mean":    _avg(_fmt_comp),
+            "n_scored":       n_scored,
+            "total":          total,
+            # Debug: raw final-answer count
+            "final_answer_correct": correct,
+            "final_answer_accuracy": correct / total if total else 0.0,
         }
     else:
+        # No reward_fn — fall back to binary final-answer accuracy.
         _logger.warning(
-            "evaluate_gsm8k: no prm_scorer provided — falling back to final-answer "
-            "accuracy.  Pass prm_scorer for real step-quality measurement."
+            "evaluate_gsm8k: no reward_fn provided — using final-answer accuracy. "
+            "Pass reward_fn=math_env.compute_grounded_reward for full training-objective eval."
         )
+        fa_acc = correct / total if total else 0.0
         result = {
-            "accuracy":              final_answer_accuracy,
-            "step_frac_mean":        0.0,
-            "step_acc":              0.0,
+            "accuracy":              fa_acc,
+            "combined_score":        fa_acc,
+            "correct_rate":          fa_acc,
             "prm_mean":              0.0,
-            "final_answer_accuracy": final_answer_accuracy,
-            "final_answer_correct":  correct,
+            "sympy_mean":            0.0,
+            "format_mean":           0.0,
+            "n_scored":              0,
             "total":                 total,
+            "final_answer_correct":  correct,
+            "final_answer_accuracy": fa_acc,
         }
     return result
 

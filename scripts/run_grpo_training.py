@@ -732,8 +732,40 @@ def grpo_loss_for_group(
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Evaluation helpers
 # ---------------------------------------------------------------------------
+
+def _log_eval_result(label: str, res: Dict, best: Optional[float]) -> None:
+    """Print a structured evaluation summary that mirrors the training objective.
+
+    The primary number shown is ``combined_score`` — identical to the GRPO
+    reward formula — so the eval metric and training metric are directly
+    comparable.  All four components are shown so it's immediately obvious
+    which one is driving any change.
+    """
+    cs     = float(res.get("combined_score", 0.0))
+    cr     = float(res.get("correct_rate",   0.0))
+    prm    = float(res.get("prm_mean",       0.0))
+    sympy  = float(res.get("sympy_mean",     0.0))
+    fmt    = float(res.get("format_mean",    0.0))
+    n_sc   = int(res.get("n_scored", res.get("total", 0)))
+    fa_acc = float(res.get("final_answer_accuracy", cr))
+
+    best_str = f" (best={best:.4f})" if best is not None else ""
+    logger.info(
+        "Training Score  [%s]: %.4f%s  |  n=%d",
+        label, cs, best_str, n_sc,
+    )
+    logger.info(
+        "  Components    : 0.60×correct(%.1f%%) + 0.15×PRM(%.3f) + "
+        "0.15×SymPy(%.3f) + 0.10×fmt(%.3f) = %.4f",
+        100 * cr, prm, sympy, fmt, cs,
+    )
+    logger.info(
+        "  (debug) final-answer accuracy: %.1f%%  (binary, not used for ckpt)",
+        100 * fa_acc,
+    )
+
 
 def evaluate_policy(
     model: AutoModelForCausalLM,
@@ -741,26 +773,43 @@ def evaluate_policy(
     eval_data_path: str,
     max_samples: int,
     max_new_tokens: int,
-    prm_scorer: Optional[Any] = None,
+    math_env: Optional[Any] = None,
 ) -> Dict[str, object]:
-    """Run GSM8K evaluation with optional PRM step-quality scoring.
+    """Run GSM8K evaluation using the SAME reward formula as GRPO training.
 
-    When *prm_scorer* is supplied the evaluation scores every reasoning step
-    and returns step-level quality metrics alongside final-answer accuracy.
-    Step quality (``step_acc``, ``prm_mean``) is the *primary* improvement
-    signal: it captures incremental reasoning gains that binary final-answer
-    accuracy misses entirely.
+    When *math_env* is supplied a ``reward_fn`` is constructed that calls
+    ``math_env.compute_grounded_reward(question, solution, gold)``.  This
+    returns ``combined_score = 0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format``,
+    making the eval metric IDENTICAL to the GRPO training objective.  Any
+    improvement in step quality, SymPy verification or format compliance shows
+    up immediately in the accuracy number instead of being hidden behind the
+    coarse binary final-answer signal.
     """
     if not Path(eval_data_path).exists():
-        return {"accuracy": 0.0, "correct": 0, "total": 0}
+        return {"accuracy": 0.0, "combined_score": 0.0, "total": 0}
     model.eval()
+
+    reward_fn = None
+    if math_env is not None:
+        import logging as _log_mod
+        _mec_logger = _log_mod.getLogger("src.rl.math_environment_curriculum")
+
+        def reward_fn(question: str, solution: str, gold: str) -> Dict:
+            """Thin wrapper that silences per-sample debug logs during eval."""
+            _old = _mec_logger.level
+            _mec_logger.setLevel(_log_mod.WARNING)
+            try:
+                return math_env.compute_grounded_reward(question, solution, gold)
+            finally:
+                _mec_logger.setLevel(_old)
+
     results = evaluate_gsm8k(
         model=model,
         tokenizer=tokenizer,
         data_path=eval_data_path,
         max_samples=max_samples,
         max_new_tokens=max_new_tokens,
-        prm_scorer=prm_scorer,
+        reward_fn=reward_fn,
     )
     model.train()
     return results
@@ -1253,34 +1302,18 @@ def main() -> None:
         initial_eval = evaluate_policy(
             model, tokenizer,
             args.eval_data_path, args.eval_max_samples, args.eval_max_new_tokens,
-            prm_scorer=prm if args.use_prm else None,
+            math_env=math_env,
         )
-        # "accuracy" == step_frac_mean (row-level step fraction, macro-averaged)
-        # prm_mean is the continuous quality signal used for checkpoint saving.
-        n_sc = initial_eval.get("n_solutions_scored", 0)
-        logger.info(
-            "Step Quality    : step_frac=%.1f%% | step_acc(frac≥0.7)=%.1f%% (%d/%d) | "
-            "strict(all≥0.7)=%.1f%% | PRM_mean=%.3f | prm_min=%.3f",
-            100 * initial_eval.get("step_frac_mean",  0.0),
-            100 * initial_eval.get("step_acc",        0.0),
-            round(initial_eval.get("step_acc", 0.0) * n_sc), n_sc,
-            100 * initial_eval.get("step_acc_strict", 0.0),
-            initial_eval.get("prm_mean",    0.0),
-            initial_eval.get("prm_min_mean", 0.0),
-        )
-        logger.info(
-            "  (debug) Final-answer accuracy: %.1f%% (%d/%d)",
-            100 * initial_eval.get("final_answer_accuracy", 0.0),
-            initial_eval.get("final_answer_correct", 0),
-            initial_eval.get("total", 0),
-        )
+        # accuracy == combined_score = 0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format
+        # This is identical to the GRPO training objective.
+        _log_eval_result("INITIAL (iter 0)", initial_eval, best=None)
         metrics_log.append({"iteration": 0, **initial_eval})
-        best_accuracy = float(initial_eval.get("accuracy",       0.0))  # = step_frac_mean
-        best_step_acc = float(initial_eval.get("step_frac_mean", 0.0))
-        best_prm_mean = float(initial_eval.get("prm_mean",       0.0))
+        best_accuracy  = float(initial_eval.get("accuracy",     0.0))
+        best_combined  = float(initial_eval.get("combined_score", 0.0))
+        best_prm_mean  = float(initial_eval.get("prm_mean",     0.0))
     else:
         best_accuracy = 0.0
-        best_step_acc = 0.0
+        best_combined = 0.0
         best_prm_mean = 0.0
 
     # ── Training ─────────────────────────────────────────────────────────────
@@ -1599,57 +1632,26 @@ def main() -> None:
             eval_res = evaluate_policy(
                 model, tokenizer,
                 args.eval_data_path, args.eval_max_samples, args.eval_max_new_tokens,
-                prm_scorer=prm if args.use_prm else None,
+                math_env=math_env,
             )
-            # "accuracy" == step_frac_mean (row-level, macro-averaged)
-            cur_step_frac = float(eval_res.get("accuracy",       best_step_acc))
-            cur_prm_mean  = float(eval_res.get("prm_mean",       best_prm_mean))
-            n_scored      = eval_res.get("n_solutions_scored",   0)
+            # accuracy == combined_score: 0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format
+            cur_combined = float(eval_res.get("combined_score", best_combined))
+            cur_prm_mean = float(eval_res.get("prm_mean",       best_prm_mean))
 
-            # ── Primary display: row-level step fraction + PRM mean ──────────
-            logger.info(
-                "Step Quality    : step_frac=%.1f%% (best=%.1f%%) | "
-                "step_acc(frac≥0.7)=%.1f%% (%d/%d) | strict=%.1f%% | "
-                "PRM_mean=%.3f (best=%.3f) | prm_min=%.3f",
-                100 * cur_step_frac,  100 * best_step_acc,
-                100 * eval_res.get("step_acc", 0.0),
-                round(eval_res.get("step_acc", 0.0) * n_scored), n_scored,
-                100 * eval_res.get("step_acc_strict", 0.0),
-                cur_prm_mean, best_prm_mean,
-                eval_res.get("prm_min_mean", 0.0),
-            )
-            logger.info(
-                "  (debug) Final-answer: %.1f%% (%d/%d)",
-                100 * eval_res.get("final_answer_accuracy", 0.0),
-                eval_res.get("final_answer_correct", 0),
-                eval_res.get("total", 0),
-            )
+            _log_eval_result(f"iter {iteration}", eval_res, best=best_combined)
 
-            # ── Best-checkpoint: step_frac_mean primary, prm_mean tiebreaker ─
-            # Save when row-level step fraction improves, OR when it ties but
-            # the continuous PRM mean improved (detects quality gains below
-            # the resolution of the fraction metric).
-            step_improved = cur_step_frac > best_step_acc
-            prm_tiebreak  = (
-                abs(cur_step_frac - best_step_acc) < 1e-4
-                and cur_prm_mean > best_prm_mean + 1e-4
-            )
-            if step_improved or prm_tiebreak:
-                reason = (
-                    f"step_frac {100*cur_step_frac:.1f}%"
-                    if step_improved
-                    else f"PRM_mean {cur_prm_mean:.4f} > {best_prm_mean:.4f}"
-                )
-                best_step_acc = max(best_step_acc, cur_step_frac)
-                best_prm_mean = max(best_prm_mean, cur_prm_mean)
-                best_accuracy = best_step_acc
+            # ── Checkpoint: save when combined_score strictly improves ────────
+            # combined_score is a continuous variable; any improvement in
+            # correctness, PRM quality, SymPy, or format moves it.
+            if cur_combined > best_combined + 1e-4:
+                reason = f"combined {cur_combined:.4f} > {best_combined:.4f}"
+                best_combined  = cur_combined
+                best_prm_mean  = max(best_prm_mean, cur_prm_mean)
+                best_accuracy  = best_combined
                 best_path = out_dir / "best_policy"
                 model.save_pretrained(str(best_path))
                 tokenizer.save_pretrained(str(best_path))
-                logger.info(
-                    "New best saved to %s  (%s  PRM_mean %.3f)",
-                    best_path, reason, cur_prm_mean,
-                )
+                logger.info("New best saved → %s  (%s)", best_path, reason)
 
             iter_metrics.update(eval_res)
 
@@ -1696,40 +1698,42 @@ def main() -> None:
             "skipped_groups": iter_metrics.get("skipped_groups", 0),
             "learning_rate":  iter_metrics.get("learning_rate", 0.0),
             "iter_time_s":    iter_metrics.get("iter_time_s", 0.0),
-            # Final-answer eval (empty on non-eval iterations to keep CSV columnar)
-            "gsm8k_accuracy": iter_metrics.get("accuracy", ""),
-            "gsm8k_correct":  iter_metrics.get("correct", ""),
-            "gsm8k_total":    iter_metrics.get("total", ""),
-            # Step-quality eval (primary improvement signal)
-            "step_frac_mean":    iter_metrics.get("step_frac_mean",   ""),
-            "step_acc":          iter_metrics.get("step_acc",         ""),
-            "step_acc_strict":   iter_metrics.get("step_acc_strict",  ""),
-            "prm_mean":          iter_metrics.get("prm_mean",         ""),
-            "prm_min_mean":      iter_metrics.get("prm_min_mean",     ""),
-            "n_solutions_scored":iter_metrics.get("n_solutions_scored",""),
+            # Training-objective eval (primary; same formula as GRPO reward)
+            "gsm8k_combined":   iter_metrics.get("combined_score",        ""),
+            "gsm8k_correct_rt": iter_metrics.get("correct_rate",          ""),
+            "gsm8k_prm":        iter_metrics.get("prm_mean",              ""),
+            "gsm8k_sympy":      iter_metrics.get("sympy_mean",            ""),
+            "gsm8k_format":     iter_metrics.get("format_mean",           ""),
+            "gsm8k_n_scored":   iter_metrics.get("n_scored",              ""),
+            # Debug (not used for checkpointing)
+            "gsm8k_final_ans":  iter_metrics.get("final_answer_accuracy", ""),
         })
 
     logger.info("=" * 70)
     logger.info("GRPO training complete.")
-    logger.info("Best step_frac_mean : %.1f%% (avg row-level step fraction)", 100 * best_step_acc)
-    logger.info("Best PRM mean score : %.3f (continuous quality signal)", best_prm_mean)
-    logger.info("Checkpoints         : %s", out_dir)
-    logger.info("Logs                : %s", log_dir)
-    logger.info("Console log         : %s", console_log_path)
+    logger.info(
+        "Best training-objective score : %.4f  "
+        "(0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format)",
+        best_combined,
+    )
+    logger.info("Best PRM component mean       : %.3f", best_prm_mean)
+    logger.info("Checkpoints                   : %s", out_dir)
+    logger.info("Logs                          : %s", log_dir)
+    logger.info("Console log                   : %s", console_log_path)
     logger.info("=" * 70)
 
     # ── Final summary ─────────────────────────────────────────────────────────
     summary: Dict[str, Any] = {
-        "run_name":        run_name,
-        "best_accuracy":   best_step_acc,   # accuracy == step_acc throughout
-        "best_step_acc":   best_step_acc,
-        "best_prm_mean":   best_prm_mean,
-        "total_iterations": args.num_iterations,
-        "checkpoints_dir": str(out_dir),
-        "log_dir":         str(log_dir),
-        "console_log":     str(console_log_path),
-        "metrics_csv":     str(_metrics_csv_path),
-        "metrics_jsonl":   str(out_dir / "metrics.jsonl"),
+        "run_name":          run_name,
+        "best_accuracy":     best_combined,   # accuracy == combined_score
+        "best_combined":     best_combined,
+        "best_prm_mean":     best_prm_mean,
+        "total_iterations":  args.num_iterations,
+        "checkpoints_dir":   str(out_dir),
+        "log_dir":           str(log_dir),
+        "console_log":       str(console_log_path),
+        "metrics_csv":       str(_metrics_csv_path),
+        "metrics_jsonl":     str(out_dir / "metrics.jsonl"),
     }
     (log_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, default=str), encoding="utf-8"
