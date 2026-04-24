@@ -660,10 +660,18 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         terminal_reward = float(reward_result["combined_score"])
         trajectory = Trajectory()
-        for idx, transition in enumerate(solution_transitions):
-            transition.reward = (
-                terminal_reward if idx == len(solution_transitions) - 1 else 0.0
-            )
+        for transition in solution_transitions:
+            # Spread the trajectory-level reward across every output token,
+            # not just the last.  With terminal-only reward and gae_lambda=0.95,
+            # the GAE advantage at a token k steps from the end scales as
+            # 0.95^k — at k=400 that's ~1e-9, effectively zero.  Concentrating
+            # 99%+ of transitions near zero after buffer-wide normalization
+            # (adv - mean) / std kills the policy gradient: approx_kl ends up
+            # ~0.001 instead of the intended ~0.05, clip_frac ~1%, no learning.
+            # Spreading the reward makes every token's advantage proportional
+            # to (R - V(s_t)), the same approach used by TRL, OpenAI InstructGPT,
+            # and every production RLHF system.
+            transition.reward = terminal_reward
             trajectory.add(transition)
 
         summary = reward_result["sympy_summary"]
@@ -777,10 +785,9 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         terminal_reward = float(reward_result["combined_score"])
         all_transitions = question_transitions + solution_transitions
-        for idx, transition in enumerate(all_transitions):
-            transition.reward = (
-                terminal_reward if idx == len(all_transitions) - 1 else 0.0
-            )
+        for transition in all_transitions:
+            # Spread reward to every token — see grounded path comment.
+            transition.reward = terminal_reward
             trajectory.add(transition)
 
         verification = reward_result["solution_metrics"]["verification_details"]

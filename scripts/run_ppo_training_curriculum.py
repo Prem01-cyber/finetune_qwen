@@ -110,7 +110,11 @@ class CurriculumTrainingConfig:
     #     0.05 with kl_trip_multiplier=1.5 → trip at 0.075 ≈ actually lets
     #     all 3 epochs complete in typical mid-training iterations.
     #   * kl_trip_multiplier=1.5 keeps the canonical trip ratio; tune via CLI.
-    learning_rate = 3e-6
+    # 1e-5 is the standard RLHF learning rate for a 1.5B model (TRL/InstructGPT
+    # range is 1e-5 to 3e-5).  The previous 3e-6 was so conservative that even
+    # 1024 gradient steps produced approx_kl~0.001 (target 0.05) and clip_frac
+    # ~1% — the policy was barely moving.
+    learning_rate = 1e-5
     # 2 PPO epochs over each rollout buffer.  Previously 3, dropped
     # because iterations regularly hit the KL trip line inside epoch 2
     # anyway — the third epoch almost never landed meaningful updates,
@@ -142,7 +146,11 @@ class CurriculumTrainingConfig:
     kl_trip_multiplier = 1.5
 
     gamma = 1.0
-    gae_lambda = 0.95
+    # Raised from 0.95.  With reward spread across all tokens (not just the
+    # terminal one), gae_lambda controls how much the per-step value-function
+    # error contributes vs the raw advantage.  0.98 keeps a smooth bias-variance
+    # trade-off while letting the GAE reach further back in the sequence.
+    gae_lambda = 0.98
 
     num_rollouts_per_iter = 100
     max_question_tokens = 200
@@ -990,6 +998,15 @@ def main():
     parser.add_argument(
         "--run-name", type=str, default=None, help="Optional run name for logging"
     )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="AdamW learning rate (default: 1e-5).  Raise to 3e-5 for faster "
+        "learning on a freshly-reset checkpoint; lower to 3e-6 if you see "
+        "policy_loss oscillating or approx_kl regularly spiking to the trip "
+        "line inside the first mini-batch.",
+    )
     args = parser.parse_args()
 
     config = CurriculumTrainingConfig()
@@ -1020,6 +1037,8 @@ def main():
     config.batch_size = max(1, int(args.batch_size))
     config.gradient_checkpointing = bool(args.gradient_checkpointing)
     config.grad_checkpoint_explicit = bool(args.grad_checkpoint_explicit)
+    if args.learning_rate is not None:
+        config.learning_rate = float(args.learning_rate)
     if args.torch_compile:
         config.use_torch_compile = True
 

@@ -86,7 +86,7 @@ python scripts/run_ppo_training_curriculum.py \
   --clip-range 0.2 \
   --batch-size 16 \
   --eval-every 5 \
-  --eval-max-samples 500 \
+  --eval-max-samples 250 \
   --eval-max-new-tokens 512 \
   --checkpoint-keep-last 5 \
   --checkpoint-keep-every 10 \
