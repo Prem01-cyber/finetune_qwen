@@ -146,11 +146,16 @@ class CurriculumTrainingConfig:
     kl_trip_multiplier = 1.5
 
     gamma = 1.0
-    # Raised from 0.95.  With reward spread across all tokens (not just the
-    # terminal one), gae_lambda controls how much the per-step value-function
-    # error contributes vs the raw advantage.  0.98 keeps a smooth bias-variance
-    # trade-off while letting the GAE reach further back in the sequence.
-    gae_lambda = 0.98
+    # gae_lambda=1.0 is the critical setting for terminal-only reward on long
+    # sequences.  With lambda<1 the GAE advantage at step k decays as lambda^k:
+    # at lambda=0.95 and 400 tokens, step 0 sees advantage~1e-9 (zero gradient).
+    # At lambda=1.0 the GAE telescopes exactly:
+    #   A_t = R - V(s_t)  for every t regardless of position
+    # so every token has the same signed advantage (positive for good
+    # trajectories, negative for bad), with no cancellation when early and late
+    # tokens mix in a mini-batch.  This is REINFORCE + learned baseline, the
+    # same gradient principle used in GRPO and DeepSeek-Math.
+    gae_lambda = 1.0
 
     num_rollouts_per_iter = 100
     max_question_tokens = 200

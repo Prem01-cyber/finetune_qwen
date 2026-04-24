@@ -1,0 +1,114 @@
+name: self-improvement-math-env
+version: "1.0.0"
+description: >
+  A recursive self-improvement environment for math reasoning (Theme #4).
+  The agent generates novel math problems, solves them, and is scored by a
+  multi-signal reward pipeline (PRM per-step correctness, SymPy arithmetic
+  verification, format compliance, and question quality). An adaptive
+  curriculum escalates difficulty as the agent masters each topic.
+  The self-improvement loop: better problems force better solutions, better
+  solutions improve the policy, and the policy generates harder problems.
+
+author: "finetune-qwen team"
+
+tags:
+  - openenv
+  - math
+  - self-play
+  - curriculum
+  - rl
+  - self-improvement
+  - reasoning
+  - gsm8k
+
+tasks:
+  - name: pedagogy
+    description: >
+      Generate and solve clear, learnable foundation-level math problems
+      (basic arithmetic, single-step word problems). Reward favours clarity
+      and solvability over novelty.
+    difficulty: easy
+    max_steps: 1
+    score_range: [0.0, 1.0]
+
+  - name: accuracy
+    description: >
+      Generate and solve intermediate math problems requiring multi-step
+      reasoning (fractions, percentages, ratios, money). Reward emphasises
+      arithmetic correctness (SymPy step verification) and stable format.
+    difficulty: medium
+    max_steps: 1
+    score_range: [0.0, 1.0]
+
+  - name: challenge
+    description: >
+      Generate and solve novel, difficult math problems (mixed operations,
+      time-distance, geometry). Reward penalises repetition and rewards
+      difficulty alignment and originality.
+    difficulty: hard
+    max_steps: 1
+    score_range: [0.0, 1.0]
+
+observation_space:
+  type: Observation
+  module: src.openenv.models
+  fields:
+    instruction: "Curriculum-selected challenge prompt (str)"
+    topic: "Active math topic, e.g. 'fractions' (str)"
+    target_difficulty: "Target difficulty in [0, 1] (float)"
+    phase: "Episode phase: propose_and_solve | done (str enum)"
+    curriculum_iteration: "Current training iteration (int)"
+    focus_topics: "Topics currently in the curriculum spotlight (list[str])"
+
+action_space:
+  type: Action
+  module: src.openenv.models
+  fields:
+    question: "A natural-language math problem the agent proposes (str, 1–4000 chars)"
+    solution: "The agent's step-by-step solution with a final answer (str, 1–8000 chars)"
+
+reward:
+  type: float
+  range: [0.0, 1.0]
+  description: >
+    Multi-signal reward computed by a pipeline of four independent verifiers:
+
+    R_sol = 0.55 × PRM_mean   (Qwen2.5-Math-PRM-7B, per-step correctness)
+          + 0.20 × PRM_min    (weakest step — pushes policy to fix broken steps)
+          + 0.15 × SymPy      (arithmetic equality checking per step)
+          + 0.10 × Format     (Step N: lines + parseable Final Answer)
+
+    R_question = 0.45 × solvability + 0.25 × difficulty_match
+               + 0.20 × clarity   + 0.10 × novelty
+
+    R_combined = clip(0.4 × R_question + 0.6 × R_sol + expert_modifier, cap)
+
+    Hard rules:
+    - PRM-degraded solutions (unparseable output): R = 0
+    - format_score < 0.5: R capped at 0.3 regardless of PRM score
+    - Expert panel modifier in [−0.08, +0.08], additive only
+
+endpoints:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+
+client:
+  class_name: SelfImprovementMathClient
+  module: src.openenv.client
+
+action:
+  class_name: Action
+  module: src.openenv.models
+
+observation:
+  class_name: Observation
+  module: src.openenv.models
+
+infrastructure:
+  framework: FastAPI
+  server: uvicorn
+  port: 7860
+  docker: true
+
+spec_version: 1

@@ -659,25 +659,17 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         )
 
         terminal_reward = float(reward_result["combined_score"])
-        n_sol = max(1, len(solution_transitions))
-        # Spread reward across all output tokens, normalised by trajectory
-        # length so GAE return targets stay in [0, R] ≈ [0, 1].
-        #
-        # Without normalisation each token gets reward R, the GAE return at
-        # step t is ≈ (T-t)×R, so the first token sees a target of ~T×R ≈
-        # 400×0.6 = 240.  That causes value_loss > 200 (was 0.08), which
-        # dominates the shared gradient-clip budget and pinches the policy
-        # gradient to near zero — the exact instability (KL trip at 13% budget,
-        # 0.2622 >> 0.075 threshold) seen in the logs.
-        #
-        # With reward = R / T, GAE return at step t = (T-t)×(R/T) = R×(1-t/T)
-        # which lives in [0, R] ≈ [0, 1].  Value targets are back in range,
-        # every token still gets a gradient (unlike terminal-only), and the
-        # policy:value gradient ratio is balanced again.
-        per_token_reward = terminal_reward / n_sol
         trajectory = Trajectory()
-        for transition in solution_transitions:
-            transition.reward = per_token_reward
+        # Terminal-only reward — all intermediate tokens carry 0 reward.
+        # With gae_lambda=1.0 the GAE telescopes exactly to:
+        #   A_t = R - V(s_t)  for every token t (same as REINFORCE + baseline).
+        # Every token in the trajectory sees the same signed advantage; no
+        # within-trajectory cancellation from opposing early/late advantages.
+        # See run_ppo_training_curriculum.py (gae_lambda=1.0) for context.
+        for idx, transition in enumerate(solution_transitions):
+            transition.reward = (
+                terminal_reward if idx == len(solution_transitions) - 1 else 0.0
+            )
             trajectory.add(transition)
 
         summary = reward_result["sympy_summary"]
@@ -791,11 +783,11 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         terminal_reward = float(reward_result["combined_score"])
         all_transitions = question_transitions + solution_transitions
-        n_all = max(1, len(all_transitions))
-        # Length-normalised spread — see grounded path comment.
-        per_token_reward = terminal_reward / n_all
-        for transition in all_transitions:
-            transition.reward = per_token_reward
+        # Terminal-only reward — gae_lambda=1.0 makes A_t = R - V(s_t) for all t.
+        for idx, transition in enumerate(all_transitions):
+            transition.reward = (
+                terminal_reward if idx == len(all_transitions) - 1 else 0.0
+            )
             trajectory.add(transition)
 
         verification = reward_result["solution_metrics"]["verification_details"]

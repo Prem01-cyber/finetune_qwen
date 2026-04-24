@@ -238,9 +238,13 @@ class RolloutBuffer:
         if n == 0:
             return
 
-        # Normalise advantages
+        # Normalise advantages then clip to prevent a single outlier batch
+        # from spiking approx_kl and tripping the early-stop before the rest
+        # of the gradient budget is used (observed as 51/52 batches KL≈0.0003,
+        # one batch KL=0.085, early-stop at 5% budget).
         adv_arr = np.array(self._advantages, dtype=np.float32)
         adv_arr = (adv_arr - adv_arr.mean()) / (adv_arr.std() + 1e-8)
+        adv_arr = np.clip(adv_arr, -5.0, 5.0)
 
         indices = np.arange(n)
         if shuffle:
