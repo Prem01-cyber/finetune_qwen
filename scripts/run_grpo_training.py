@@ -501,6 +501,10 @@ def generate_questions_batched(
     ``generate_solutions_batched`` so the question token IDs can be passed
     directly to ``grpo_loss_for_group`` for the question-level GRPO update.
 
+    Uses the same centralized prompts (``create_generator_messages``) as
+    ``generate_question()`` so the chat format is identical whether running
+    single-question or batched two-phase generation.
+
     Returns:
         questions       : K_q decoded question strings
         input_ids_list  : K_q full (prompt+response) token ID tensors
@@ -508,14 +512,7 @@ def generate_questions_batched(
         old_log_probs   : K_q scalar tensors (sum log π_old over response),
                           no_grad — used as denominator in IS ratio.
     """
-    system = (
-        "You are a math teacher creating original practice problems for students. "
-        "Your questions must be clear, solvable, and require multi-step arithmetic reasoning."
-    )
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": instruction},
-    ]
+    messages = create_generator_messages(instruction)
     try:
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
