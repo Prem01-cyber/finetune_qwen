@@ -666,7 +666,20 @@ class CurriculumMathEnvironment:
 
         pred_final = extract_final_answer_numeric_str(solution) or ""
         gt_match_bool = self._answers_equivalent(pred_final, gold_final)
-        gt_match = 1.0 if gt_match_bool else 0.0
+        if gt_match_bool:
+            gt_match = 1.0
+        else:
+            # Soft numeric proximity: reward near-misses rather than cliffing at 0.
+            # Gives partial credit proportional to how close the numeric answer is.
+            # Capped at 0.85 so an exact match (1.0) is always strictly better.
+            # Non-numeric wrong answers still get 0.0.
+            try:
+                _p = float(pred_final.replace(",", "").strip())
+                _g = float(gold_final.replace(",", "").strip())
+                _denom = max(abs(_g), 1.0)
+                gt_match = min(0.85, 1.0 / (1.0 + 2.0 * abs(_p - _g) / _denom))
+            except (ValueError, TypeError, AttributeError):
+                gt_match = 0.0
 
         # Optional PRM step-level quality on grounded rollouts.
         # prm_final (last step score) is the strongest single predictor of
@@ -717,8 +730,9 @@ class CurriculumMathEnvironment:
                 + 0.40 * process_score
                 + 0.10 * format_score
             )
+            _gt_tag = "exact" if gt_match_bool else f"prox={gt_match:.2f}"
             components_str = (
-                f"0.50×{gt_match:.2f} + 0.40×proc({process_score:.3f}"
+                f"0.50×{gt_match:.2f}({_gt_tag}) + 0.40×proc({process_score:.3f}"
                 f"[fin={prm_final:.2f},mean={prm_mean:.2f}]) + "
                 f"0.10×fmt({format_score:.3f})"
             )
