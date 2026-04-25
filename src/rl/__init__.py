@@ -12,17 +12,11 @@ from src.rl.replay_buffer import GenerationalReplayBuffer
 # Optional heavy imports (transformers / torch model deps).
 try:
     from src.rl.value_network import ValueHead
-    from src.rl.reward_calculator import RewardCalculator
     from src.rl.ppo_trainer import PPOTrainer
-    from src.rl.math_environment import MathEnvironment
-    from src.rl.math_environment_consensus import ConsensusMathEnvironment
     from src.rl.math_environment_curriculum import CurriculumMathEnvironment
 except ModuleNotFoundError:  # pragma: no cover
     ValueHead = None
-    RewardCalculator = None
     PPOTrainer = None
-    MathEnvironment = None
-    ConsensusMathEnvironment = None
     CurriculumMathEnvironment = None
 
 __all__ = [
@@ -31,12 +25,9 @@ __all__ = [
     "Transition",
     "Trajectory",
     "ValueHead",
-    "RewardCalculator",
     "GAEComputer",
     "RolloutBuffer",
     "PPOTrainer",
-    "MathEnvironment",
-    "ConsensusMathEnvironment",
     "CurriculumMathEnvironment",
     "QuestionClassifier",
     "CurriculumManager",

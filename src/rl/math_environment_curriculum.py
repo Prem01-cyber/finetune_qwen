@@ -20,11 +20,10 @@ from sympy.parsing.sympy_parser import parse_expr
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.rl.consensus_reward_calculator import ConsensusRewardCalculator
+from src.config.prompts import create_solver_messages
 from src.rl.curriculum_manager import CurriculumManager
 from src.rl.expert_panel import SimulatedExpertPanel
-from src.rl.math_environment_consensus import ConsensusMathEnvironment
-from src.rl.mdp_components import Trajectory
+from src.rl.mdp_components import Action, State, Trajectory, Transition
 from src.rl.prm_scorer import ProcessRewardScorer
 from src.rl.quality_filter import QualityFilter
 from src.rl.question_quality_evaluator import QuestionQualityEvaluator
@@ -78,13 +77,13 @@ class TrajectoryMetadata:
     curriculum_state_snapshot: Dict[str, object]
 
 
-class CurriculumMathEnvironment(ConsensusMathEnvironment):
-    """Consensus environment extended with adaptive curriculum logic."""
+class CurriculumMathEnvironment:
+    """Standalone curriculum environment with PRM-based rewards and GRPO training support."""
 
     def __init__(
         self,
         policy_model: AutoModelForCausalLM,
-        value_model: ValueHead,
+        value_model: Optional[ValueHead],
         tokenizer: AutoTokenizer,
         reference_questions: Optional[List[str]] = None,
         grounded_qa_pairs: Optional[List[Dict[str, str]]] = None,
@@ -97,20 +96,24 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         consensus_temperature: float = 0.7,
         device: Optional[torch.device] = None,
     ):
-        super().__init__(
-            policy_model=policy_model,
-            value_model=value_model,
-            tokenizer=tokenizer,
-            max_question_tokens=max_question_tokens,
-            max_solution_tokens=max_solution_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            consensus_temperature=consensus_temperature,
-            device=device,
-        )
+        # ── Core model attributes (used by generation helpers) ───────────
+        self.policy = policy_model
+        self.value = value_model
+        self.tokenizer = tokenizer
+        self.max_question_tokens = max_question_tokens
+        self.max_solution_tokens = max_solution_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            try:
+                self.device = next(policy_model.parameters()).device
+            except StopIteration:
+                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.reference_questions = reference_questions or []
-        # (question, gold_final) pairs used for GSM8K-anchored rollouts.
-        # Each item must have keys: "question" (str) and "gold_final" (str).
         self.grounded_qa_pairs: List[Dict[str, str]] = [
             qa for qa in (grounded_qa_pairs or [])
             if qa.get("question") and qa.get("gold_final")
@@ -122,16 +125,12 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         self.question_evaluator = QuestionQualityEvaluator(
             reference_questions=self.reference_questions
         )
-        self.consensus_reward_calculator = ConsensusRewardCalculator(
-            verifier=self.triple_verifier
-        )
-        # PRM replaces consensus as the dominant self-play signal when available.
-        # When None we fall back to the legacy consensus-based reward so the
-        # environment still works without the PRM.
+        # PRM is the sole process-quality signal.  Passing prm_scorer=None
+        # will cause compute_reward/compute_grounded_reward to raise at
+        # call time — GRPO training always supplies the PRM.
         self.prm_scorer = prm_scorer
         self.expert_panel = SimulatedExpertPanel()
         self.replay_buffer = GenerationalReplayBuffer(max_size=500)
-        # Relaxed novelty threshold so replay admissions actually happen.
         self.quality_filter = QualityFilter(novelty_threshold=0.5)
         self.last_replay_ratio: float = 0.0
         self.last_rollout_mix: Dict[str, int] = {
@@ -155,6 +154,128 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             topic=topic, target_difficulty=difficulty
         )
         return instruction, topic, difficulty
+
+    def format_solution_prompt(self, question: str) -> str:
+        """Format a question into a chat-templated solver prompt."""
+        messages = create_solver_messages(question)
+        return self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+    def generate_with_logging(
+        self,
+        initial_prompt: str,
+        max_tokens: int,
+        phase: str,
+    ) -> Tuple[str, List[Transition]]:
+        """
+        Generate text with per-step PPO-grade transition logging.
+
+        Used by the PPO-compatible rollout methods (``collect_rollouts``,
+        ``rollout_trajectory``, ``rollout_grounded_trajectory``).  The GRPO
+        training loop uses ``generate_solutions_batched`` instead.
+        """
+        import torch.nn.functional as F  # local import to keep top-level clean
+
+        prompt_ids = self.tokenizer.encode(
+            initial_prompt, return_tensors="pt"
+        ).to(self.device)
+        prompt_length = prompt_ids.shape[1]
+        prompt_attn = torch.ones_like(prompt_ids)
+
+        temperature = float(self.temperature)
+        do_sample = temperature > 1e-4
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id or eos_id
+
+        gen_kwargs: Dict[str, Any] = dict(
+            input_ids=prompt_ids,
+            attention_mask=prompt_attn,
+            max_new_tokens=max_tokens,
+            do_sample=do_sample,
+            use_cache=True,
+            output_logits=True,
+            return_dict_in_generate=True,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
+        )
+        if do_sample:
+            gen_kwargs["temperature"] = max(temperature, 1e-6)
+            gen_kwargs["top_p"] = float(self.top_p)
+
+        with torch.no_grad():
+            gen_out = self.policy.generate(**gen_kwargs)
+
+        full_ids = gen_out.sequences  # [1, P + T]
+        T_gen = int(full_ids.shape[1] - prompt_length)
+        if T_gen <= 0:
+            return "", []
+
+        raw_logits = torch.stack([lg[0] for lg in gen_out.logits], dim=0).float()
+        raw_log_probs = F.log_softmax(raw_logits, dim=-1)
+        sampled_tokens = full_ids[0, prompt_length:]
+        chosen_log_probs = raw_log_probs.gather(
+            1, sampled_tokens.unsqueeze(1)
+        ).squeeze(1)
+        entropies = -(raw_log_probs.exp() * raw_log_probs).sum(dim=-1)
+
+        positions = torch.arange(
+            prompt_length - 1, prompt_length + T_gen - 1, device=self.device
+        )
+        full_attn = torch.ones_like(full_ids)
+        if self.value is not None:
+            values = self.value.values_at_positions(
+                input_ids=full_ids, positions=positions, attention_mask=full_attn
+            )
+        else:
+            values = torch.zeros(T_gen, device=self.device)
+
+        piece_by_piece: List[str] = self.tokenizer.batch_decode(
+            [[tok.item()] for tok in sampled_tokens], skip_special_tokens=False
+        )
+
+        transitions: List[Transition] = []
+        running_text = initial_prompt
+        for t in range(T_gen):
+            state_input_ids = full_ids[0, : prompt_length + t]
+            current_state = State(
+                text=running_text,
+                input_ids=state_input_ids,
+                attention_mask=torch.ones_like(state_input_ids),
+                phase=phase,
+            )
+            action_token = int(sampled_tokens[t].item())
+            action = Action(
+                token_id=action_token,
+                log_prob=float(chosen_log_probs[t].item()),
+                entropy=float(entropies[t].item()),
+            )
+            next_text = running_text + piece_by_piece[t]
+            next_input_ids = full_ids[0, : prompt_length + t + 1]
+            next_state = State(
+                text=next_text,
+                input_ids=next_input_ids,
+                attention_mask=torch.ones_like(next_input_ids),
+                phase=phase,
+            )
+            is_done = eos_id is not None and action_token == eos_id
+            transitions.append(
+                Transition(
+                    state=current_state,
+                    action=action,
+                    reward=0.0,
+                    next_state=next_state,
+                    value=float(values[t].item()),
+                    done=is_done,
+                )
+            )
+            running_text = next_text
+            if is_done:
+                break
+
+        generated_ids = full_ids[0, prompt_length : prompt_length + len(transitions)]
+        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        return generated_text, transitions
 
     def _compute_format_score(self, solution: str) -> float:
         """
@@ -202,85 +323,11 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 target_difficulty=target_difficulty,
             )
 
-        solution_result = self.consensus_reward_calculator.calculate_reward(
-            question=question,
-            solution=solution,
+        raise RuntimeError(
+            "compute_reward called without a PRM scorer. "
+            "CurriculumMathEnvironment requires prm_scorer to be set. "
+            "Pass prm_scorer=ProcessRewardScorer(...) at construction time."
         )
-        consensus_info = solution_result["verification_details"]["consensus"]
-        question_result = self.question_evaluator.evaluate(
-            question=question,
-            solution=solution,
-            consensus_result=consensus_info,
-            target_topic=target_topic,
-            target_difficulty=target_difficulty,
-        )
-
-        question_reward = float(question_result["overall_score"])
-        solution_reward = float(solution_result["combined_score"])
-        format_score = float(solution_result["format_score"])
-        # Gate the question reward on having a parseable solution: reward
-        # shape is not supposed to praise a nice-looking question paired
-        # with a broken solution.  We treat "consensus reached" as the
-        # non-PRM analogue of "PRM succeeded" here.
-        sol_valid = bool(consensus_info.get("has_majority", False))
-        effective_question_reward = question_reward if sol_valid else 0.0
-
-        # Q/Sol = 0.4/0.6 (was 0.3/0.7).
-        base_combined_score = (
-            0.4 * effective_question_reward + 0.6 * solution_reward
-        )
-
-        # Format floor (mirrors the PRM path): broken structure caps the
-        # reward at 0.3 regardless of how the consensus scored.
-        format_floor_active = format_score < 0.5
-        format_cap = 0.3 if format_floor_active else 1.0
-        base_combined_score = min(base_combined_score, format_cap)
-
-        expert_adjustment = self.expert_panel.apply_expert_preferences(
-            base_reward=base_combined_score,
-            question_metrics=question_result,
-            solution_metrics={
-                # Shaping now keys on format only — correctness/consensus
-                # already live inside ``solution_reward`` so feeding them
-                # back in would double-count.
-                "format_compliance": format_score,
-            },
-            iteration=self.curriculum_manager.current_iteration,
-        )
-        combined_score = float(expert_adjustment["adjusted_reward"])
-        combined_score = max(0.0, min(format_cap, combined_score))
-
-        solution_success = bool(consensus_info.get("has_majority", False)) and bool(
-            consensus_info.get("primary_matches_majority", False)
-        )
-        self.curriculum_manager.update_from_trajectory(
-            topic=target_topic,
-            question_reward=question_reward,
-            solution_success=solution_success,
-            combined_reward=combined_score,
-            measured_difficulty=float(question_result["measured_difficulty"]),
-        )
-
-        return {
-            "combined_score": combined_score,
-            "base_combined_score": base_combined_score,
-            "question_metrics": question_result,
-            "solution_metrics": {
-                "overall_score": solution_reward,
-                "correctness": float(solution_result.get("combined_score", 0.0)),
-                "format_compliance": solution_result["format_score"],
-                "efficiency": solution_result["consensus_score"],
-                "consensus_score": solution_result["consensus_score"],
-                "verification_details": solution_result["verification_details"],
-            },
-            "curriculum_metrics": {
-                "target_topic": target_topic,
-                "target_difficulty": target_difficulty,
-                "detected_topic": question_result["detected_topic"],
-                "measured_difficulty": question_result["measured_difficulty"],
-            },
-            "expert_metrics": expert_adjustment,
-        }
 
     def _compute_reward_with_prm(
         self,
