@@ -185,6 +185,7 @@ python -u scripts/run_grpo_training.py \
     --eval-data-path data/sft/gsm8k_test.jsonl \
     --num-iterations 30 \
     --group-size 8 \
+    --q-group-size 2 \
     --questions-per-iter 16 \
     --learning-rate 5e-6 \
     --max-new-tokens 400 \

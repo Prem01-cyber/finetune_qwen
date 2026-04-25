@@ -485,6 +485,118 @@ def generate_question(
 # Generation
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
+def generate_questions_batched(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    instruction: str,
+    K_q: int,
+    max_new_tokens: int,
+    temperature: float,
+    device: torch.device,
+) -> Tuple[List[str], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    """
+    Generate K_q question candidates from a single curriculum instruction in
+    one batched model.generate() call.  Returns the same four-tuple as
+    ``generate_solutions_batched`` so the question token IDs can be passed
+    directly to ``grpo_loss_for_group`` for the question-level GRPO update.
+
+    Returns:
+        questions       : K_q decoded question strings
+        input_ids_list  : K_q full (prompt+response) token ID tensors
+        response_masks  : K_q bool masks (True = non-pad response token)
+        old_log_probs   : K_q scalar tensors (sum log π_old over response),
+                          no_grad — used as denominator in IS ratio.
+    """
+    system = (
+        "You are a math teacher creating original practice problems for students. "
+        "Your questions must be clear, solvable, and require multi-step arithmetic reasoning."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": instruction},
+    ]
+    try:
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:
+        prompt = f"{system}\n\n{instruction}\n"
+
+    stop_ids = _build_stop_token_ids(tokenizer)
+    pad_id: int = (
+        tokenizer.pad_token_id
+        if tokenizer.pad_token_id is not None
+        else tokenizer.eos_token_id
+    )
+
+    enc = tokenizer(
+        prompt, return_tensors="pt", truncation=True, max_length=512
+    ).to(device)
+    prompt_len: int = enc["input_ids"].shape[1]
+
+    input_ids_batch = enc["input_ids"].expand(K_q, -1).contiguous()
+    attn_mask_batch = enc["attention_mask"].expand(K_q, -1).contiguous()
+
+    model.eval()
+    with torch.no_grad():
+        out = model.generate(
+            input_ids=input_ids_batch,
+            attention_mask=attn_mask_batch,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=0.95,
+            pad_token_id=pad_id,
+            eos_token_id=stop_ids,
+            use_cache=True,
+        )
+
+    questions: List[str] = []
+    input_ids_list: List[torch.Tensor] = []
+    response_masks: List[torch.Tensor] = []
+
+    pad_id_t = torch.tensor(pad_id, device=device, dtype=out.dtype)
+    for i in range(K_q):
+        full_ids = out[i]
+        response_section = full_ids[prompt_len:]
+        mask = torch.zeros(full_ids.shape[0], dtype=torch.bool, device=device)
+        mask[prompt_len:] = response_section != pad_id_t
+        question = tokenizer.decode(response_section, skip_special_tokens=True).strip()
+        questions.append(question)
+        input_ids_list.append(full_ids)
+        response_masks.append(mask)
+
+    # Single batched forward pass for all K_q old log-probs (same trick as solutions).
+    old_log_probs: List[torch.Tensor] = []
+    with torch.no_grad():
+        attn_mask_lp = (out != pad_id_t)
+        attn_mask_lp[:, :prompt_len] = True
+        batch_logits = model(
+            input_ids=out,
+            attention_mask=attn_mask_lp.long(),
+            use_cache=False,
+            return_dict=True,
+        ).logits  # [K_q, total_len, vocab]
+
+        for i in range(K_q):
+            full_ids = out[i]
+            mask = response_masks[i]
+            shift_logits = batch_logits[i, :-1]
+            shift_labels  = full_ids[1:]
+            shift_mask    = mask[1:]
+            lp_tokens = F.log_softmax(shift_logits, dim=-1)[
+                torch.arange(shift_logits.size(0), device=device),
+                shift_labels,
+            ]
+            resp_lps = lp_tokens[shift_mask]
+            old_log_probs.append(
+                resp_lps.sum().detach() if resp_lps.numel() > 0
+                else torch.tensor(0.0, device=device)
+            )
+
+    return questions, input_ids_list, response_masks, old_log_probs
+
 def _build_stop_token_ids(tokenizer: AutoTokenizer) -> List[int]:
     """
     Return a list of token IDs that should stop generation.
@@ -867,6 +979,15 @@ def main() -> None:
         help="K: number of solutions per question per GRPO group (default 4).",
     )
     parser.add_argument(
+        "--q-group-size", type=int, default=1,
+        help="K_q: question candidates per self-play group (default 1 = disabled). "
+             "When ≥2, a second question-level GRPO update is added: K_q questions are "
+             "sampled from the same instruction, each solved group-size times; the "
+             "per-question reward (mean of its M solution rewards) drives a GRPO update "
+             "on the question tokens.  Recommended: 2 with --group-size 4 to keep "
+             "total self-play compute the same as K_q=1 with group-size 8.",
+    )
+    parser.add_argument(
         "--questions-per-iter", type=int, default=16,
         help="Number of questions per training iteration (default 16).",
     )
@@ -1070,12 +1191,13 @@ def main() -> None:
             _gpu.name, _gpu.total_memory / 1e9, _gpu.major, _gpu.minor,
         )
     logger.info(
-        "Run config: K=%d N=%d lr=%.1e T=%.2f max_new=%d | "
+        "Run config: K=%d K_q=%d N=%d lr=%.1e T=%.2f max_new=%d | "
         "clip_eps=%.2f kl_coef=%.4f warmup=%d | diff_alpha=%.1f | "
         "self_play=%.0f%% grounded=%.0f%% | "
         "math_mix=%.0f%% math_maxdiff=%d | overlong_filter=%s | "
-        "eval_every=%d eval_N=%d | grad_clip=%.2f save_every=%d keep_last=%d",
-        args.group_size, args.questions_per_iter, args.learning_rate,
+        "eval_every=%d eval_N=%d | grad_clip=%.2f save_every=%d keep_last=%d | "
+        "question_GRPO=%s",
+        args.group_size, args.q_group_size, args.questions_per_iter, args.learning_rate,
         args.temperature, args.max_new_tokens,
         args.clip_eps, args.kl_coef, args.warmup_iters,
         args.difficulty_alpha,
@@ -1084,6 +1206,7 @@ def main() -> None:
         args.overlong_filter,
         args.eval_every, args.eval_max_samples,
         args.max_grad_norm, args.save_every, args.keep_last,
+        f"ENABLED (K_q={args.q_group_size})" if args.q_group_size > 1 else "disabled",
     )
 
     # ── Load model ──────────────────────────────────────────────────────────
@@ -1479,6 +1602,155 @@ def main() -> None:
                 #    This is the "proposer" role in Theme #4 self-improvement:
                 #    the model creates its own challenge.
                 q_gen_attempts += 1
+
+                # ── TWO-PHASE QUESTION GRPO (when --q-group-size ≥ 2) ────────
+                # Phase 1: sample K_q question candidates, store their token
+                #   IDs for a question-level GRPO update.
+                # Phase 2: for each candidate, generate M=group_size solutions,
+                #   score them, and run a solution-level GRPO update.
+                # The per-question reward (mean solution reward) is then used
+                # to run GRPO on the question tokens — gradients flow back
+                # through the question tokens for the first time.
+                if args.q_group_size > 1:
+                    _q_temp = min(0.90, _annealed_temp + 0.05)
+                    q_cands, q_ids_all, q_masks_all, q_olps_all = generate_questions_batched(
+                        model=model,
+                        tokenizer=tokenizer,
+                        instruction=instruction,
+                        K_q=args.q_group_size,
+                        max_new_tokens=128,
+                        temperature=_q_temp,
+                        device=device,
+                    )
+                    # Keep only candidates with enough substance
+                    _valid_q = [
+                        (q, ids, mask, olp)
+                        for q, ids, mask, olp
+                        in zip(q_cands, q_ids_all, q_masks_all, q_olps_all)
+                        if len(q.strip()) >= 10
+                    ]
+                    if not _valid_q:
+                        logger.debug("Two-phase SP: all %d question candidates too short, skipping.", args.q_group_size)
+                        skipped += 1
+                        continue
+                    q_gen_valid += 1
+                    n_self_play += 1
+
+                    # Phase 2: score solutions for each valid question candidate
+                    _question_agg_rewards: List[float] = []   # one per valid candidate
+                    _q_total_loss_val: float = 0.0
+
+                    for _q_text, _q_ids, _q_mask, _q_olp in _valid_q:
+                        solution_prompt = math_env.format_solution_prompt(_q_text)
+                        sols_q, ids_q, masks_q, olps_q = generate_solutions_batched(
+                            model=model,
+                            tokenizer=tokenizer,
+                            prompt=solution_prompt,
+                            K=args.group_size,
+                            max_new_tokens=args.max_new_tokens,
+                            temperature=_annealed_temp,
+                            device=device,
+                        )
+                        # Overlong filter
+                        if args.overlong_filter:
+                            _vf = [
+                                t for t in zip(sols_q, ids_q, masks_q, olps_q)
+                                if int(t[2].sum().item()) < args.max_new_tokens
+                            ]
+                            if _vf:
+                                sols_q, ids_q, masks_q, olps_q = map(list, zip(*_vf))  # type: ignore
+                            else:
+                                skipped += 1
+                                _question_agg_rewards.append(0.0)
+                                continue
+
+                        # Score solutions
+                        _sol_rewards: List[float] = []
+                        for _sol in sols_q:
+                            _r, _q_rew, _, _q_met = compute_self_play_reward(
+                                question=_q_text,
+                                solution=_sol,
+                                target_topic=target_topic,
+                                target_difficulty=target_difficulty,
+                                math_env=math_env,
+                            )
+                            _sol_rewards.append(_r)
+                            all_q_rewards.append(_q_rew)
+                            _qc_topic.append(_q_met["topic_match"])
+                            _qc_diff.append(_q_met["difficulty_fit"])
+                            _qc_clarity.append(_q_met["clarity"])
+                            _qc_novelty.append(_q_met["novelty"])
+                            _qc_solvability.append(_q_met["solvability"])
+
+                        all_rewards.extend(_sol_rewards)
+                        _sp_rewards.extend(_sol_rewards)
+
+                        # Aggregate question reward = mean of its solution rewards
+                        _q_agg = float(np.mean(_sol_rewards))
+                        _question_agg_rewards.append(_q_agg)
+                        if _q_agg > 0.5:
+                            q_quality_good += 1
+
+                        # ── Solution-level GRPO update ───────────────────────
+                        _sol_loss = grpo_loss_for_group(
+                            model=model,
+                            input_ids_list=ids_q,
+                            response_masks=masks_q,
+                            rewards=_sol_rewards,
+                            old_log_probs=olps_q,
+                            clip_eps=args.clip_eps,
+                            kl_coef=args.kl_coef,
+                            ref_model=ref_model,
+                        )
+                        if _sol_loss is not None:
+                            _sol_loss.backward()
+                            total_loss_val += _sol_loss.item()
+                            _q_total_loss_val += _sol_loss.item()
+                            n_groups += 1
+                        else:
+                            skipped += 1
+                            _skipped_zero_var += 1
+
+                    # ── Question-level GRPO update ───────────────────────────
+                    # Advantages are computed over the K_q question-reward
+                    # scalars.  The IS ratio is exp(new_lp_question - old_lp_question).
+                    # kl_coef=0 here: there is no reference distribution for questions.
+                    _q_ids_v   = [t[1] for t in _valid_q]
+                    _q_masks_v = [t[2] for t in _valid_q]
+                    _q_olps_v  = [t[3] for t in _valid_q]
+
+                    _q_loss = grpo_loss_for_group(
+                        model=model,
+                        input_ids_list=_q_ids_v,
+                        response_masks=_q_masks_v,
+                        rewards=_question_agg_rewards,
+                        old_log_probs=_q_olps_v,
+                        clip_eps=args.clip_eps,
+                        kl_coef=0.0,   # no ref model for question tokens
+                        ref_model=None,
+                    )
+                    if _q_loss is not None:
+                        _q_loss.backward()
+                        logger.debug(
+                            "Q-GRPO: loss=%.4f q_rewards=%s (variance=%.4f)",
+                            _q_loss.item(),
+                            [f"{r:.3f}" for r in _question_agg_rewards],
+                            float(np.var(_question_agg_rewards)),
+                        )
+
+                    # pbar update then skip to next group (all done above)
+                    _mean_r_sp = float(np.mean(all_rewards[-len(_valid_q)*args.group_size:])) if all_rewards else 0.0
+                    _q_acc_pct = 100.0 * q_quality_good / max(1, n_self_play)
+                    pbar.set_postfix(
+                        loss=f"{_q_total_loss_val / max(1, len(_valid_q)):.4f}",
+                        mean_r=f"{_mean_r_sp:.3f}",
+                        q_acc=f"{_q_acc_pct:.0f}%",
+                        q_rew=f"{float(np.mean(all_q_rewards)):.3f}" if all_q_rewards else "n/a",
+                        skip=skipped,
+                    )
+                    continue  # ← everything handled above; jump to next group
+
+                # ── K_q=1: original single-question path (no question GRPO) ──
                 question = generate_question(
                     model=model,
                     tokenizer=tokenizer,
