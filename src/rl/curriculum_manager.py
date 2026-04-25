@@ -87,6 +87,39 @@ class CurriculumManager:
         "optimization_problems": [
             "Generate a constrained optimization style word problem in {context}.",
         ],
+        # ── AQuA-RAT additions ────────────────────────────────────────────
+        "number_theory": [
+            "Generate a number theory problem about divisibility, remainders, or prime factors in a {context} setting.",
+            "Create a problem involving multiples and factors where someone in {context} {action} items in groups.",
+        ],
+        "profit_loss": [
+            "Generate a profit and loss problem where someone in {context} {action} goods at cost price and selling price.",
+            "Create a problem about percentage profit or loss on a transaction in {context}.",
+        ],
+        "interest": [
+            "Generate a simple or compound interest problem involving a loan or investment in {context}.",
+            "Create a problem where someone in {context} {action} money at a given annual interest rate.",
+        ],
+        "sets": [
+            "Generate a set theory or Venn diagram problem where people in {context} belong to overlapping groups.",
+            "Create a problem using union and intersection of two groups in {context}.",
+        ],
+        "combinatorics": [
+            "Generate a combinatorics problem about arrangements or selections of objects in {context}.",
+            "Create a problem involving permutations or combinations where someone in {context} {action} items.",
+        ],
+        "sequences": [
+            "Generate an arithmetic or geometric sequence problem in {context}.",
+            "Create a problem where someone in {context} follows a pattern and must find the nth term.",
+        ],
+        "probability": [
+            "Generate a probability problem involving random selection or chance events in {context}.",
+            "Create a problem where someone in {context} {action} items from a group and asks for probability.",
+        ],
+        "work_time": [
+            "Generate a work-rate problem where two people in {context} complete a task together or alone.",
+            "Create a problem where workers in {context} {action} a job at different rates.",
+        ],
     }
 
     TOPIC_PREREQUISITES = {
@@ -96,6 +129,15 @@ class CurriculumManager:
         "algebra": ["basic_arithmetic", "comparison_problems"],
         "mixed_operations": ["basic_arithmetic", "fractions"],
         "optimization_problems": ["comparison_problems", "algebra"],
+        # AQuA-RAT additions
+        "number_theory": ["basic_arithmetic"],
+        "profit_loss": ["percentages", "money_problems"],
+        "interest": ["percentages"],
+        "sets": ["basic_arithmetic"],
+        "combinatorics": ["basic_arithmetic"],
+        "sequences": ["basic_arithmetic", "algebra"],
+        "probability": ["fractions", "ratios"],
+        "work_time": ["ratios", "multi_step_reasoning"],
     }
 
     def __init__(self, checkpoint_dir: str | Path):

@@ -146,12 +146,24 @@ if torch.cuda.is_available():
 # Data loading
 # ---------------------------------------------------------------------------
 
+def _infer_eval_dataset_name(data_path: str) -> str:
+    """Derive a short human-readable label from the eval data file path."""
+    stem = Path(data_path).stem.lower()
+    if "aqua" in stem:
+        return "AQuA-RAT"
+    if "math" in stem:
+        return "MATH"
+    if "gsm" in stem:
+        return "GSM8K"
+    return Path(data_path).stem
+
+
 def load_gsm8k(path: str) -> List[Dict[str, str]]:
     """Return list of {"question": ..., "gold_final": ...} from a JSONL file."""
     pairs: List[Dict[str, str]] = []
     p = Path(path)
     if not p.exists():
-        logger.warning("GSM8K data not found at %s", path)
+        logger.warning("Training data not found at %s", path)
         return pairs
     with p.open(encoding="utf-8") as f:
         for line in f:
@@ -185,7 +197,7 @@ def load_gsm8k(path: str) -> List[Dict[str, str]]:
 
             if question and gold:
                 pairs.append({"question": question, "gold_final": gold})
-    logger.info("Loaded %d GSM8K QA pairs from %s", len(pairs), path)
+    logger.info("Loaded %d QA pairs from %s", len(pairs), path)
     return pairs
 
 
@@ -1059,6 +1071,7 @@ def evaluate_policy(
         max_new_tokens=max_new_tokens,
         reward_fn=reward_fn,
         pass_at_k=pass_at_k,
+        dataset_name=_infer_eval_dataset_name(eval_data_path),
     )
     model.train()
     return results
@@ -1520,7 +1533,7 @@ def main() -> None:
     # ── Load data ────────────────────────────────────────────────────────────
     gsm8k_pairs = load_gsm8k(args.gsm8k_data)
     if not gsm8k_pairs:
-        logger.error("No GSM8K data found — cannot train. Exiting.")
+        logger.error("No training data found at %s — cannot train. Exiting.", args.gsm8k_data)
         sys.exit(1)
 
     # Optional MATH dataset mixing
@@ -2469,7 +2482,8 @@ def main() -> None:
 
         # --- Eval ---
         if iteration % args.eval_every == 0:
-            logger.info("Evaluating GSM8K (%d samples)...", args.eval_max_samples)
+            _eval_ds_label = _infer_eval_dataset_name(args.eval_data_path)
+            logger.info("Evaluating %s (%d samples)...", _eval_ds_label, args.eval_max_samples)
             eval_res = evaluate_policy(
                 model, tokenizer,
                 args.eval_data_path, args.eval_max_samples, args.eval_max_new_tokens,

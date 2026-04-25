@@ -282,6 +282,18 @@ def main() -> None:
         print(f"Wrote detailed report to {args.output_json}")
 
 
+def _infer_dataset_name(data_path: str) -> str:
+    """Derive a short human-readable dataset label from the file path."""
+    stem = Path(data_path).stem.lower()   # e.g. "aqua_validation", "gsm8k_test"
+    if "aqua" in stem:
+        return "AQuA-RAT"
+    if "math" in stem:
+        return "MATH"
+    if "gsm" in stem:
+        return "GSM8K"
+    return Path(data_path).stem          # fallback: raw filename stem
+
+
 def evaluate_gsm8k(
     model: Any,
     tokenizer: Any,
@@ -292,10 +304,11 @@ def evaluate_gsm8k(
     top_p: float = 1.0,
     reward_fn: Any = None,
     pass_at_k: int = 0,
+    dataset_name: str = "",
     pass_at_k_temperature: float = 0.8,
 ) -> dict:
     """
-    Evaluate *model* on a GSM8K-formatted JSONL file using the SAME scoring
+    Evaluate *model* on a math JSONL file using the SAME scoring
     function used during GRPO training.
 
     Args:
@@ -402,8 +415,9 @@ def evaluate_gsm8k(
     # Pass@K accumulators: for each problem, did ANY of K samples get it right?
     _pak_any_correct: list[int] = []   # 1 if any of K samples correct, else 0
 
+    _eval_label = dataset_name or _infer_dataset_name(data_path)
     pbar = tqdm(
-        rows, total=total, desc="GSM8K eval",
+        rows, total=total, desc=f"{_eval_label} eval",
         unit="q", dynamic_ncols=True, leave=True,
     )
     for i, row in enumerate(pbar):
