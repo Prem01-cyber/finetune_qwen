@@ -190,8 +190,8 @@ mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/${RUN_NAME}.log"
 echo "[launch] run_name = $RUN_NAME"
 echo "[launch] log_file = $LOG_FILE"
-echo "[launch] architecture = PATH 3 (two-phase self-play, K_q=2, K=16, A100-80GB)"
-echo "[launch] estimated wall-time ≈ 5 h (60 iters × ~3 min + 12 evals × ~4 min)"
+echo "[launch] architecture = PATH 3 (two-phase self-play, K_q=2, K=8, A100-80GB)"
+echo "[launch] estimated wall-time ≈ 2.5 h (30 iters × ~3 min + 6 evals × ~4 min)"
 
 # ── Train ────────────────────────────────────────────────────────────────
 python -u scripts/run_grpo_training.py \
@@ -199,8 +199,8 @@ python -u scripts/run_grpo_training.py \
     --output-dir checkpoints/grpo \
     --gsm8k-data data/sft/gsm8k_sft.jsonl \
     --eval-data-path data/sft/gsm8k_test.jsonl \
-    --num-iterations 60 \
-    --group-size 16 \
+    --num-iterations 30 \
+    --group-size 8 \
     --q-group-size 2 \
     --questions-per-iter 16 \
     --learning-rate 5e-6 \
@@ -215,14 +215,14 @@ python -u scripts/run_grpo_training.py \
     --self-play-ratio 0.70 \
     --math-mix-ratio 0.3 \
     --math-mix-ratio-late 0.5 \
-    --math-ramp-start 15 \
+    --math-ramp-start 8 \
     --math-max-difficulty 3 \
     --overlong-filter \
     --min-warmup 6 \
     --selfplay-gt-thresh 0.55 \
     --selfplay-grounded-thresh 0.60 \
     --selfplay-step-thresh 0.65 \
-    --selfplay-ramp-iters 30 \
+    --selfplay-ramp-iters 18 \
     --grounded-floor 0.50 \
     --extractor-model Qwen/Qwen2.5-0.5B-Instruct \
     --extraction-cache data/extraction_cache.json \
