@@ -154,3 +154,4 @@ xgrammar==0.1.33
 xxhash==3.6.0
 yarl==1.23.0
 zipp==3.23.1
+gradio==4.31.5
