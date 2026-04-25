@@ -8,73 +8,152 @@
 #   Disk   : 300 GB virtual (1920 MB/s)
 #   Network: ~6 Gbps up
 #
-# Why this config gives the best results for the hackathon run:
+# ── Architecture: Three Training Paths ──────────────────────────────────
 #
-#   1. K=8 (group-size) — doubles the learning signal per question vs K=4.
-#      GRPO advantages are z-scores within a group; K=8 makes mean/std
-#      estimates much tighter, so weak solutions stop pulling the
-#      gradient sideways. Marginal VRAM cost (~4 GB extra for K=8 vs K=4)
-#      is trivial on an 80 GB card — we were using ~12 GB at K=4.
+#   PATH 1 — Grounded (70% of groups):
+#     [GSM8K/MATH question + gold_final]
+#       → K=8 solutions (batched)
+#       → reward = 0.50×gold_match + 0.40×PRM_process + 0.10×format + LCCP bonus
+#       → solution GRPO backward
+#     Updates: solution generation only
 #
-#   2. --questions-per-iter 16 — unchanged. Already healthy (mean_r=0.609,
-#      std=0.357, 0 groups skipped). Going higher linearly increases iter
-#      wall-time and makes the eval/train ratio worse. Sweet spot.
+#   PATH 2 — Single-question self-play (--q-group-size 1, DISABLED by default):
+#     [curriculum instruction]
+#       → generate_question() [@torch.no_grad — no question gradient]
+#       → K=8 solutions (batched)
+#       → reward = 0.40×Q_heuristic + 0.60×PRM_solution
+#       → solution GRPO backward
+#     Updates: solution generation only (question reward cancels in advantages)
 #
-#   3. --learning-rate 5e-6 — halved from 1e-5 after iter 5 LR shock. At 1e-5
-#      the policy collapsed the moment warmup ended (mean_r dropped 0.917→0.448,
-#      grounded_acc 87%→53%). 5e-6 keeps the update stable through the full run.
+#   PATH 3 — Two-phase self-play (--q-group-size 2, DEFAULT in this script):
+#     [curriculum instruction]
+#       → generate_questions_batched(K_q=2) + store old_log_probs
+#       → for each of K_q=2 question candidates:
+#            → K=8 solutions, score each, solution GRPO backward
+#            → question_reward = mean(solution_rewards)
+#       → question GRPO backward over K_q=2 questions
+#       → optimizer.step()  ← applies both sets of gradients
+#     Updates: BOTH solution AND question generation
+#     Question reward: outcome-based (mean of actual downstream solution rewards),
+#                      not heuristic — the model learns to ask questions that
+#                      lead to high-PRM, correctly-structured solutions.
 #
-#   4. --max-grad-norm 0.5 — tighter than 1.0 default, matches PPO. Prevents
-#      rare high-variance groups from spiking the gradient norm.
+# ── Why these specific values ────────────────────────────────────────────
 #
-#   5. --warmup-iters 8 — extended from 5. At 5 iters the ramp to peak LR
-#      coincided exactly with the crash. 8 iters gives a gentler ramp and
-#      lets the policy adapt before hitting peak learning rate.
+#   --group-size 8            K=8 batched in ONE model.generate call — near-100%
+#                             GPU utilisation.  Tight mean/std estimates make GRPO
+#                             advantages cleaner.  Marginal VRAM: ~4 GB extra vs K=4.
 #
-#   6. --save-every 5 + --keep-last 3 — at 3 GB per merged 1.5B bf16
-#      checkpoint, naive "save every iter" burns 90 GB. Rolling window keeps
-#      the disk tidy; best_policy/ is always preserved independently.
+#   --q-group-size 2          K_q=2 question candidates per self-play group.
+#                             Each candidate solved K=8 times.  Question GRPO runs
+#                             once per group with 2-point reward signal.
+#                             Compute overhead: +31% per iteration (self-play groups
+#                             double, grounded unaffected; 30% × 2× = +30%).
+#                             To keep SAME compute: use --group-size 4 --q-group-size 2.
+#
+#   --questions-per-iter 16   N=16 groups per step: 11 grounded + 5 self-play.
+#                             Per iter solution rollouts:
+#                               Grounded : 11 × 8 = 88
+#                               Self-play: 5 × 2 × 8 = 80
+#                               Total    : 168 (vs 128 with K_q=1)
+#
+#   --self-play-ratio 0.30    30% self-play (5 groups/iter).  The two-phase update
+#                             extracts question-learning signal from these groups
+#                             that previously only trained solution generation.
+#
+#   --learning-rate 5e-6      Halved from 1e-5 after iter 5 LR shock.  At 1e-5
+#                             policy collapsed at warmup end (grounded_acc 87%→53%).
+#                             5e-6 keeps update stable.
+#
+#   --warmup-iters 8          Extended from 5.  Gentler ramp lets policy adapt
+#                             before hitting peak LR.
+#
+#   --max-grad-norm 0.5       Tighter than 1.0 default, matches PPO.  Prevents
+#                             high-variance groups from spiking gradient norm.
+#
+#   --kl-coef 0.04            KL penalty anchors solution policy to SFT checkpoint.
+#                             kl_coef=0.0 is hardcoded for the question GRPO update
+#                             (question generation should stay exploratory).
+#
+#   --clip-eps 0.2            PPO-style IS clip: prevents policy spikes.
+#
+#   --difficulty-alpha 3.0    Difficulty-weighted sampling: questions where the model
+#                             wins 40-60% of K solutions are sampled most often.
+#
+#   --math-mix-ratio 0.3      30% MATH competition problems (difficulty ≤ 3).
+#   --math-mix-ratio-late 0.5 Ramps to 50% from iter 15–25 once policy is stable.
+#   --math-ramp-start 15      Start of the MATH ratio ramp.
+#   --math-max-difficulty 3   Level 3 ≈ AMC-10; levels 4-5 are too hard for 1.5B.
+#
+#   --num-iterations 50       ~120 s/iter (K_q=2 overhead) → 50 iters ≈ 100 min.
+#
+#   --eval-every 5            10 eval checkpoints over 50 iters.
+#   --eval-max-samples 100    Fast evals (~2 min each); best_policy saved on improvement.
+#
+#   --save-every 5            Rolling window of 3 checkpoints (~9 GB on disk).
+#   --keep-last 3
+#
+# ── Expected wall-time on this host (K_q=2, K=8, N=16, T_anneal=0.8→0.4) ──
+#
+#   Model + PRM load                              :  ~2 min
+#   Initial eval (100 samples)                   :  ~2 min
+#   Train iter (168 sol rollouts + 10 q rollouts):  ~120 s  (~2 min/iter)
+#   Eval checkpoint × 10 (100 samples)           :  ~2 min each = 20 min
+#   50 iterations × 2 min                        :  ~100 min
+#   Total                                        :  ~2.5 h end-to-end
+#
+#   Compare vs K_q=1: 90 s/iter × 50 = 75 min + 20 min eval = ~1.8 h
+#   Two-phase overhead: ~40 min extra for full question-generation gradient learning.
+#
+# ── Smoke test (exercises all three paths, ~8 min) ───────────────────────
+#
+#   Tests PATH 3 (two-phase) with minimal compute:
+#
+#   bash launch_grpo.sh \
+#     --num-iterations 3 \
+#     --questions-per-iter 8 \
+#     --group-size 4 \
+#     --q-group-size 2 \
+#     --self-play-ratio 0.30 \
+#     --max-new-tokens 200 \
+#     --eval-every 2 \
+#     --eval-max-samples 20 \
+#     --eval-max-new-tokens 256 \
+#     --math-mix-ratio 0 \
+#     --skip-initial-eval \
+#     --save-every 0 \
+#     --keep-last 0 \
+#     --output-dir checkpoints/grpo_smoke \
+#     --run-name smoke_twophase
+#
+#   What to check in the smoke logs:
+#     [iter 1] "Two-phase SP" block appears (K_q=2 question candidates)
+#     [iter 1] "Q-GRPO: loss=..." appears (question backward ran)
+#     [iter 1] solution GRPO loss reported per candidate
+#     [eval]   combined_score > 0.0 (reward_fn fired correctly)
 #
 # ── Environment-variable tuning ──────────────────────────────────────────
 #
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #     HF + Flash-Attn 2 fragment the allocator during generation.
-#     Expandable segments let PyTorch grow allocations without copying,
-#     recovering 2-4 GB of peak VRAM over a long run.
+#     Expandable segments recover 2-4 GB peak VRAM over a long run.
 #
 #   OMP_NUM_THREADS=8
-#     EPYC 7V13 has 96 vCPU. Letting PyTorch spawn 96 OpenMP threads for
-#     tiny per-op workloads causes catastrophic contention. 8 is enough
-#     for the 1.5B forward passes inside reward scoring.
+#     EPYC 7V13 has 96 vCPU. 96 OpenMP threads causes thrashing; 8 is enough.
 #
 #   TOKENIZERS_PARALLELISM=false
-#     Eliminates a fork-after-thread warning from HF tokenizers when we
-#     spawn subprocesses for generation.
+#     Eliminates fork-after-thread warning from HF tokenizers.
 #
 #   HF_HUB_DISABLE_XET=1
-#     Falls back to HTTP downloads for the 7B PRM. Xet transport can
-#     silently hang for hours on some datacenter networks.
-#
-# ── Expected wall-time on this host ──────────────────────────────────────
-#
-#   Initial eval (250 samples)                        : ~5 min
-#   Train iter @ K=8 batched, N=16, max_new=400       : ~90 s  (was ~6-7 min sequential)
-#   Eval every 10 iters (250 samples) × 10 evals      : ~5 min each × 10 = 50 min
-#   100 iterations × 1.5 min                          : ~2.5 h
-#   Total                                             : ~3.5 h end-to-end
-#
-#   This is 3× more iterations than the previous 30-iter run in the same wall-time.
+#     Falls back to HTTP downloads for the 7B PRM.
 #
 # ── Overrides ────────────────────────────────────────────────────────────
 #
-#   bash launch_grpo.sh                       # run with these defaults
-#   bash launch_grpo.sh --group-size 12       # push VRAM harder
-#   bash launch_grpo.sh --no-prm              # skip 7B PRM download
-#   bash launch_grpo.sh --num-iterations 50   # longer run
-#
-#   Smoke test:
-#     bash launch_grpo.sh --num-iterations 2 --questions-per-iter 8 \
-#         --group-size 4 --skip-initial-eval --run-name smoke
+#   bash launch_grpo.sh                         # default (two-phase, K_q=2)
+#   bash launch_grpo.sh --q-group-size 1        # disable question GRPO
+#   bash launch_grpo.sh --group-size 4 --q-group-size 2   # same compute as K_q=1 K=8
+#   bash launch_grpo.sh --num-iterations 100    # longer run (~5 h)
+#   bash launch_grpo.sh --no-prm               # skip 7B PRM (smoke only)
 
 set -euo pipefail
 
@@ -83,7 +162,6 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 # ── CPU / threading ──────────────────────────────────────────────────────
-# Cap CPU threads so tokenizer/scoring doesn't thrash the 96-vCPU EPYC.
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 export MKL_NUM_THREADS=${MKL_NUM_THREADS:-8}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
@@ -97,7 +175,7 @@ export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-/tmp/triton_cache}
 # ── Python path ──────────────────────────────────────────────────────────
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
-# ── Pre-flight: sanity-check the GPU before a 4-hour run ─────────────────
+# ── Pre-flight: sanity-check the GPU before a long run ───────────────────
 if command -v nvidia-smi >/dev/null 2>&1; then
     echo "─── nvidia-smi ───────────────────────────────────────────────"
     nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version \
@@ -112,72 +190,10 @@ mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/${RUN_NAME}.log"
 echo "[launch] run_name = $RUN_NAME"
 echo "[launch] log_file = $LOG_FILE"
+echo "[launch] architecture = PATH 3 (two-phase self-play, K_q=2, K=8)"
+echo "[launch] estimated wall-time ≈ 2.5 h (50 iters × ~2 min + 10 evals × ~2 min)"
 
-# ── Smoke test (15 samples, 2 iters, ~3 min) ─────────────────────────────
-#
-#   bash launch_grpo.sh \
-#     --num-iterations 2 --questions-per-iter 4 --group-size 4 \
-#     --max-new-tokens 128 --eval-every 1 --eval-max-samples 15 \
-#     --eval-max-new-tokens 256 --save-every 0 --keep-last 0 \
-#     --math-mix-ratio 0 --self-play-ratio 0 \
-#     --output-dir checkpoints/grpo_smoke --run-name smoke
-#
-#   Plots are auto-saved to checkpoints/grpo_smoke/smoke/plots/ after training.
-#   Generate from an existing run at any time:
-#     python scripts/plot_grpo_run.py --latest
-#
 # ── Train ────────────────────────────────────────────────────────────────
-#
-# What each flag does on this hardware:
-#
-#   --group-size 8            K=8 batched in ONE model.generate call — near-100%
-#                             GPU utilisation vs the old sequential K=8 loop.
-#
-#   --questions-per-iter 16   N=16 groups per step (well-conditioned gradient).
-#
-#   --clip-eps 0.2            PPO-style IS clip: prevents policy spikes at 1e-5 LR.
-#
-#   --kl-coef 0.04            Reference-policy KL penalty: anchors the policy to the
-#                             SFT starting checkpoint.  Prevents forgetting GSM8K
-#                             facts learned during dual_task_v1 training.
-#                             β=0.04 matches DeepSeekMath-GRPO default.
-#
-#   --warmup-iters 3          Linear LR ramp: 1e-6 → 1e-5 over 3 iterations.
-#
-#   --min-lr-ratio 0.1        Cosine decays to 1e-6 (10% of peak) by iter 100.
-#
-#   --difficulty-alpha 3.0    Difficulty-weighted sampling: questions where the model
-#                             scores 40-60% of K=8 solutions are sampled most often.
-#
-#   --math-mix-ratio 0.3      30% of each question batch comes from MATH competition
-#                             dataset (difficulty ≤ 3), 70% from GSM8K.  MATH problems
-#                             expose the model to harder multi-step reasoning and raise
-#                             the accuracy ceiling beyond GSM8K's ~85% saturation.
-#                             First run downloads + caches to data/math/math_numeric.jsonl.
-#
-#   --math-max-difficulty 3   Level 1-2 ≈ AMC-8 (comparable to hard GSM8K).
-#                             Level 3 ≈ AMC-10.  Levels 4-5 are too hard for a 1.5B
-#                             model to reliably get any reward signal from.
-#
-#   --self-play-ratio 0.35    35% of groups use SELF-PLAY: the model generates its own
-#                             question from a curriculum instruction, then solves it.
-#                             Reward = 0.40×question_quality + 0.60×solution_quality.
-#                             This is the core Theme #4 self-improvement loop — the model
-#                             is rewarded not only for solving correctly but for creating
-#                             well-formed, appropriately difficult, solvable challenges.
-#                             Raised from 0.30 → 0.35 after smoke run confirmed q_acc=100%
-#                             and q_reward≈0.77 — the model generates high-quality questions.
-#                             The remaining 65% use GROUNDED (dataset) questions with
-#                             gold-answer reward — the primary accuracy anchor.
-#
-#   --num-iterations 100      ~90s/iter on A100 → 100 iters ≈ 3.5 h total.
-#
-#   --eval-every 10           10 eval checkpoints over 100 iters.
-#
-#   --save-every 10           Save every 10 iters; best_policy/ saved on any improvement.
-#
-#   --keep-last 3             Rolling window of 3 iter_* checkpoints (~9 GB).
-#
 python -u scripts/run_grpo_training.py \
     --base-model checkpoints/dual_task_v1 \
     --output-dir checkpoints/grpo \
