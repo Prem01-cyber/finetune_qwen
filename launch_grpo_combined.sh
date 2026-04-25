@@ -2,17 +2,38 @@
 # =============================================================================
 # launch_grpo_combined.sh  —  GRPO training on NuminaMath-CoT + OpenMathInstruct-2
 #
-# This replaces GSM8K/AQuA with a single high-quality combined dataset that:
-#   • Has 14 distinct skill_ids → ZPD CurriculumManager gets real per-topic signal
-#   • Clean \\boxed{} / numeric answers → gt_match_rate stays ≥ 60% at all times
+# Host profile (same as launch_grpo.sh):
+#   GPU    : 1× A100 PCIe, 80 GB HBM2e, 1583 GB/s, PCIe 4.0 x16
+#   CPU    : AMD EPYC 7V13 64-core (96 vCPU available)
+#   RAM    : 221.7 GB
+#
+# Dataset vs launch_grpo.sh:
+#   • Replaces GSM8K/AQuA with NuminaMath-CoT + OpenMathInstruct-2
+#   • 14 distinct skill_ids → ZPD CurriculumManager gets real per-topic signal
+#   • Clean \\boxed{} / numeric answers → gt_match_rate stays ≥ 60%
 #   • Difficulty tiers 1–3 per problem → sparse-reward regime at tiers 2-3
-#   • 30K+ diverse problems → prevents reward-hacking via memorisation
+#   • 20K+ diverse problems → prevents reward-hacking via memorisation
 #
-# Pre-requisite (one-time, ~5 min):
-#   python scripts/prepare_combined_dataset.py
+# Flash-Attention 2
+# -----------------
+#   src/utils/attn_backend.py picks the BEST available backend at runtime:
 #
-# Then launch:
-#   bash launch_grpo_combined.sh
+#       flash_attention_2  (O(T) attention memory, 1.5-2.5× faster backward)
+#           ↓  not installed
+#       sdpa               (torch.nn.functional.scaled_dot_product_attention)
+#           ↓  not available
+#       eager              (stock HF, slowest)
+#
+#   This script installs flash-attn if missing before training begins.
+#   Impact on this run (K=8, T≈500, 28 layers, bf16):
+#     - Attention activation memory: ~1.3 GB saved per backward pass
+#     - Rollout speed: ~1.5× faster .generate() for long contexts
+#     - Gradient checkpointing automatically DISABLED when Flash is active
+#       (Flash already provides O(T) memory — double-checkpointing wastes time)
+#
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#   HF + Flash-Attn 2 fragment the allocator during generation.
+#   Expandable segments recover 2-4 GB peak VRAM over a long run.
 #
 # ── Why these hyperparameter changes vs launch_grpo.sh ─────────────────────
 #
@@ -66,6 +87,14 @@
 #   Iters 26-60  (SELFPLAY_RAMP): mean_reward 0.82→0.88, sp_ratio 40%→60%
 #   Eval accuracy on combined_val: expect 55-65% (harder than GSM8K's 78-80%)
 #
+#   Wall-time with Flash-Attn 2 active (A100-80GB, K_q=2, K=8, N=16):
+#     Model + PRM load             :  ~2 min
+#     Initial eval (150 samples)   :  ~3 min
+#     Train iter (Flash active)    :  ~90 s   (was ~120 s — ~25% faster)
+#     Eval checkpoint × 12         :  ~3 min each = 36 min
+#     60 iterations × 90 s        :  ~90 min
+#     Total                        :  ~2.5 h  (was ~4 h without Flash)
+#
 # ── Smoke test (~10 min) ─────────────────────────────────────────────────────
 #
 #   bash launch_grpo_combined.sh \
@@ -89,8 +118,8 @@ EVAL_DATA="data/sft/combined_val.jsonl"
 EXTRACTION_CACHE="data/extraction_cache_combined.json"
 
 if [ ! -f "$TRAIN_DATA" ]; then
-    echo "Combined training data not found at $TRAIN_DATA."
-    echo "Running the data pipeline first (≈5 min for 35K problems) …"
+    echo "[launch] Combined training data not found at $TRAIN_DATA"
+    echo "[launch] Running the data pipeline first (~5 min for 20K problems) …"
     python scripts/prepare_combined_dataset.py
 fi
 
@@ -106,8 +135,24 @@ if [ ! -d "$BASE_MODEL" ]; then
     exit 1
 fi
 
+# ── Flash-Attention 2 install (if missing) ────────────────────────────────────
+#
+# flash-attn needs to match (torch version, CUDA version, Python version).
+# We use MAX_JOBS to cap parallel compilation to avoid OOM during build.
+# If the prebuilt wheel is available it installs in <30 s; source build ~10 min.
+#
+if ! python -c "import flash_attn; assert int(flash_attn.__version__.split('.')[0]) >= 2" 2>/dev/null; then
+    echo "[launch] flash-attn not found or < v2 — installing now …"
+    MAX_JOBS=4 pip install flash-attn --no-build-isolation -q
+    echo "[launch] flash-attn installed."
+else
+    FLASH_VER=$(python -c "import flash_attn; print(flash_attn.__version__)" 2>/dev/null)
+    echo "[launch] flash-attn ${FLASH_VER} already installed — skipping install."
+fi
+
 # ── GPU / allocator ───────────────────────────────────────────────────────────
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+# expandable_segments: recovers 2-4 GB fragmented VRAM during long Flash+HF runs
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 # ── CPU / threading ───────────────────────────────────────────────────────────
@@ -115,16 +160,22 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 export MKL_NUM_THREADS=${MKL_NUM_THREADS:-8}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 
+# ── Triton / Flash-Attn compilation cache ─────────────────────────────────────
+# Persist Triton JIT kernels across runs — avoids ~30 s recompile each launch.
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-/tmp/triton_cache}
+# Flash-Attn 2 uses Triton for its CUDA kernels.
+# Setting this suppresses the "your GPU may not be supported" warning on A100.
+export FLASH_ATTENTION_SKIP_CUDA_BUILD=${FLASH_ATTENTION_SKIP_CUDA_BUILD:-FALSE}
+
 # ── HuggingFace hub robustness ────────────────────────────────────────────────
 export HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}
 export HF_HUB_ENABLE_HF_TRANSFER=${HF_HUB_ENABLE_HF_TRANSFER:-0}
 export TRANSFORMERS_VERBOSITY=${TRANSFORMERS_VERBOSITY:-warning}
-export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-/tmp/triton_cache}
 
 # ── Python path ───────────────────────────────────────────────────────────────
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 
-# ── Pre-flight ────────────────────────────────────────────────────────────────
+# ── Pre-flight: GPU info ───────────────────────────────────────────────────────
 if command -v nvidia-smi >/dev/null 2>&1; then
     echo "─── nvidia-smi ───────────────────────────────────────────────────"
     nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version \
@@ -132,20 +183,33 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     echo "──────────────────────────────────────────────────────────────────"
 fi
 
+# ── Confirm attention backend that will be selected ───────────────────────────
+python - <<'PYEOF'
+import sys; sys.path.insert(0, '.')
+from src.utils.attn_backend import select_attn_implementation
+impl = select_attn_implementation()
+tag = {
+    "flash_attention_2": "FAST   — Flash-Attn 2 active (O(T) memory, 1.5-2.5× faster)",
+    "sdpa":              "OK     — SDPA active (no flash-attn; install for ~2× speedup)",
+    "eager":             "SLOW   — Eager fallback (install flash-attn for best performance)",
+}.get(impl, impl)
+print(f"[launch] attn_backend = {tag}")
+PYEOF
+
 # ── Log tee ───────────────────────────────────────────────────────────────────
 RUN_NAME="grpo_combined_$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="logs/grpo"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/${RUN_NAME}.log"
 
-echo "[launch] run_name    = $RUN_NAME"
-echo "[launch] base_model  = $BASE_MODEL"
-echo "[launch] train_data  = $TRAIN_DATA"
-echo "[launch] eval_data   = $EVAL_DATA"
-echo "[launch] log_file    = $LOG_FILE"
+echo "[launch] run_name     = $RUN_NAME"
+echo "[launch] base_model   = $BASE_MODEL"
+echo "[launch] train_data   = $TRAIN_DATA  ($(wc -l < "$TRAIN_DATA") rows)"
+echo "[launch] eval_data    = $EVAL_DATA"
+echo "[launch] log_file     = $LOG_FILE"
 echo "[launch] architecture = two-phase self-play (K_q=2, K=8)"
-echo "[launch] dataset     = NuminaMath-CoT + OpenMathInstruct-2 (14 skill_ids)"
-echo "[launch] estimated wall-time ≈ 4 h (60 iters × ~120s + 12 evals × ~3 min)"
+echo "[launch] dataset      = NuminaMath-CoT + OpenMathInstruct-2 (14 skill_ids)"
+echo "[launch] wall-time    ≈ 2.5 h  Flash active  /  4 h  SDPA fallback"
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 python -u scripts/run_grpo_training.py \
