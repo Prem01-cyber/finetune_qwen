@@ -20,26 +20,27 @@ from src.rl.mdp_components import State, Action, Transition, Trajectory
 from src.rl.value_network import ValueHead
 from src.rl.reward_calculator import RewardCalculator
 from src.sft.step_verify_sympy import verify_solution_text
+from src.config.prompts import create_solver_messages, format_generator_user_message
 
 logger = logging.getLogger(__name__)
 
 
-# Question generation prompts (curriculum of increasing difficulty)
+# Question generation prompts (curriculum of varying complexity)
 QUESTION_PROMPTS = [
-    # Level 1: 2-step problems
-    "Generate a grade-school math problem about money and fractions that requires exactly 2 steps to solve.",
-    "Create a simple word problem about time and distance with 2 calculation steps.",
-    "Generate a problem about percentages and discounts requiring 2 steps.",
+    # Simple problems
+    "Generate a grade-school math problem about money and fractions.",
+    "Create a simple word problem about time and distance.",
+    "Generate a problem about percentages and discounts.",
 
-    # Level 2: 3-step problems
-    "Generate a math problem about shopping with multiple items requiring 3 steps.",
-    "Create a problem about ratios and proportions with 3 calculation steps.",
-    "Generate a word problem combining fractions and multiplication in 3 steps.",
+    # Moderate complexity
+    "Generate a math problem about shopping with multiple items.",
+    "Create a problem about ratios and proportions.",
+    "Generate a word problem combining fractions and multiplication.",
 
-    # Level 3: 4-5 step problems
-    "Generate a complex problem about compound percentages requiring 4-5 steps.",
-    "Create a multi-stage problem about resource allocation with 4-5 steps.",
-    "Generate a challenging problem combining multiple operations in 4-5 steps.",
+    # Higher complexity
+    "Generate a complex problem about compound percentages.",
+    "Create a multi-stage problem about resource allocation.",
+    "Generate a challenging problem combining multiple operations.",
 ]
 
 
@@ -117,33 +118,24 @@ class MathEnvironment:
         """
         Format prompt for question generation phase.
 
+        Uses centralized prompt configuration from src/config/prompts.py.
+
         Returns:
-            s_0^gen = "### Task: Generate Question\n<instruction>"
+            Formatted user message with task prefix
         """
-        return f"### Task: Generate Question\n{instruction}"
+        return format_generator_user_message(instruction)
 
     def format_solution_prompt(self, question: str) -> str:
         """
         Format prompt for solution generation phase.
         
-        Uses chat template with system prompt to ensure proper formatting.
-        This matches the format used by TripleVerifier for consensus solutions.
+        Uses centralized prompt configuration from src/config/prompts.py
+        with chat template to ensure proper formatting.
 
         Returns:
             Formatted prompt with chat template
         """
-        system_prompt = (
-            "You are a step-by-step math solver. "
-            "Solve the given problem one step at a time. "
-            "Each step must be on its own line, starting with 'Step N:'. "
-            "End with a line starting with 'Final Answer:'. "
-            "Write every mathematical expression in Python/SymPy syntax."
-        )
-        
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"### Task: Solve Problem\nProblem: {question}\nSolution:"},
-        ]
+        messages = create_solver_messages(question)
         
         # Apply chat template (matches training format)
         prompt = self.tokenizer.apply_chat_template(

@@ -51,41 +51,41 @@ class CurriculumManager:
 
     TOPIC_TEMPLATES = {
         "basic_arithmetic": [
-            "Generate a {context} word problem using addition/subtraction with {steps} steps.",
+            "Generate a {context} word problem using addition/subtraction.",
         ],
         "single_step_word_problems": [
-            "Generate a simple one-idea word problem in a {context} setting with {steps} steps.",
+            "Generate a simple one-idea word problem in a {context} setting.",
         ],
         "fractions": [
-            "Generate a fractions word problem where someone {action} part of a quantity in a {context} scenario with {steps} steps.",
-            "Create a problem involving fraction operations in {context} with {steps} steps.",
+            "Generate a fractions word problem where someone {action} part of a quantity in a {context} scenario.",
+            "Create a problem involving fraction operations in {context}.",
         ],
         "percentages": [
-            "Generate a percentage change or discount problem in {context} with {steps} steps.",
+            "Generate a percentage change or discount problem in {context}.",
         ],
         "ratios": [
-            "Generate a ratios/proportions word problem in {context} with {steps} steps.",
+            "Generate a ratios/proportions word problem in {context}.",
         ],
         "money_problems": [
-            "Create a money and pricing problem in {context} with {steps} reasoning steps.",
+            "Create a money and pricing problem in {context}.",
         ],
         "time_distance": [
-            "Generate a time/speed/distance problem in {context} with {steps} steps.",
+            "Generate a time/speed/distance problem in {context}.",
         ],
         "multi_step_reasoning": [
-            "Generate a multi-step reasoning problem in {context} requiring {steps} steps.",
+            "Generate a multi-step reasoning problem in {context}.",
         ],
         "algebra": [
-            "Generate an algebra problem that solves for a variable in {context} with {steps} steps.",
+            "Generate an algebra problem that solves for a variable in {context}.",
         ],
         "mixed_operations": [
-            "Generate a problem requiring mixed operations in {context} with {steps} steps.",
+            "Generate a problem requiring mixed operations in {context}.",
         ],
         "comparison_problems": [
-            "Generate a comparison problem in {context} ('more than'/'less than') with {steps} steps.",
+            "Generate a comparison problem in {context} ('more than'/'less than').",
         ],
         "optimization_problems": [
-            "Generate a constrained optimization style word problem in {context} with {steps} steps.",
+            "Generate a constrained optimization style word problem in {context}.",
         ],
     }
 
@@ -234,11 +234,10 @@ class CurriculumManager:
     def generate_instruction(self, topic: str, target_difficulty: float) -> str:
         templates = self.TOPIC_TEMPLATES.get(topic, self.TOPIC_TEMPLATES["multi_step_reasoning"])
         template = random.choice(templates)
-        steps = self._difficulty_to_step_range(target_difficulty)
+        # Note: {steps} placeholder removed from templates to let model decide complexity
         return template.format(
             context=random.choice(self.CONTEXTS),
             action=random.choice(self.ACTIONS),
-            steps=steps,
         )
 
     def get_curriculum_stats(self) -> Dict[str, object]:

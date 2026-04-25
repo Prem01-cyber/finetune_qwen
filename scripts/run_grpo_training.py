@@ -70,6 +70,7 @@ from src.rl.prm_scorer import ProcessRewardScorer
 from src.sft.solution_format import extract_final_answer_numeric_str
 from src.utils.attn_backend import select_attn_implementation
 from src.rl.math_environment_curriculum import CurriculumMathEnvironment
+from src.config.prompts import create_generator_messages
 
 logging.basicConfig(
     level=logging.INFO,
@@ -411,7 +412,9 @@ def compute_self_play_reward(
     #   solvability_score→ scalar  (the dict version is under "solvability" — don't use that)
     #   novelty_combined → scalar  (the dict version is under "novelty" — don't use that)
     q_metrics_raw = result.get("question_metrics", {}) or {}
-    q_reward = float(q_metrics_raw.get("overall_score", 0.0))
+    # Use the gated question reward (zeroed when solution is invalid) — this is
+    # what actually contributed to combined_score, not the raw overall_score.
+    q_reward = float(result.get("effective_question_reward", q_metrics_raw.get("overall_score", 0.0)))
     q_metrics: Dict = {
         "overall_score":  q_reward,
         "topic_match":    float(q_metrics_raw.get("topic_match",       0.0)),
@@ -430,30 +433,27 @@ def generate_question(
     instruction: str,
     max_new_tokens: int,
     device: torch.device,
+    temperature: float = 0.85,
 ) -> str:
     """Generate a math question from a curriculum instruction.
 
-    The instruction (e.g. "Create a 2-step word problem about money in a
-    shopping context") is formatted with the chat template so the SFT-trained
-    model responds in its expected style.
+    Uses centralized prompts from src/config/prompts.py to ensure consistency
+    across SFT training, GRPO, PPO, and inference.
 
     Returns the raw decoded question text (no special tokens).
     """
-    system = (
-        "You are a math problem creator. "
-        "Given an instruction, write a clear, solvable math word problem. "
-        "Write only the problem statement — no solution, no explanation."
-    )
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": instruction},
-    ]
+    # Use centralized prompt configuration
+    messages = create_generator_messages(instruction)
+    
     try:
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
     except Exception:
-        prompt = f"{system}\n\n{instruction}\n"
+        # Fallback if chat template is missing
+        system = messages[0]["content"]
+        user = messages[1]["content"]
+        prompt = f"{system}\n\n{user}\n"
 
     enc = tokenizer(
         prompt, return_tensors="pt", truncation=True, max_length=512
@@ -472,7 +472,7 @@ def generate_question(
         attention_mask=enc["attention_mask"],
         max_new_tokens=max_new_tokens,
         do_sample=True,
-        temperature=0.9,   # slightly higher than solutions for diversity
+        temperature=temperature,
         top_p=0.95,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         eos_token_id=stop_ids or None,
@@ -809,11 +809,12 @@ def evaluate_policy(
 
     When *math_env* is supplied a ``reward_fn`` is constructed that calls
     ``math_env.compute_grounded_reward(question, solution, gold)``.  This
-    returns ``combined_score = 0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format``,
-    making the eval metric IDENTICAL to the GRPO training objective.  Any
-    improvement in step quality, SymPy verification or format compliance shows
-    up immediately in the accuracy number instead of being hidden behind the
-    coarse binary final-answer signal.
+    returns ``combined_score = 0.50×correct + 0.40×process(0.60×prm_final
+    + 0.40×prm_mean) + 0.10×format``, making the eval metric IDENTICAL to
+    the GRPO training objective.  Any improvement in step quality, chain
+    integrity, or format compliance shows up immediately in the accuracy
+    number instead of being hidden behind the coarse binary final-answer
+    signal.
     """
     if not Path(eval_data_path).exists():
         return {"accuracy": 0.0, "combined_score": 0.0, "total": 0}
@@ -822,16 +823,20 @@ def evaluate_policy(
     reward_fn = None
     if math_env is not None:
         import logging as _log_mod
-        _mec_logger = _log_mod.getLogger("src.rl.math_environment_curriculum")
+        _mec_logger  = _log_mod.getLogger("src.rl.math_environment_curriculum")
+        _prm_logger  = _log_mod.getLogger("src.rl.prm_scorer")
 
         def reward_fn(question: str, solution: str, gold: str) -> Dict:
-            """Thin wrapper that silences per-sample debug logs during eval."""
-            _old = _mec_logger.level
+            """Thin wrapper that silences per-sample INFO logs during eval."""
+            _old_mec = _mec_logger.level
+            _old_prm = _prm_logger.level
             _mec_logger.setLevel(_log_mod.WARNING)
+            _prm_logger.setLevel(_log_mod.WARNING)
             try:
                 return math_env.compute_grounded_reward(question, solution, gold)
             finally:
-                _mec_logger.setLevel(_old)
+                _mec_logger.setLevel(_old_mec)
+                _prm_logger.setLevel(_old_prm)
 
     results = evaluate_gsm8k(
         model=model,
@@ -897,6 +902,17 @@ def main() -> None:
         "--math-mix-ratio", type=float, default=0.3,
         help="Fraction of each question batch drawn from MATH (vs GSM8K). "
              "0 = GSM8K only, 1 = MATH only. Default 0.3.",
+    )
+    parser.add_argument(
+        "--math-mix-ratio-late", type=float, default=None,
+        help="If set, ramp MATH fraction from --math-mix-ratio to this value "
+             "starting at iter 15 (linear ramp over next 10 iters). "
+             "Example: --math-mix-ratio 0.3 --math-mix-ratio-late 0.5 "
+             "raises difficulty progressively once the policy is stable.",
+    )
+    parser.add_argument(
+        "--math-ramp-start", type=int, default=15,
+        help="Iteration at which to begin the MATH ratio ramp. Default 15.",
     )
     parser.add_argument(
         "--math-max-difficulty", type=int, default=3,
@@ -1293,8 +1309,9 @@ def main() -> None:
     _q_attempts: Dict[str, int] = defaultdict(int)
 
     def _question_key(q: str) -> str:
-        """Short fingerprint — collision-safe enough for ~1k questions."""
-        return q[:100]
+        """Stable hash fingerprint — collision-resistant for any pool size."""
+        import hashlib
+        return hashlib.md5(q.encode(), usedforsecurity=False).hexdigest()
 
     def _sample_by_difficulty(
         pool: List[Dict[str, str]], n: int, alpha: float
@@ -1346,7 +1363,7 @@ def main() -> None:
             math_env=math_env,
             pass_at_k=args.eval_pass_at_k,
         )
-        # accuracy == combined_score = 0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format
+        # accuracy == combined_score = 0.50×correct + 0.40×process(prm_final,prm_mean) + 0.10×fmt
         # This is identical to the GRPO training objective.
         _log_eval_result("INITIAL (iter 0)", initial_eval, best=None)
         metrics_log.append({"iteration": 0, **initial_eval})
@@ -1369,8 +1386,20 @@ def main() -> None:
         # When math_pairs is non-empty, draw proportionally: N*ratio from MATH
         # and N*(1-ratio) from GSM8K.  The difficulty sampler handles each pool
         # independently so MATH problems get their own win-rate tracking.
-        if math_pairs and args.math_mix_ratio > 0.0:
-            n_math  = max(1, round(args.questions_per_iter * args.math_mix_ratio))
+        #
+        # MATH ratio ramp: once past --math-ramp-start, linearly increase the
+        # MATH fraction toward --math-mix-ratio-late over the next 10 iterations.
+        # This progressively raises difficulty after the policy has stabilised.
+        _effective_math_ratio = args.math_mix_ratio
+        if args.math_mix_ratio_late is not None and iteration > args.math_ramp_start:
+            _ramp_progress = min(1.0, (iteration - args.math_ramp_start) / 10.0)
+            _effective_math_ratio = (
+                args.math_mix_ratio
+                + _ramp_progress * (args.math_mix_ratio_late - args.math_mix_ratio)
+            )
+
+        if math_pairs and _effective_math_ratio > 0.0:
+            n_math  = max(1, round(args.questions_per_iter * _effective_math_ratio))
             n_gsm8k = max(1, args.questions_per_iter - n_math)
             math_batch  = _sample_by_difficulty(math_pairs,  n_math,  alpha=args.difficulty_alpha)
             gsm8k_batch = _sample_by_difficulty(gsm8k_pairs, n_gsm8k, alpha=args.difficulty_alpha)
@@ -1381,14 +1410,23 @@ def main() -> None:
                 gsm8k_pairs, args.questions_per_iter, alpha=args.difficulty_alpha
             )
         cur_lr = optimizer.param_groups[0]["lr"]
-        logger.info("LR this iteration: %.2e", cur_lr)
+        # Temperature annealing: linearly decay T from peak → min_temp over the run.
+        # Early iterations need high T for exploration; later ones need lower T
+        # to consolidate learned strategies (and close the training/eval gap).
+        _anneal_frac = min(1.0, (iteration - 1) / max(1, args.num_iterations - 1))
+        _annealed_temp = args.temperature * (1.0 - 0.5 * _anneal_frac)  # 0.8 → 0.4
+        logger.info(
+            "LR this iteration: %.2e | T=%.3f | MATH ratio=%.0f%%",
+            cur_lr, _annealed_temp, 100 * _effective_math_ratio,
+        )
 
         all_rewards:   List[float] = []
         all_q_rewards: List[float] = []
         _grounded_rewards:   List[float] = []
         _sp_rewards:         List[float] = []
         _grounded_step_accs: List[float] = []
-        _grounded_lccps:     List[float] = []   # chain integrity per grounded rollout
+        _grounded_lccps:     List[float] = []
+        _skipped_zero_var:   int = 0   # groups skipped due to zero reward variance
         # Per-component question quality accumulators
         _qc_topic:      List[float] = []
         _qc_diff:       List[float] = []
@@ -1408,6 +1446,14 @@ def main() -> None:
         # generation vs grounded (dataset) questions.
         n_self_play_target = int(round(len(questions_batch) * args.self_play_ratio))
 
+        # Build a random set of group indices that will use self-play.
+        # Random interleaving distributes self-play uniformly across the batch
+        # instead of front-loading all self-play groups, which would cause the
+        # gradient to shift mid-batch as the objective changes character.
+        _all_indices = list(range(len(questions_batch)))
+        random.shuffle(_all_indices)
+        _self_play_indices = set(_all_indices[:n_self_play_target])
+
         # Zero gradients once before the loop — we accumulate them via
         # per-group .backward() calls instead of building one giant graph.
         # Keeping all K*N forward passes alive until a single backward()
@@ -1421,12 +1467,8 @@ def main() -> None:
         for _group_idx, qa in enumerate(pbar):
 
             # ── Decide: self-play (model generates question) or grounded ─────
-            # First n_self_play_target groups use self-play; the rest use the
-            # grounded dataset question.  Interleaving is simple and stable.
-            use_self_play = (
-                args.self_play_ratio > 0.0
-                and n_self_play < n_self_play_target
-            )
+            # Random interleaving: self-play slots chosen before the loop.
+            use_self_play = _group_idx in _self_play_indices
 
             if use_self_play:
                 # ── SELF-PLAY BRANCH ─────────────────────────────────────────
@@ -1443,6 +1485,9 @@ def main() -> None:
                     instruction=instruction,
                     max_new_tokens=128,   # questions are short
                     device=device,
+                    # Slightly warmer than solution temperature for diversity,
+                    # but anneals with the same schedule to stay consistent.
+                    temperature=min(0.90, _annealed_temp + 0.05),
                 )
                 # A valid question must have at least some substance.
                 # Reject single-word, empty, or nonsensical outputs.
@@ -1473,7 +1518,7 @@ def main() -> None:
                     prompt=solution_prompt,
                     K=args.group_size,
                     max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
+                    temperature=_annealed_temp,
                     device=device,
                 )
             )
@@ -1558,7 +1603,12 @@ def main() -> None:
             if not use_self_play:
                 _key = _question_key(question)
                 _q_attempts[_key] += len(solutions)
-                _q_wins[_key] += sum(1 for r in rewards if r > 0.5)
+                # Win = reward in the top half of THIS group, not an absolute 0.5 threshold.
+                # Using a relative threshold avoids the case where all solutions score 0.55
+                # (all "wins" → easy) or all score 0.45 (all "losses" → impossible) when the
+                # rewards are actually similar and carry no difficulty information.
+                _group_median = float(np.median(rewards))
+                _q_wins[_key] += sum(1 for r in rewards if r > _group_median)
 
             # --- GRPO loss (IS clip + optional KL penalty) + immediate backward ---
             group_loss = grpo_loss_for_group(
@@ -1574,6 +1624,7 @@ def main() -> None:
 
             if group_loss is None:
                 skipped += 1
+                _skipped_zero_var += 1
                 _pf: Dict = dict(mean_r=f"{np.mean(rewards):.3f}", skip=skipped, loss="skip")
                 if n_self_play > 0 and all_q_rewards:
                     _q_acc_pct = 100.0 * q_quality_good / max(1, n_self_play)
@@ -1652,14 +1703,27 @@ def main() -> None:
         logger.info(
             "Iter %d | loss=%.4f | reward mean=%.3f std=%.3f | "
             "grounded_acc=%.1f%% | step_acc=%.1f%% | lccp=%.1f%% | batch_acc=%.1f%% | "
-            "groups=%d skipped=%d | lr=%.2e | %.1fs",
+            "groups=%d skipped=%d(0var=%d) | lr=%.2e | %.1fs",
             iteration, loss_val, mean_r, std_r,
             100 * grounded_acc_r,
             100 * mean_step_acc,
             100 * mean_lccp,
             100 * acc_r,
-            n_groups, skipped, _cur_lr, iter_time,
+            n_groups, skipped, _skipped_zero_var, _cur_lr, iter_time,
         )
+        # Starvation warning: if >30% of groups were skipped due to zero reward
+        # variance (all K solutions same score), the curriculum difficulty is
+        # mis-calibrated — either too easy (all correct) or too hard (all wrong).
+        _total_attempted = n_groups + skipped
+        if _total_attempted > 0 and _skipped_zero_var / _total_attempted > 0.30:
+            logger.warning(
+                "STARVATION: %.0f%% of groups skipped (zero variance). "
+                "grounded_acc=%.1f%% suggests curriculum is %s. "
+                "Consider adjusting --difficulty-alpha.",
+                100 * _skipped_zero_var / _total_attempted,
+                100 * grounded_acc_r,
+                "too easy (raise alpha)" if grounded_acc_r > 0.75 else "too hard (lower alpha)",
+            )
 
         # ── Question-generation accuracy line (only when self-play is active) ─
         if n_self_play > 0:
@@ -1709,7 +1773,7 @@ def main() -> None:
                 math_env=math_env,
                 pass_at_k=args.eval_pass_at_k,
             )
-            # accuracy == combined_score: 0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format
+            # accuracy == combined_score: 0.50×correct + 0.40×process(prm_final,prm_mean) + 0.10×fmt
             cur_combined = float(eval_res.get("combined_score", best_combined))
             cur_prm_mean = float(eval_res.get("prm_mean",       best_prm_mean))
 
@@ -1788,7 +1852,7 @@ def main() -> None:
     logger.info("GRPO training complete.")
     logger.info(
         "Best training-objective score : %.4f  "
-        "(0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format)",
+        "(0.50×correct + 0.40×process[0.60×prm_final+0.40×prm_mean] + 0.10×fmt)",
         best_combined,
     )
     logger.info("Best PRM component mean       : %.3f", best_prm_mean)

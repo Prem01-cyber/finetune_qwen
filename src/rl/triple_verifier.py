@@ -22,6 +22,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 
 from src.sft.solution_format import extract_final_answer_numeric_str
 from src.sft.step_verify_sympy import verify_solution_text, VerificationReport
+from src.config.prompts import create_solver_messages
 
 logger = logging.getLogger(__name__)
 
@@ -88,19 +89,8 @@ class TripleVerifier:
         Returns:
             List of 3 solution strings
         """
-        # Format prompt using chat template (matches training format)
-        system_prompt = (
-            "You are a step-by-step math solver. "
-            "Solve the given problem one step at a time. "
-            "Each step must be on its own line, starting with 'Step N:'. "
-            "End with a line starting with 'Final Answer:'. "
-            "Write every mathematical expression in Python/SymPy syntax."
-        )
-        
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"### Task: Solve Problem\nProblem: {question}\nSolution:"},
-        ]
+        # Use centralized prompt configuration
+        messages = create_solver_messages(question)
         
         # Apply chat template
         prompt = self.tokenizer.apply_chat_template(

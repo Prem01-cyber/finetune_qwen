@@ -197,6 +197,8 @@ python -u scripts/run_grpo_training.py \
     --difficulty-alpha 3.0 \
     --self-play-ratio 0.30 \
     --math-mix-ratio 0.3 \
+    --math-mix-ratio-late 0.5 \
+    --math-ramp-start 15 \
     --math-max-difficulty 3 \
     --overlong-filter \
     --eval-every 5 \

@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from src.rl.question_classifier import QuestionClassifier
-from src.sft.step_verify_sympy import verify_solution_text
 
 
 @dataclass
@@ -53,8 +52,10 @@ class QuestionQualityEvaluator:
         self.classifier = classifier or QuestionClassifier()
         self.novelty_window_size = novelty_window_size
         self.recent_questions: List[str] = []
-
-        self._reference_ngrams = [self._extract_ngrams(question.lower()) for question in self.reference_questions]
+        # Pre-compute and cache reference n-gram sets once at init.
+        self._reference_ngrams = [self._extract_ngrams(q.lower()) for q in self.reference_questions]
+        # Rolling cache of n-gram sets for recent questions (avoids recomputing every call).
+        self._recent_ngrams: List[set] = []
 
     def evaluate(
         self,
@@ -101,17 +102,18 @@ class QuestionQualityEvaluator:
 
     def compute_novelty_score(self, question: str) -> Dict[str, float]:
         dataset_novelty = self._novelty_against_reference(question, self._reference_ngrams)
-        session_novelty = self._novelty_against_reference(
-            question,
-            [self._extract_ngrams(x.lower()) for x in self.recent_questions],
-        )
+        # Use cached recent n-gram sets instead of recomputing from strings each call (O(n²)→O(n)).
+        session_novelty = self._novelty_against_reference(question, self._recent_ngrams)
         # Weight dataset novelty higher (60%) — comparing against 8k GSM8K questions
         # is a stable, meaningful signal. Session novelty (40%) guards against
         # the model looping the same question template within a run.
         combined = max(0.0, min(1.0, 0.60 * dataset_novelty + 0.40 * session_novelty))
 
         self.recent_questions.append(question)
-        self.recent_questions = self.recent_questions[-self.novelty_window_size :]
+        self.recent_questions = self.recent_questions[-self.novelty_window_size:]
+        # Keep n-gram cache in sync with the question window.
+        self._recent_ngrams.append(self._extract_ngrams(question.lower()))
+        self._recent_ngrams = self._recent_ngrams[-self.novelty_window_size:]
 
         return {
             "combined": combined,
@@ -127,7 +129,10 @@ class QuestionQualityEvaluator:
     ) -> Dict[str, object]:
         q_lower = (question or "").lower()
         has_numbers = bool(re.search(r"\d", q_lower))
-        has_question = ("?" in q_lower) or bool(re.search(r"\b(find|calculate|how many|what is)\b", q_lower))
+        has_question = ("?" in q_lower) or bool(re.search(
+            r"\b(find|calculate|how many|what is|determine|compute|evaluate|express|simplify|solve)\b",
+            q_lower,
+        ))
         length_ok = 8 <= len(q_lower.split()) <= 120
         if not (has_numbers and has_question and length_ok):
             return {"solvable": False, "reason": "syntactic_failure", "score": 0.0}
@@ -136,15 +141,20 @@ class QuestionQualityEvaluator:
         if has_contradiction:
             return {"solvable": False, "reason": "semantic_failure", "score": 0.3}
 
-        verify_result = verify_solution_text(solution)
-        summary = verify_result.summary
-        if summary.get("steps_failed", 0) > 0:
-            return {"solvable": False, "reason": "arithmetic_errors", "score": 0.5}
-
+        # PRM-based arithmetic quality check (replaces SymPy step verification).
+        # consensus_strength = prm_mean: average PRM score across all reasoning steps.
+        # A low PRM mean means the model produced inconsistent or incorrect reasoning,
+        # which strongly signals the question is ambiguous, contradictory, or unsolvable.
+        # PRM understands full mathematical semantics — it catches errors that SymPy
+        # misses (e.g., wrong logic, incorrect setups) while not failing on valid prose.
         if consensus_result:
+            confidence = float(consensus_result.get("consensus_strength", 0.5))
+            if confidence < 0.30:
+                # PRM rejects most steps → solution is invalid → question is likely unsolvable
+                return {"solvable": False, "reason": "low_prm_confidence", "score": 0.5}
             if not bool(consensus_result.get("has_majority", False)):
+                # PRM is borderline (0.30–0.49) → uncertain solvability
                 return {"solvable": False, "reason": "no_consensus", "score": 0.6}
-            confidence = float(consensus_result.get("consensus_strength", 0.0))
         else:
             confidence = 0.5
 

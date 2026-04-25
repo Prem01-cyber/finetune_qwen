@@ -50,6 +50,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from scripts.convert_gsm8k_to_sft import parse_gsm8k_answer
 from src.sft.solution_format import extract_final_answer_numeric_str, validate_sympy_solution_format
+from src.sft.sympy_normalize import normalize_for_parse_expr
 
 SOLVER_SYSTEM_PROMPT = (
     "You are a step-by-step math solver. "
@@ -87,10 +88,15 @@ def _norm_expr(s: str) -> str:
 
 
 def _equiv_expr(a: str, b: str) -> Optional[bool]:
+    """Check if two answer strings are mathematically equivalent.
+
+    Uses the same normalization as CurriculumMathEnvironment._answers_equivalent
+    so eval and training agree on what counts as "correct".
+    """
     if not a or not b:
         return None
-    a_n = _norm_expr(a)
-    b_n = _norm_expr(b)
+    a_n = normalize_for_parse_expr(_norm_expr(a))
+    b_n = normalize_for_parse_expr(_norm_expr(b))
     try:
         return bool(simplify(parse_expr(a_n) - parse_expr(b_n)) == 0)
     except Exception:
@@ -340,7 +346,7 @@ def evaluate_gsm8k(
     import logging as _logging
     _logger = _logging.getLogger(__name__)
 
-    greedy = temperature == 0.0
+    greedy = temperature < 1e-6
     rows: list[dict] = []
 
     p = Path(data_path)

@@ -231,10 +231,17 @@ class ProcessRewardScorer:
 
         # Truncation may have dropped trailing separators.  Align lengths
         # conservatively by padding missing positions with the mean of what
-        # we did see (keeps the gradient well-defined).
+        # we did see.  Log a warning so callers know the scores are partial.
         if len(step_scores) < len(steps) and step_scores:
             pad_val = float(sum(step_scores) / len(step_scores))
-            step_scores = step_scores + [pad_val] * (len(steps) - len(step_scores))
+            n_padded = len(steps) - len(step_scores)
+            step_scores = step_scores + [pad_val] * n_padded
+            logger.warning(
+                "PRM: %d/%d steps scored; %d tail step(s) padded with mean=%.3f "
+                "(sequence likely truncated at %d tokens).",
+                len(step_scores) - n_padded, len(steps), n_padded, pad_val,
+                self.max_input_tokens,
+            )
         elif len(step_scores) > len(steps):
             step_scores = step_scores[: len(steps)]
 
@@ -260,6 +267,7 @@ class ProcessRewardScorer:
             "min_score": min_score,
             "final_score": final_score,
             "degraded": False,
+            "padded_steps": len(step_scores) < len(steps),  # True if tail was padded
         }
 
     @torch.no_grad()

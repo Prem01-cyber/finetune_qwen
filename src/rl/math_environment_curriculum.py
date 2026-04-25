@@ -316,18 +316,17 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         voting was supposed to approximate but couldn't (three samples
         from the same policy agree on wrong answers).
 
-        Reward shape:
-            R_sol = 0.55·PRM_mean + 0.20·PRM_min + 0.15·SymPy + 0.10·Format
+        Solution reward (PRM path):
+            R_sol = 0.45·prm_final + 0.35·prm_mean + 0.20·lccp
             R     = 0.4·R_q + 0.6·R_sol      (then expert-panel modifier)
 
-        * ``PRM_mean`` is the primary smooth gradient.
-        * ``PRM_min`` amplifies the weakest step — pushes the model to fix
-          individual broken steps instead of averaging them out.
-        * SymPy and format keep the arithmetic-consistency and structure
-          pressures we already had.
-        * The 0.4/0.6 Q/Sol split (vs the historical 0.3/0.7) boosts the
-          gradient flowing to question-generation without starving the
-          solution-correctness signal — key for the self-improvement loop.
+        * ``prm_final`` (final step score) is the strongest predictor of
+          overall answer correctness.
+        * ``prm_mean`` provides a smooth gradient over all steps.
+        * ``lccp`` (Longest Correct Consecutive Prefix) rewards chain
+          integrity — consecutive correct steps before the first failure.
+        * The 0.4/0.6 Q/Sol split boosts gradient to question-generation
+          without starving the solution-correctness signal.
         """
         assert self.prm_scorer is not None, "caller must check self.prm_scorer"
 
@@ -356,6 +355,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         # score also collapses.
         if prm_degraded or prm_num_steps == 0:
             solution_reward = 0.0
+            _sp_lccp = 0.0
             sol_valid = False
             logger.info(
                 "PRM degraded (%s); sol_reward set to 0.0 (format=%.2f).",
@@ -363,10 +363,23 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 format_score,
             )
         else:
+            # LCCP for self-play: same chain-integrity measure as grounded path
+            _sp_step_scores = prm_result.get("step_scores", []) or []
+            if _sp_step_scores:
+                _first_fail = next(
+                    (i for i, s in enumerate(_sp_step_scores) if s <= 0.5),
+                    len(_sp_step_scores),
+                )
+                _sp_lccp = _first_fail / len(_sp_step_scores)
+            else:
+                _sp_lccp = 0.0
+
+            # Self-play solution: PRM-only reward blending mean, final & chain integrity.
+            # LCCP anchors the grade to *consecutive* correctness, not just bag-of-steps.
             solution_reward = (
-                0.50 * prm_mean
-                + 0.30 * prm_final
-                + 0.20 * prm_min
+                0.45 * prm_final
+                + 0.35 * prm_mean
+                + 0.20 * _sp_lccp
             )
             sol_valid = True
         solution_reward = max(0.0, min(1.0, solution_reward))
@@ -410,6 +423,33 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         format_cap = 0.3 if format_floor_active else 1.0
         base_combined_score = min(base_combined_score, format_cap)
 
+        # Novelty gate: prevent template-copying reward hacking.
+        # If the model just generates "John has X apples..." with different numbers,
+        # n-gram similarity to the reference corpus is high → dataset_novelty is LOW.
+        # We cap the reward to discourage this without penalising genuinely novel questions.
+        #   < 0.20: near-copy of a training question (template + new variables) → cap 0.35
+        #   > 0.85: completely off-domain (not a real math problem style)       → cap 0.55
+        #   [0.20, 0.85]: Goldilocks zone → full reward (novelty_cap = 1.0)
+        _dataset_novelty = float(
+            question_result.get("novelty", {}).get("dataset_novelty", 0.5)
+            if isinstance(question_result.get("novelty"), dict)
+            else 0.5
+        )
+        if _dataset_novelty < 0.20:
+            _novelty_cap = 0.35
+        elif _dataset_novelty > 0.85:
+            _novelty_cap = 0.55
+        else:
+            _novelty_cap = 1.0
+        if _novelty_cap < 1.0:
+            base_combined_score = min(base_combined_score, _novelty_cap)
+            logger.debug(
+                "Novelty gate: dataset_novelty=%.2f → cap=%.2f (was %.3f → now %.3f)",
+                _dataset_novelty, _novelty_cap,
+                base_combined_score / _novelty_cap if _novelty_cap > 0 else 0,
+                base_combined_score,
+            )
+
         expert_adjustment = self.expert_panel.apply_expert_preferences(
             base_reward=base_combined_score,
             question_metrics=question_result,
@@ -427,9 +467,15 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         # above the cap.
         combined_score = max(0.0, min(format_cap, combined_score))
 
-        # Treat "policy produced solid per-step correctness" as success
-        # for curriculum mastery tracking.
-        solution_success = (not prm_degraded) and (prm_mean >= 0.7)
+        # Curriculum mastery: consider self-play solution "successful" when
+        # both the chain mean AND the final concluding step are above threshold.
+        # Using prm_final as a required condition prevents a solution that gets
+        # most steps right but fails the conclusion from being marked "mastered".
+        solution_success = (
+            (not prm_degraded)
+            and (prm_mean >= 0.65)
+            and (prm_final >= 0.50)
+        )
         self.curriculum_manager.update_from_trajectory(
             topic=target_topic,
             question_reward=question_reward,
@@ -443,8 +489,8 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         valid_tag = "" if sol_valid else " [SOL_INVALID]"
         logger.info(
             "PRM reward%s: combined=%.3f = clip(base=%.3f + mod=%+.3f, cap=%.2f)%s "
-            "| Q=%.2f sol=%.3f | "
-            "sol=0.50*PRM_mean(%.2f)+0.30*PRM_final(%.2f)+0.20*PRM_min(%.2f) "
+            "| Q=%.2f sol=%.3f novelty=%.2f | "
+            "sol=0.45*prm_final(%.2f)+0.35*prm_mean(%.2f)+0.20*lccp(%.2f) "
             "| steps=%d",
             valid_tag,
             combined_score,
@@ -454,9 +500,10 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             floor_tag,
             effective_question_reward,
             solution_reward,
-            prm_mean,
+            _dataset_novelty,
             prm_final,
-            prm_min,
+            prm_mean,
+            _sp_lccp if sol_valid else 0.0,
             prm_num_steps,
         )
 
@@ -485,6 +532,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         return {
             "combined_score": combined_score,
             "base_combined_score": base_combined_score,
+            "effective_question_reward": effective_question_reward,  # gated (0 when sol invalid)
             "question_metrics": question_result,
             "solution_metrics": {
                 "overall_score": solution_reward,
@@ -638,6 +686,17 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 f"0.85×{gt_match:.2f} + 0.15×fmt({format_score:.3f})"
             )
         combined = max(0.0, min(1.0, combined))
+
+        # Hard negative mining: wrong-answer solutions still get a partial signal
+        # proportional to how far they got before the first error (LCCP).
+        # This prevents gradient starvation on hard problems where no solution in
+        # the group is fully correct — the model still learns "longer correct prefix
+        # is better" rather than receiving zero reward for all K samples.
+        if gt_match < 0.5 and lccp > 0.0 and self.prm_scorer is not None:
+            # Bonus = 0.15 × LCCP, capped so that a wrong answer (combined ≈ 0.40)
+            # can never exceed 0.55 — always well below a correct answer (≈ 0.90+).
+            _hnm_bonus = 0.15 * lccp
+            combined = min(combined + _hnm_bonus, 0.55)
 
         _chain_depth = first_fail if prm_step_scores else 0
         logger.info(

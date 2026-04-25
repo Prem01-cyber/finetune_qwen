@@ -211,7 +211,7 @@ class QuestionClassifier:
 
         lower = text.lower()
         has_numbers = 1.0 if self._number_pattern.search(lower) else 0.0
-        has_question = 1.0 if ("?" in lower or re.search(r"\b(find|calculate|how many|what is)\b", lower)) else 0.0
+        has_question = 1.0 if ("?" in lower or re.search(r"\b(find|calculate|how many|what is|determine|compute|evaluate|express|simplify|solve)\b", lower)) else 0.0
         words = lower.split()
         length_ok = 1.0 if 8 <= len(words) <= 120 else 0.3
         contradiction = 1.0 if not re.search(r"\b(impossible|contradiction|undefined)\b", lower) else 0.0

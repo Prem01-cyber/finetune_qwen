@@ -42,25 +42,13 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-SOLVE_TASK_PREFIX = "### Task: Solve Problem\n"
-GENERATE_TASK_PREFIX = "### Task: Generate Question\n"
-
-SOLVER_SYSTEM_PROMPT = (
-    "You are a step-by-step math solver. "
-    "Solve the given problem one step at a time. "
-    "Each step must be on its own line, starting with 'Step N:'. "
-    "End with a line starting with 'Final Answer:'. "
-    "Write every mathematical expression in Python/SymPy syntax "
-    "so it can be verified programmatically."
-)
-
-GENERATOR_SYSTEM_PROMPT = (
-    "You are a math problem generator. "
-    "Generate grade-school level math word problems that require 2-5 steps to solve. "
-    "Problems should involve realistic scenarios and use simple arithmetic, fractions, "
-    "percentages, or basic algebra. "
-    "Output ONLY the problem statement, no solutions or steps."
+from src.config.prompts import (
+    SOLVE_TASK_PREFIX,
+    GENERATE_TASK_PREFIX,
+    SOLVER_SYSTEM_PROMPT,
+    GENERATOR_SYSTEM_PROMPT,
 )
 
 

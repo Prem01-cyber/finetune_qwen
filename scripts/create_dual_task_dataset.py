@@ -24,12 +24,14 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
-# Task prefix markers
-SOLVE_TASK_PREFIX = "### Task: Solve Problem\n"
-GENERATE_TASK_PREFIX = "### Task: Generate Question\n"
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.config.prompts import SOLVE_TASK_PREFIX, GENERATE_TASK_PREFIX
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
