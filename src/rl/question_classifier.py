@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 TOPIC_KEYWORDS = {
@@ -188,6 +188,71 @@ TOPIC_KEYWORDS = {
         "days to complete",
         "rate of work",
     ],
+    # ── NuminaMath / OpenMathInstruct additions ───────────────────────────
+    "geometry": [
+        "triangle",
+        "circle",
+        "rectangle",
+        "polygon",
+        "area",
+        "perimeter",
+        "angle",
+        "radius",
+        "diameter",
+        "hypotenuse",
+        "coordinate",
+        "tangent",
+        "bisector",
+        "congruent",
+        "similar",
+        "parallel",
+        "perpendicular",
+        "volume",
+        "surface area",
+        "right angle",
+    ],
+    "calculus": [
+        "derivative",
+        "differentiate",
+        "integrate",
+        "dy/dx",
+        "f'(x)",
+        "definite integral",
+        "indefinite integral",
+        "slope of the tangent",
+        "rate of change",
+        "inflection point",
+    ],
+    "statistics": [
+        "mean",
+        "median",
+        "mode",
+        "standard deviation",
+        "variance",
+        "average",
+        "data set",
+        "frequency",
+        "histogram",
+        "distribution",
+        "normal distribution",
+        "expected value",
+        "outlier",
+        "quartile",
+        "range of data",
+    ],
+    "competition_math": [
+        "positive integers",
+        "integer solutions",
+        "divisible by",
+        "remainder when",
+        "relatively prime",
+        "greatest common divisor",
+        "least common multiple",
+        "prove that",
+        "diophantine",
+        "congruent modulo",
+        "sum of digits",
+    ],
 }
 
 TOPIC_LIST = list(TOPIC_KEYWORDS.keys())
@@ -219,9 +284,44 @@ class QuestionClassifier:
     _fraction_pattern = re.compile(r"\d+\s*/\s*\d+")
     _nested_op_pattern = re.compile(r"\([^()]*[+\-*/][^()]*\)")
 
+    # High-confidence single-phrase signals that override the scoring formula.
+    # Ordered: more specific first.  If ANY of these patterns match, the
+    # corresponding topic wins regardless of keyword counts.
+    _PRIORITY_SIGNALS: List[Tuple[re.Pattern, str]] = [
+        # Calculus — "integrate" before ratios can steal "rate" as a substring
+        (re.compile(r"\b(derivative|differentiate|integrate|d/dx|dy/dx|f'\s*\(|indefinite integral|definite integral|rate of change|inflection point)\b", re.I), "calculus"),
+        # Geometry
+        (re.compile(r"\b(triangle|rectangle|polygon|perimeter|circumference|hypotenuse|right angle|surface area|volume of|radius|diameter)\b", re.I), "geometry"),
+        # Statistics
+        (re.compile(r"\b(standard deviation|variance|median|normal distribution|expected value)\b", re.I), "statistics"),
+        # Competition math
+        (re.compile(r"\b(divisible by|remainder when|relatively prime|greatest common divisor|least common multiple|diophantine|congruent modulo|sum of digits)\b", re.I), "competition_math"),
+        (re.compile(r"\bpositive integers?\b.{0,40}\bdivisible\b", re.I), "competition_math"),
+        # Time-distance (speeds? covers plural; match across short gap)
+        (re.compile(r"\bspeeds?\b.{0,80}\b(meet|distance|time|arrive|travel)\b", re.I), "time_distance"),
+        (re.compile(r"\b(km/h|mph|miles per hour|km per hour)\b", re.I), "time_distance"),
+        # Combinatorics — "how many ways" beats single_step "how many"
+        (re.compile(r"\bhow many ways\b", re.I), "combinatorics"),
+        (re.compile(r"\b(arrangements?|permutations?|combinations?) of\b", re.I), "combinatorics"),
+        # Probability — "probability" contains "y" which would otherwise hit algebra
+        (re.compile(r"\b(probability|the chance that|likelihood of)\b", re.I), "probability"),
+    ]
+
     def classify_topic(self, question: str, solution: Optional[str] = None) -> Dict[str, object]:
         """Return primary/secondary topics with confidence."""
         text = (question or "").lower()
+
+        # Fast path: high-confidence priority signals bypass scoring
+        for pattern, topic in self._PRIORITY_SIGNALS:
+            if pattern.search(text):
+                return TopicClassification(
+                    primary_topic=topic,
+                    secondary_topics=[],
+                    confidence=0.95,
+                    signals_used=["priority"],
+                    keyword_scores={topic: 0.95},
+                ).to_dict()
+
         keyword_scores = {topic: self._keyword_score(text, words) for topic, words in TOPIC_KEYWORDS.items()}
 
         signals_used = ["keyword"]
@@ -317,6 +417,15 @@ class QuestionClassifier:
         has_mul = "*" in text or "multiply" in text
         has_add_sub = any(op in text for op in ["+", "-", "add", "subtract"])
 
+        # Higher-specificity signals come first
+        if any(kw in text for kw in ["derivative", "dy/dx", "f'(", "differentiat", "integrat"]):
+            return "calculus"
+        if any(kw in text for kw in ["triangle", "circle", "area =", "perimeter", "radius", "angle", "coordinate"]):
+            return "geometry"
+        if any(kw in text for kw in ["modulo", "gcd", "lcm", "divisible by", "remainder", "prime"]):
+            return "competition_math"
+        if any(kw in text for kw in ["mean =", "median", "standard deviation", "variance"]):
+            return "statistics"
         if has_variable:
             return "algebra"
         if has_percent:

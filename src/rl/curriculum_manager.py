@@ -18,6 +18,38 @@ from src.rl.question_classifier import QuestionClassifier, TOPIC_LIST
 
 logger = logging.getLogger(__name__)
 
+# Maps dataset skill_id prefixes → canonical curriculum topic names.
+# Used during bootstrap so questions from NuminaMath / OpenMathInstruct
+# are credited to the right ZPD bucket instead of being misclassified.
+SKILL_ID_TO_TOPIC: dict[str, str] = {
+    # NuminaMath-CoT
+    "numina_algebra":        "algebra",
+    "numina_prealgebra":     "algebra",
+    "numina_number_theory":  "number_theory",
+    "numina_geometry":       "geometry",
+    "numina_combinatorics":  "combinatorics",
+    "numina_calculus":       "calculus",
+    "numina_statistics":     "statistics",
+    "numina_synthetic":      "multi_step_reasoning",
+    "numina_olympiad":       "competition_math",
+    "numina_competition":    "competition_math",
+    "numina_general":        "multi_step_reasoning",
+    # OpenMathInstruct-2
+    "openmath_algebra":      "algebra",
+    "openmath_prealgebra":   "algebra",
+    "openmath_number_theory":"number_theory",
+    "openmath_geometry":     "geometry",
+    "openmath_combinatorics":"combinatorics",
+    "openmath_calculus":     "calculus",
+    "openmath_competition":  "competition_math",
+    "openmath_synthetic":    "multi_step_reasoning",
+    "openmath_general":      "multi_step_reasoning",
+    # Legacy
+    "gsm8k_grade_school":    "basic_arithmetic",
+    "aqua_rat_algebra":      "algebra",
+    "question_generation":   "multi_step_reasoning",
+}
+
 
 @dataclass
 class TopicState:
@@ -120,6 +152,29 @@ class CurriculumManager:
             "Generate a work-rate problem where two people in {context} complete a task together or alone.",
             "Create a problem where workers in {context} {action} a job at different rates.",
         ],
+        # ── NuminaMath / OpenMathInstruct additions ───────────────────────
+        "geometry": [
+            "Generate a geometry problem about area or perimeter of a shape encountered in {context}.",
+            "Create a problem involving triangles or circles where someone in {context} needs to find a missing length or angle.",
+            "Generate a coordinate geometry problem where points in a {context} layout form a geometric figure.",
+            "Create a problem involving volume or surface area of a 3D shape relevant to {context}.",
+        ],
+        "calculus": [
+            "Generate a rate-of-change problem where a quantity in {context} grows or shrinks over time.",
+            "Create an optimization problem where someone in {context} wants to maximise profit or minimise cost using calculus.",
+            "Generate a problem involving a function whose minimum or maximum value must be found in a {context} scenario.",
+        ],
+        "statistics": [
+            "Generate a statistics problem where someone in {context} collects data and must find the mean, median, or mode.",
+            "Create a problem involving standard deviation or variance of measurements taken in {context}.",
+            "Generate a problem where data from {context} is summarised and an outlier or expected value must be identified.",
+        ],
+        "competition_math": [
+            "Generate a number theory problem asking how many positive integers satisfy a divisibility condition.",
+            "Create a competition-style problem: find all integer solutions to an equation involving remainders or modular arithmetic.",
+            "Generate a counting problem asking in how many ways objects can be arranged or selected under a constraint.",
+            "Create a problem: given two integers relatively prime to each other, find their least common multiple or sum of digits.",
+        ],
     }
 
     TOPIC_PREREQUISITES = {
@@ -138,6 +193,11 @@ class CurriculumManager:
         "sequences": ["basic_arithmetic", "algebra"],
         "probability": ["fractions", "ratios"],
         "work_time": ["ratios", "multi_step_reasoning"],
+        # NuminaMath / OpenMathInstruct additions
+        "geometry": ["basic_arithmetic"],
+        "calculus": ["algebra", "sequences"],
+        "statistics": ["ratios", "fractions"],
+        "competition_math": ["number_theory", "combinatorics", "algebra"],
     }
 
     def __init__(self, checkpoint_dir: str | Path):
@@ -174,6 +234,77 @@ class CurriculumManager:
         else:
             for state in self.topics.values():
                 state.difficulty_target = 0.5
+
+    def initialize_from_dataset(
+        self,
+        records: List[Dict],
+        difficulty_field: str = "difficulty",
+    ) -> None:
+        """
+        Bootstrap curriculum topic priors directly from dataset skill_ids.
+
+        Much faster than the question-classifier bootstrap path — reads
+        skill_id and difficulty from each JSONL record rather than running
+        the keyword classifier on every question.
+
+        Args:
+            records:          List of dataset records with 'skill_id' and
+                              optionally 'difficulty' fields.
+            difficulty_field: Name of the difficulty field (default 'difficulty').
+                              Values: 1=easy, 2=medium, 3=hard.
+        """
+        counts: Dict[str, int] = {topic: 0 for topic in TOPIC_LIST}
+        # Map difficulty 1/2/3 → difficulty_target 0.35/0.55/0.75
+        _diff_map = {1: 0.35, 2: 0.55, 3: 0.75}
+        topic_difficulties: Dict[str, List[float]] = {t: [] for t in TOPIC_LIST}
+
+        for rec in records:
+            skill_id = rec.get("skill_id", "")
+            topic = SKILL_ID_TO_TOPIC.get(skill_id)
+            if topic is None:
+                # Fall back to keyword classifier on the question text
+                msgs = rec.get("messages", [])
+                question = next(
+                    (m.get("content", "") for m in msgs if m.get("role") == "user"), ""
+                )
+                if question:
+                    detected = self.classifier.classify_topic(question)
+                    topic = str(detected["primary_topic"])
+                else:
+                    continue
+            if topic not in counts:
+                continue
+            counts[topic] += 1
+            raw_diff = rec.get(difficulty_field, 2)
+            topic_difficulties[topic].append(_diff_map.get(int(raw_diff), 0.55))
+
+        total = max(1, sum(counts.values()))
+        for topic, state in self.topics.items():
+            prevalence = counts[topic] / total
+            # Difficulty target: average of observed difficulties, biased up
+            # for rare topics (less data → start harder to find signal faster)
+            diffs = topic_difficulties[topic]
+            if diffs:
+                avg_diff = sum(diffs) / len(diffs)
+            else:
+                avg_diff = 0.50
+
+            # Blend prevalence-based prior with observed average difficulty
+            state.difficulty_target = float(
+                max(0.30, min(0.80, 0.4 * avg_diff + 0.6 * (0.35 + 0.8 * prevalence)))
+            )
+
+        logger.info(
+            "Curriculum bootstrapped from %d records across %d topics",
+            len(records),
+            sum(1 for c in counts.values() if c > 0),
+        )
+        for topic, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+            if cnt > 0:
+                logger.debug(
+                    "  %-30s  %4d samples  target_difficulty=%.2f",
+                    topic, cnt, self.topics[topic].difficulty_target,
+                )
 
     def select_topic_and_difficulty(self) -> Tuple[str, float]:
         probs = self._compute_topic_probabilities()

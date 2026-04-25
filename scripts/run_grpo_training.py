@@ -1590,11 +1590,24 @@ def main() -> None:
     _extractor.warmup()
     logger.info("Extractor warmup complete")
 
+    # ── LLM-backed question classifier (replaces keyword regex) ─────────────
+    # Uses the already-loaded policy model for topic classification during
+    # self-play reward computation. ~60-120 ms per call, cached, falls back
+    # to regex on any error. Dramatically more accurate than keyword matching
+    # for geometry, calculus, competition_math, and statistics.
+    from src.rl.llm_question_classifier import LLMQuestionClassifier
+    _llm_classifier = LLMQuestionClassifier(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        cache_size=10_000,
+    )
+
     math_env = CurriculumMathEnvironment(
         policy_model=model,
         value_model=None,
         tokenizer=tokenizer,
-        # Feed all GSM8K training questions as the novelty reference set so
+        # Feed all training questions as the novelty reference set so
         # session_novelty is measured against the actual training distribution —
         # a self-play question that mimics a dataset question gets low novelty.
         reference_questions=[p["question"] for p in gsm8k_pairs],
@@ -1604,8 +1617,34 @@ def main() -> None:
         device=device,
         unified_accuracy_calc=_unified_calc,
     )
+    # Inject LLM classifier into the question quality evaluator
+    math_env.question_evaluator.classifier = _llm_classifier
     # Wire the question_evaluator into the unified calc after math_env is available
     _unified_calc.question_evaluator = math_env.question_evaluator
+
+    # Bootstrap curriculum from dataset skill_ids when the training data
+    # contains structured records (NuminaMath / OpenMathInstruct format).
+    # Falls back to the keyword-classifier path for plain GSM8K.
+    _raw_records: list = []
+    _train_path = Path(args.gsm8k_data)
+    if _train_path.exists():
+        with _train_path.open(encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line:
+                    try:
+                        _raw_records.append(json.loads(_line))
+                    except json.JSONDecodeError:
+                        pass
+    if any("skill_id" in r for r in _raw_records[:20]):
+        logger.info(
+            "Detected structured dataset (%d records) — bootstrapping "
+            "curriculum from skill_ids instead of keyword classifier.",
+            len(_raw_records),
+        )
+        math_env.curriculum_manager.initialize_from_dataset(_raw_records)
+    else:
+        logger.info("Plain dataset detected — using keyword-classifier bootstrap.")
 
     # ── Difficulty-adaptive sampling state ───────────────────────────────────
     # Track per-question win-rate.  Questions where the model scores correctly
@@ -2397,6 +2436,10 @@ def main() -> None:
         mean_q_solvab    = float(np.mean(_qc_solvability)) if _qc_solvability else 0.0
 
         _cur_lr = optimizer.param_groups[0]["lr"]
+
+        # ── LLM classifier stats (every 5 iters to avoid log spam) ─────────
+        if iteration % 5 == 0:
+            _llm_classifier.log_stats()
 
         # ── Primary summary line ─────────────────────────────────────────────
         logger.info(
