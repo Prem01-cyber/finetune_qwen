@@ -1562,17 +1562,29 @@ def main() -> None:
         q_quality_good  = 0    # self-play groups where question_reward > 0.5
         total_loss_val = 0.0
 
-        # Determine how many of this iteration's groups use self-play question
-        # generation vs grounded (dataset) questions.
+        # Randomly assign self-play slots before pre-sorting.
         n_self_play_target = int(round(len(questions_batch) * args.self_play_ratio))
-
-        # Build a random set of group indices that will use self-play.
-        # Random interleaving distributes self-play uniformly across the batch
-        # instead of front-loading all self-play groups, which would cause the
-        # gradient to shift mid-batch as the objective changes character.
         _all_indices = list(range(len(questions_batch)))
         random.shuffle(_all_indices)
         _self_play_indices = set(_all_indices[:n_self_play_target])
+
+        # CHANGE 2: Pre-sort batch — grounded questions first, self-play second.
+        # This lets us do a clean optimizer.step() on grounded gradients before
+        # the noisier self-play gradients accumulate. Two separate weight updates
+        # per iteration: one anchored to gold answers, one for self-play.
+        _grounded_items = [
+            (idx, qa) for idx, qa in enumerate(questions_batch)
+            if idx not in _self_play_indices
+        ]
+        _selfplay_items = [
+            (idx, qa) for idx, qa in enumerate(questions_batch)
+            if idx in _self_play_indices
+        ]
+        _ordered_batch = _grounded_items + _selfplay_items
+        _n_grounded = len(_grounded_items)
+        _grounded_step_done = False   # flag: intermediate step already fired
+        _grounded_n_groups  = 0       # groups counted in grounded phase
+        _grounded_loss_val  = 0.0     # loss accumulated in grounded phase
 
         # Zero gradients once before the loop — we accumulate them via
         # per-group .backward() calls instead of building one giant graph.
@@ -1583,12 +1595,33 @@ def main() -> None:
         # away; gradients accumulate in .grad tensors without extra memory.
         optimizer.zero_grad()
 
-        pbar = tqdm(questions_batch, desc=f"Iter {iteration} GRPO groups", unit="q")
-        for _group_idx, qa in enumerate(pbar):
+        pbar = tqdm(_ordered_batch, desc=f"Iter {iteration} GRPO groups", unit="q")
+        for _group_idx, qa in pbar:
 
             # ── Decide: self-play (model generates question) or grounded ─────
             # Random interleaving: self-play slots chosen before the loop.
             use_self_play = _group_idx in _self_play_indices
+
+            # CHANGE 2: At the first self-play group, step optimizer on
+            # accumulated grounded gradients before processing any self-play.
+            if use_self_play and not _grounded_step_done:
+                if _grounded_n_groups > 0:
+                    if _grounded_n_groups > 1:
+                        for _p in model.parameters():
+                            if _p.grad is not None:
+                                _p.grad.div_(_grounded_n_groups)
+                    torch.nn.utils.clip_grad_norm_(
+                        [_p for _p in model.parameters() if _p.requires_grad],
+                        args.max_grad_norm,
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    _grounded_loss_val_avg = _grounded_loss_val / _grounded_n_groups
+                    logger.info(
+                        "Grounded phase optimizer.step() | grounded_loss=%.4f | groups=%d",
+                        _grounded_loss_val_avg, _grounded_n_groups,
+                    )
+                _grounded_step_done = True
 
             if use_self_play:
                 # ── SELF-PLAY BRANCH ─────────────────────────────────────────
@@ -1822,21 +1855,21 @@ def main() -> None:
             _sp_q_rew_this_group: List[float] = []
             for sol in solutions:
                 if use_self_play:
-                    # compute_reward = 0.40×question_quality + 0.60×solution_quality
-                    # This is the core Theme #4 signal: the model is rewarded
-                    # for generating a well-formed, appropriately difficult,
-                    # solvable question AND for solving it correctly.
-                    r, q_rew, _, q_met = compute_self_play_reward(
+                    # CHANGE 3: Use solution-quality-only reward for the GRPO update.
+                    # The question reward is now adversarial (computed post-loop)
+                    # rather than a heuristic quality score.
+                    # compute_self_play_reward returns (combined, q_rew, sol_rew, q_met)
+                    _, q_rew, r, q_met = compute_self_play_reward(
                         question=question,
                         solution=sol,
                         target_topic=target_topic,
                         target_difficulty=target_difficulty,
                         math_env=math_env,
                     )
-                    _sp_q_rew_this_group.append(q_rew)
-                    all_q_rewards.append(q_rew)
-                    # Collect per-component breakdown (same question, all K solutions
-                    # get the same q_metrics — average to reduce noise).
+                    # r is now the solution-only reward (PRM-based, no q blending)
+                    _sp_q_rew_this_group.append(r)   # track sol scores for win-rate
+                    all_q_rewards.append(q_rew)      # keep q_rew for logging
+                    # Collect per-component breakdown
                     _qc_topic.append(q_met["topic_match"])
                     _qc_diff.append(q_met["difficulty_fit"])
                     _qc_clarity.append(q_met["clarity"])
@@ -1860,12 +1893,28 @@ def main() -> None:
             else:
                 _grounded_rewards.extend(rewards)
 
-            # A self-play group is "accurate" if the question it generated scored
-            # above 0.5 on question quality — meaning it was clear, on-topic,
-            # appropriately difficult, and solvable.
+            # CHANGE 3: Adversarial win-rate question reward.
+            # win_rate = fraction of K solutions with solution reward > 0.5
+            # Generator earns reward for questions the Solver finds HARD (low win_rate).
+            # Groups where win_rate==0.0 or 1.0 carry zero gradient variance — skip them.
             if use_self_play and _sp_q_rew_this_group:
-                if float(np.mean(_sp_q_rew_this_group)) > 0.5:
-                    q_quality_good += 1
+                _win_rate = float(np.mean([r > 0.5 for r in _sp_q_rew_this_group]))
+                if _win_rate == 0.0 or _win_rate == 1.0:
+                    # No variance in rewards — no gradient signal, don't update q stats
+                    logger.debug(
+                        "Self-play group skipped for q_reward: win_rate=%.2f (zero variance)",
+                        _win_rate,
+                    )
+                else:
+                    # Adversarial: harder questions (low win_rate) → higher q_reward
+                    _q_adv_reward = 1.0 - _win_rate
+                    all_q_rewards.append(_q_adv_reward)
+                    if _q_adv_reward > 0.5:   # win_rate < 0.5 → genuinely challenging
+                        q_quality_good += 1
+                    logger.debug(
+                        "Self-play adversarial q_reward: win_rate=%.2f → q_reward=%.2f",
+                        _win_rate, _q_adv_reward,
+                    )
 
             # --- Update difficulty stats (grounded questions only — self-play
             #     questions are ephemeral and have no stable key) ---
@@ -1906,6 +1955,10 @@ def main() -> None:
             group_loss.backward()
             total_loss_val += group_loss.item()
             n_groups += 1
+            # CHANGE 2: Track per-phase group counts for per-phase normalisation.
+            if not _grounded_step_done:
+                _grounded_n_groups += 1
+                _grounded_loss_val += group_loss.item()
             _pf = dict(
                 mean_r=f"{np.mean(rewards):.3f}",
                 loss=f"{group_loss.item():.4f}",
@@ -1921,22 +1974,26 @@ def main() -> None:
             pbar.set_postfix(**_pf)
 
         # --- Gradient step: normalise accumulated grads then step ---
-        if n_groups > 0:
-            # Divide accumulated grads by n_groups to get the true average
-            # (equivalent to averaging the group losses before backward).
-            if n_groups > 1:
+        # CHANGE 2: If grounded step already fired (intermediate step done),
+        # only self-play gradients remain in .grad — normalise by their count.
+        # If no self-play groups exist, or self-play ratio=0, fall through as before.
+        _selfplay_n_groups = n_groups - _grounded_n_groups
+        _norm_groups = _selfplay_n_groups if _grounded_step_done else n_groups
+        if _norm_groups > 0 or (not _grounded_step_done and n_groups > 0):
+            _div = _norm_groups if _grounded_step_done else n_groups
+            if _div > 1:
                 for p in model.parameters():
                     if p.grad is not None:
-                        p.grad.div_(n_groups)
+                        p.grad.div_(_div)
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad],
                 args.max_grad_norm,
             )
             optimizer.step()
-            loss_val = total_loss_val / n_groups
+            loss_val = total_loss_val / max(1, n_groups)
         else:
             loss_val = 0.0
-        scheduler.step()
+        scheduler.step()   # advance LR once per iteration (not per phase)
 
         iter_time = time.perf_counter() - iter_start
         mean_r   = float(np.mean(all_rewards))             if all_rewards   else 0.0
@@ -2042,20 +2099,22 @@ def main() -> None:
                 math_env=math_env,
                 pass_at_k=args.eval_pass_at_k,
             )
-            # accuracy == combined_score: 0.50×correct + 0.40×process(prm_final,prm_mean) + 0.10×fmt
+            # CHANGE 4: Use final_answer_accuracy as the primary checkpoint metric.
+            # combined_score blends PRM + format, so the model could get "better"
+            # at formatting while getting worse at actual math. We now save
+            # best_policy only when real math accuracy (exact-match %) improves.
             cur_combined = float(eval_res.get("combined_score", best_combined))
             cur_prm_mean = float(eval_res.get("prm_mean",       best_prm_mean))
+            cur_fa_acc   = float(eval_res.get("final_answer_accuracy", 0.0))
 
             _log_eval_result(f"iter {iteration}", eval_res, best=best_combined)
 
-            # ── Checkpoint: save when combined_score strictly improves ────────
-            # combined_score is a continuous variable; any improvement in
-            # correctness, PRM quality, SymPy, or format moves it.
-            if cur_combined > best_combined + 1e-4:
-                reason = f"combined {cur_combined:.4f} > {best_combined:.4f}"
-                best_combined  = cur_combined
+            # ── Checkpoint: save when final-answer accuracy strictly improves ──
+            if cur_fa_acc > best_accuracy + 1e-4:
+                reason = f"final_answer_accuracy {cur_fa_acc:.4f} > {best_accuracy:.4f}"
+                best_accuracy  = cur_fa_acc
+                best_combined  = max(best_combined, cur_combined)
                 best_prm_mean  = max(best_prm_mean, cur_prm_mean)
-                best_accuracy  = best_combined
                 best_path = out_dir / "best_policy"
                 model.save_pretrained(str(best_path))
                 tokenizer.save_pretrained(str(best_path))

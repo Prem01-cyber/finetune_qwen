@@ -633,37 +633,25 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         else:
             lccp = 0.0
 
+        # CHANGE 1: Binary reward — only the correct final answer matters.
+        # PRM (prm_final, prm_mean, lccp) and format_score are still computed
+        # and logged for diagnostics but do NOT contribute to the training reward.
+        # Rationale: blended rewards give up to 0.50 credit for wrong answers,
+        # which teaches the model to write confident-sounding wrong answers.
+        # A clean binary signal forces it to actually get the math right.
+        combined = float(gt_match)  # 1.0 if correct, 0.0 if wrong
         if self.prm_scorer is not None and not prm_degraded:
-            # process_score: weight prm_final (conclusion step) more than mean
-            # — the final step is the most critical and most predictive.
-            process_score = 0.60 * prm_final + 0.40 * prm_mean
-            combined = (
-                0.50 * gt_match
-                + 0.40 * process_score
-                + 0.10 * format_score
-            )
             components_str = (
-                f"0.50×{gt_match:.2f} + 0.40×proc({process_score:.3f}"
-                f"[fin={prm_final:.2f},mean={prm_mean:.2f}]) + "
-                f"0.10×fmt({format_score:.3f})"
+                f"binary({gt_match:.0f}) "
+                f"| PRM_info: fin={prm_final:.2f} mean={prm_mean:.2f} "
+                f"lccp={lccp:.2f} fmt={format_score:.2f}"
             )
         else:
-            combined = 0.85 * gt_match + 0.15 * format_score
             components_str = (
-                f"0.85×{gt_match:.2f} + 0.15×fmt({format_score:.3f})"
+                f"binary({gt_match:.0f}) | no_PRM fmt={format_score:.2f}"
             )
-        combined = max(0.0, min(1.0, combined))
-
-        # Hard negative mining: wrong-answer solutions still get a partial signal
-        # proportional to how far they got before the first error (LCCP).
-        # This prevents gradient starvation on hard problems where no solution in
-        # the group is fully correct — the model still learns "longer correct prefix
-        # is better" rather than receiving zero reward for all K samples.
-        if gt_match < 0.5 and lccp > 0.0 and self.prm_scorer is not None:
-            # Bonus = 0.15 × LCCP, capped so that a wrong answer (combined ≈ 0.40)
-            # can never exceed 0.55 — always well below a correct answer (≈ 0.90+).
-            _hnm_bonus = 0.15 * lccp
-            combined = min(combined + _hnm_bonus, 0.55)
+        # Hard negative mining DISABLED — binary reward only.
+        # Zero reward for wrong answers forces genuine learning, not partial-credit gaming.
 
         _chain_depth = first_fail if prm_step_scores else 0
         logger.info(
