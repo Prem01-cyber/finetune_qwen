@@ -1705,6 +1705,11 @@ def main() -> None:
     _rolling_successes:     List[int]   = []   # 1 = successful extraction, 0 = failed
     _CALIB_WINDOW = 50    # minimum samples before computing correlation
     _CALIB_MAX    = 200   # cap rolling lists at this length
+    # Throttle shadow extraction: only run the extractor on every Nth grounded
+    # solution during calibration. Reduces overhead ~4× while still reaching
+    # the 50-sample window within a few iterations.
+    _SHADOW_EVERY   = 4
+    _shadow_extract_counter: int = 0
 
     # ── Training ─────────────────────────────────────────────────────────────
     for iteration in range(1, args.num_iterations + 1):
@@ -2107,10 +2112,14 @@ def main() -> None:
                     # activated so we can measure chain↔PRM correlation.  These
                     # scores do NOT affect the reward — they only feed the
                     # calibration window that decides when to flip use_chain_scoring.
+                    # Throttled to every _SHADOW_EVERY solutions to avoid making
+                    # each iteration ~10× slower (extractor adds ~8s per call).
+                    _shadow_extract_counter += 1
                     if (
                         _phase == _Phase.SELFPLAY_RAMP
                         and not _use_chain_as_primary
                         and _unified_calc is not None
+                        and _shadow_extract_counter % _SHADOW_EVERY == 0
                     ):
                         _prm_ps = (
                             0.60 * r_dict.get("prm_final_score", 0.0)
