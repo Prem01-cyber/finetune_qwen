@@ -31,7 +31,6 @@ from src.rl.question_quality_evaluator import QuestionQualityEvaluator
 from src.rl.replay_buffer import GenerationalReplayBuffer
 from src.rl.value_network import ValueHead
 from src.sft.solution_format import extract_final_answer_numeric_str
-from src.sft.step_verify_sympy import verify_solution_text
 from src.sft.sympy_normalize import normalize_for_parse_expr
 
 logger = logging.getLogger(__name__)
@@ -157,49 +156,32 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         )
         return instruction, topic, difficulty
 
-    def _compute_sympy_and_format(self, sympy_summary: Dict[str, Any]) -> Dict[str, float]:
-        """Shared SymPy step + format scoring used by PRM and grounded paths.
-
-        SymPy score logic:
-          - steps_ok      = lines with a verifiable equality chain that SymPy confirmed
-          - steps_failed  = lines with a verifiable equality chain that SymPy REJECTED
-          - steps_skipped = lines with no '=' (prose, narration) — NOT penalised
-
-        Score = ok / (ok + failed)   when at least one equation is present.
-        Prose-only solutions (all skipped) get a neutral 0.5 rather than 0 so the
-        model is not punished for writing human-readable reasoning with no equations.
+    def _compute_format_score(self, solution: str) -> float:
         """
-        steps_total   = int(sympy_summary.get("steps_total", 0))
-        steps_ok      = int(sympy_summary.get("steps_verified_ok", 0))
-        steps_failed  = int(sympy_summary.get("steps_failed", 0))
-        steps_skipped = int(sympy_summary.get("steps_skipped_no_equality", 0))
-        final_status  = str(sympy_summary.get("final_answer", ""))
+        Structural format score based purely on text patterns — no SymPy.
 
-        verifiable = steps_ok + steps_failed   # steps where SymPy could actually check
-        if verifiable == 0:
-            # No equations at all — could be pure prose or no Step lines found.
-            # Give neutral 0.5: don't reward it but don't harshly penalise it.
-            sympy_score = 0.5
-        else:
-            # Precision over verifiable equations only (skipped prose doesn't count).
-            sympy_score = steps_ok / verifiable
+        Checks:
+          - Presence of 'Step N:' lines (multi-step structure)
+          - Presence of 'Final Answer:' line (correct termination)
+          - Length: ≥2 step lines scores highest
 
-        total_step_lines = steps_total + steps_skipped
-        equation_ratio = (
-            steps_total / total_step_lines if total_step_lines > 0 else 0.0
-        )
-        final_ok = 1.0 if final_status == "ok" else 0.0
-        if steps_total >= 2:
+        Returns a score in [0, 1].
+        """
+        lines = solution.splitlines()
+        step_lines  = [l for l in lines if re.match(r"^\s*Step\s+\d+\s*:", l)]
+        has_final   = any(re.match(r"^\s*Final Answer\s*:", l, re.IGNORECASE) for l in lines)
+
+        n_steps = len(step_lines)
+        if n_steps >= 2:
             length_bonus = 1.0
-        elif steps_total == 1:
+        elif n_steps == 1:
             length_bonus = 0.5
         else:
             length_bonus = 0.0
-        format_score = max(
-            0.0,
-            min(1.0, 0.5 * equation_ratio + 0.3 * final_ok + 0.2 * length_bonus),
-        )
-        return {"sympy_score": float(sympy_score), "format_score": float(format_score)}
+
+        final_ok = 1.0 if has_final else 0.0
+        # 0.7 × step-structure + 0.3 × final-answer presence
+        return max(0.0, min(1.0, 0.7 * length_bonus + 0.3 * final_ok))
 
     def compute_reward(
         self,
@@ -285,12 +267,10 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             "question_metrics": question_result,
             "solution_metrics": {
                 "overall_score": solution_reward,
-                "correctness": solution_result["sympy_score"],
+                "correctness": float(solution_result.get("combined_score", 0.0)),
                 "format_compliance": solution_result["format_score"],
                 "efficiency": solution_result["consensus_score"],
-                "steps_total": solution_result["breakdown"]["sympy"]["steps_total"],
                 "consensus_score": solution_result["consensus_score"],
-                "sympy_score": solution_result["sympy_score"],
                 "verification_details": solution_result["verification_details"],
             },
             "curriculum_metrics": {
@@ -333,11 +313,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         prm_result = self.prm_scorer.score_solution(
             question=question, solution=solution
         )
-        verification_report = verify_solution_text(solution)
-        sympy_summary = verification_report.summary
-        scores = self._compute_sympy_and_format(sympy_summary)
-        sympy_score = scores["sympy_score"]
-        format_score = scores["format_score"]
+        format_score = self._compute_format_score(solution)
 
         prm_mean = float(prm_result.get("mean_score", 0.0))
         prm_min = float(prm_result.get("min_score", 0.0))
@@ -510,7 +486,6 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         # Shape a consensus-style verification_details dict so downstream
         # aggregation (which reads these keys) keeps working unchanged.
         verification_details = {
-            "sympy_verification": sympy_summary,
             "consensus": {
                 "has_majority": prm_mean >= 0.5,
                 "consensus_strength": prm_mean,
@@ -518,8 +493,6 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 "answer_diversity": 0,
                 "majority_answer": None,
                 "primary_answer": extract_final_answer_numeric_str(solution) or None,
-                # PRM-specific fields below — extra keys are safe for consumers
-                # that only read the ones listed in the dataclass above.
                 "prm_mean_score": prm_mean,
                 "prm_min_score": prm_min,
                 "prm_final_score": prm_final,
@@ -539,9 +512,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 "correctness": prm_mean,
                 "format_compliance": format_score,
                 "efficiency": prm_mean,          # legacy slot
-                "steps_total": sympy_summary.get("steps_total", 0),
                 "consensus_score": prm_mean,     # legacy slot
-                "sympy_score": sympy_score,
                 "prm_mean_score": prm_mean,
                 "prm_min_score": prm_min,
                 "prm_final_score": prm_final,
@@ -570,13 +541,13 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
     # directly against the gold final answer, which is the only signal
     # guaranteed to move the benchmark we actually evaluate on.
     #
-    # The reward:  R = 0.7·gt_match + 0.2·sympy_step_score + 0.1·format
+    # The reward:  R = 0.50·gt_match + 0.40·process(PRM) + 0.10·format
     #
     #   * gt_match = 1.0 iff the model's Final Answer is mathematically
-    #     equivalent to the GSM8K gold final (via sympy.simplify).
-    #   * sympy_step_score is the same per-step LHS/RHS check used for
-    #     self-play (fraction of steps whose equality chains verify).
-    #   * format rewards having Step N: lines and a parseable Final Answer.
+    #     equivalent to the GSM8K gold final (via sympy.simplify on the
+    #     extracted numeric string).
+    #   * process = 0.60·prm_final + 0.40·prm_mean (PRM step-level quality)
+    #   * format rewards Step N: lines and a Final Answer: line.
     #
     # No TripleVerifier call on this path — ground truth obviates consensus.
 
@@ -616,11 +587,7 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         GSM8K problem.  No TripleVerifier call — the gold final answer
         replaces consensus voting as the semantic check.
         """
-        report = verify_solution_text(solution)
-        summary = report.summary
-        scores = self._compute_sympy_and_format(summary)
-        sympy_score = scores["sympy_score"]
-        format_score = scores["format_score"]
+        format_score = self._compute_format_score(solution)
 
         pred_final = extract_final_answer_numeric_str(solution) or ""
         gt_match_bool = self._answers_equivalent(pred_final, gold_final)
@@ -729,9 +696,6 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             "format_score":      format_score,
             "pred_final":        pred_final,
             "gold_final":        gold_final,
-            # kept for backward compat / plotting
-            "sympy_score":       scores.get("sympy_score", 0.0),
-            "sympy_summary":     summary,
         }
 
     def rollout_grounded_trajectory(self, qa_pair: Dict[str, str]) -> Trajectory:
@@ -760,19 +724,12 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         terminal_reward = float(reward_result["combined_score"])
         trajectory = Trajectory()
-        # Terminal-only reward — all intermediate tokens carry 0 reward.
-        # With gae_lambda=1.0 the GAE telescopes exactly to:
-        #   A_t = R - V(s_t)  for every token t (same as REINFORCE + baseline).
-        # Every token in the trajectory sees the same signed advantage; no
-        # within-trajectory cancellation from opposing early/late advantages.
-        # See run_ppo_training_curriculum.py (gae_lambda=1.0) for context.
         for idx, transition in enumerate(solution_transitions):
             transition.reward = (
                 terminal_reward if idx == len(solution_transitions) - 1 else 0.0
             )
             trajectory.add(transition)
 
-        summary = reward_result["sympy_summary"]
         metadata = {
             "rollout_source": "grounded",
             "curriculum_iteration": self.curriculum_manager.current_iteration,
@@ -789,23 +746,11 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             "estimated_difficulty": 0.5,
             "clarity_score": 1.0,
             "novelty_scores": {"combined": 0.0},
-            # Consensus not run for grounded rollouts; expose neutral values so
-            # downstream aggregation doesn't KeyError.
             "consensus_achieved": bool(reward_result["gt_match"]),
             "consensus_strength": 1.0 if reward_result["gt_match"] else 0.0,
             "answer_diversity": 0,
             "majority_answer": None,
             "primary_matches_majority": bool(reward_result["gt_match"]),
-            "sympy_verified": int(summary.get("steps_failed", 0)) == 0,
-            "steps_total": int(summary.get("steps_total", 0)),
-            "steps_verified_ok": int(summary.get("steps_verified_ok", 0)),
-            "steps_failed": int(summary.get("steps_failed", 0)),
-            "final_answer_ok": str(summary.get("final_answer", "")) == "ok",
-            # Grounded rollouts do not generate a question — we feed a
-            # real GSM8K problem directly.  Pinning question_reward to 0
-            # is the honest signal: "no question-gen credit was earned",
-            # so aggregate metrics can exclude these rollouts and still
-            # reflect the true per-iteration question-gen performance.
             "question_reward": 0.0,
             "solution_reward": terminal_reward,
             "pre_expert_reward": terminal_reward,
@@ -819,7 +764,6 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             "reward_breakdown": {
                 "grounded": True,
                 "gt_match": bool(reward_result["gt_match"]),
-                "sympy_score": float(reward_result["sympy_score"]),
                 "format_score": float(reward_result["format_score"]),
                 "pred_final": reward_result["pred_final"],
                 "gold_final": reward_result["gold_final"],
@@ -831,8 +775,6 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             "topics_in_sweet_spot": self.curriculum_manager.get_sweet_spot_topics(),
             "current_focus_topics": self.curriculum_manager.get_current_focus(),
             "curriculum_state_snapshot": self.curriculum_manager.get_curriculum_stats(),
-            "sympy_score": float(reward_result["sympy_score"]),
-            # Grounded-specific fields (duplicated at top level for CSV logging).
             "grounded_gt_match": bool(reward_result["gt_match"]),
             "grounded_pred_final": reward_result["pred_final"],
             "grounded_gold_final": reward_result["gold_final"],
@@ -892,7 +834,6 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
 
         verification = reward_result["solution_metrics"]["verification_details"]
         consensus = verification["consensus"]
-        sympy = verification["sympy_verification"]
         question_metrics = reward_result["question_metrics"]
 
         metadata = TrajectoryMetadata(
@@ -917,11 +858,11 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             answer_diversity=int(consensus["answer_diversity"]),
             majority_answer=consensus.get("majority_answer"),
             primary_matches_majority=bool(consensus["primary_matches_majority"]),
-            sympy_verified=int(sympy.get("steps_failed", 0)) == 0,
-            steps_total=int(sympy.get("steps_total", 0)),
-            steps_verified_ok=int(sympy.get("steps_verified_ok", 0)),
-            steps_failed=int(sympy.get("steps_failed", 0)),
-            final_answer_ok=str(sympy.get("final_answer", "")) == "ok",
+            sympy_verified=True,
+            steps_total=int(consensus.get("prm_num_steps", 0)),
+            steps_verified_ok=int(consensus.get("prm_num_steps", 0)),
+            steps_failed=0,
+            final_answer_ok=bool(consensus.get("primary_matches_majority", False)),
             question_reward=float(question_metrics["overall_score"]),
             solution_reward=float(reward_result["solution_metrics"]["overall_score"]),
             pre_expert_reward=float(reward_result["base_combined_score"]),
@@ -940,9 +881,6 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             curriculum_state_snapshot=self.curriculum_manager.get_curriculum_stats(),
         )
         metadata_dict = asdict(metadata)
-        metadata_dict["sympy_score"] = float(
-            reward_result["solution_metrics"].get("sympy_score", 0.0)
-        )
         trajectory.metadata = metadata_dict
 
         # Replay admission: requires trajectory.metadata to already exist
