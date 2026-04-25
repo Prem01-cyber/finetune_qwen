@@ -49,9 +49,13 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from scripts.convert_gsm8k_to_sft import parse_gsm8k_answer
+from src.config.prompts import create_solver_messages
 from src.sft.solution_format import extract_final_answer_numeric_str, validate_sympy_solution_format
 from src.sft.sympy_normalize import normalize_for_parse_expr
 
+# Keep these for the standalone eval_sft_inference main() path which may be
+# called without the training process context.  The GRPO loop uses
+# create_solver_messages (below) so prompts are identical to training.
 SOLVER_SYSTEM_PROMPT = (
     "You are a step-by-step math solver. "
     "Solve the given problem one step at a time. "
@@ -149,11 +153,9 @@ def _generate(
     top_p: float,
     greedy: bool,
 ) -> str:
-    user_content = USER_WRAPPER.format(question=problem.strip())
-    messages = [
-        {"role": "system", "content": SOLVER_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
+    # Use the canonical solver prompt (same system + user format as GRPO training)
+    # so eval measures the model under the exact distribution it was trained on.
+    messages = create_solver_messages(problem.strip())
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     # HuggingFace warns once-per-call when `temperature`/`top_p` are passed
