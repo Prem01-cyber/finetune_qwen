@@ -89,11 +89,16 @@
 #
 #   Wall-time with Flash-Attn 2 active (A100-80GB, K_q=2, K=8, N=16):
 #     Model + PRM load             :  ~2 min
-#     Initial eval (150 samples)   :  ~3 min
+#     Initial eval (150 samples)   :  ~4-5 min  (512 tok cap, periodic cache flush)
 #     Train iter (Flash active)    :  ~90 s   (was ~120 s — ~25% faster)
-#     Eval checkpoint × 12         :  ~3 min each = 36 min
+#     Eval checkpoint × 12         :  ~4 min each = 48 min
 #     60 iterations × 90 s        :  ~90 min
-#     Total                        :  ~2.5 h  (was ~4 h without Flash)
+#     Total                        :  ~2.5-3 h  (was ~4 h without Flash)
+#
+#   --eval-max-new-tokens 512 (not 1000):
+#     Competition math gold answers average 700-900 chars (~250-350 tokens).
+#     Capping eval generation at 512 tokens is sufficient for the model to
+#     produce a final answer without burning extra time on unsolvable tails.
 #
 # ── Smoke test (~10 min) ─────────────────────────────────────────────────────
 #
@@ -253,7 +258,7 @@ python -u scripts/run_grpo_training.py \
     \
     --eval-every            5 \
     --eval-max-samples      150 \
-    --eval-max-new-tokens   1000 \
+    --eval-max-new-tokens   512 \
     --eval-pass-at-k        0 \
     --save-every            5 \
     --keep-last             3 \

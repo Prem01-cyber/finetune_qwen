@@ -486,6 +486,14 @@ def evaluate_gsm8k(
                 _logger.debug("reward_fn failed for sample %d: %s", i, rfn_exc)
 
         done = i + 1
+        # Periodically flush the CUDA allocator's free-block pool so that
+        # fragmentation from large KV-cache + PRM tensors doesn't accumulate
+        # and cause per-sample allocation time to grow throughout the run.
+        if done % 20 == 0:
+            import gc; gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         # Live bar: show training-objective score when available, else acc.
         if _combined:
             _pf: dict = dict(
