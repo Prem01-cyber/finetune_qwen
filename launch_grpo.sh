@@ -20,17 +20,16 @@
 #      std=0.357, 0 groups skipped). Going higher linearly increases iter
 #      wall-time and makes the eval/train ratio worse. Sweet spot.
 #
-#   3. --learning-rate 1e-5 — 2× the previous 5e-6. PPO runs converged at
-#      this rate (approx_kl ~0.05 target). Loss was only -0.0032 at 5e-6,
-#      meaning the policy was barely moving each step. 1e-5 is the standard
-#      RLHF range for 1.5B models and is what Qwen-Math / DeepSeek-Math use.
+#   3. --learning-rate 5e-6 — halved from 1e-5 after iter 5 LR shock. At 1e-5
+#      the policy collapsed the moment warmup ended (mean_r dropped 0.917→0.448,
+#      grounded_acc 87%→53%). 5e-6 keeps the update stable through the full run.
 #
 #   4. --max-grad-norm 0.5 — tighter than 1.0 default, matches PPO. Prevents
 #      rare high-variance groups from spiking the gradient norm.
 #
-#   5. --eval-every 3 — more frequent eval (10 points vs 6 over 30 iters).
-#      Gives much nicer accuracy curves for the hackathon demo plot.
-#      Cost: ~4 extra eval runs × ~6 min = ~24 min over the full run.
+#   5. --warmup-iters 8 — extended from 5. At 5 iters the ramp to peak LR
+#      coincided exactly with the crash. 8 iters gives a gentler ramp and
+#      lets the policy adapt before hitting peak learning rate.
 #
 #   6. --save-every 5 + --keep-last 3 — at 3 GB per merged 1.5B bf16
 #      checkpoint, naive "save every iter" burns 90 GB. Rolling window keeps
@@ -187,13 +186,13 @@ python -u scripts/run_grpo_training.py \
     --num-iterations 30 \
     --group-size 8 \
     --questions-per-iter 16 \
-    --learning-rate 1e-5 \
+    --learning-rate 5e-6 \
     --max-new-tokens 400 \
     --temperature 0.8 \
     --max-grad-norm 0.5 \
     --clip-eps 0.2 \
     --kl-coef 0.04 \
-    --warmup-iters 5 \
+    --warmup-iters 8 \
     --min-lr-ratio 0.1 \
     --difficulty-alpha 3.0 \
     --self-play-ratio 0.30 \

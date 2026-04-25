@@ -47,7 +47,7 @@ class QuestionQualityEvaluator:
         self,
         reference_questions: Optional[List[str]] = None,
         classifier: Optional[QuestionClassifier] = None,
-        novelty_window_size: int = 100,
+        novelty_window_size: int = 500,   # raised from 100: 5 SP/iter → fills in ~100 iters
     ):
         self.reference_questions = reference_questions or []
         self.classifier = classifier or QuestionClassifier()
@@ -80,10 +80,10 @@ class QuestionQualityEvaluator:
 
         overall = (
             0.25 * topic_match
-            + 0.25 * difficulty_score
+            + 0.15 * difficulty_score
             + 0.20 * clarity
             + 0.20 * float(solvability["score"])
-            + 0.10 * novelty["combined"]
+            + 0.20 * novelty["combined"]   # raised 0.10→0.20; taken from difficulty_score
         )
 
         return QuestionEvalResult(
@@ -105,7 +105,10 @@ class QuestionQualityEvaluator:
             question,
             [self._extract_ngrams(x.lower()) for x in self.recent_questions],
         )
-        combined = max(0.0, min(1.0, 0.4 * dataset_novelty + 0.6 * session_novelty))
+        # Weight dataset novelty higher (60%) — comparing against 8k GSM8K questions
+        # is a stable, meaningful signal. Session novelty (40%) guards against
+        # the model looping the same question template within a run.
+        combined = max(0.0, min(1.0, 0.60 * dataset_novelty + 0.40 * session_novelty))
 
         self.recent_questions.append(question)
         self.recent_questions = self.recent_questions[-self.novelty_window_size :]

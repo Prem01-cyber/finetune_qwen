@@ -1273,7 +1273,10 @@ def main() -> None:
         policy_model=model,
         value_model=None,
         tokenizer=tokenizer,
-        reference_questions=[],
+        # Feed all GSM8K training questions as the novelty reference set so
+        # session_novelty is measured against the actual training distribution —
+        # a self-play question that mimics a dataset question gets low novelty.
+        reference_questions=[p["question"] for p in gsm8k_pairs],
         grounded_qa_pairs=qa_pairs,
         prm_scorer=prm,
         max_solution_tokens=args.max_new_tokens,
