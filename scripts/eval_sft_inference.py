@@ -300,6 +300,8 @@ def evaluate_gsm8k(
     temperature: float = 0.0,
     top_p: float = 1.0,
     reward_fn: Any = None,
+    pass_at_k: int = 0,
+    pass_at_k_temperature: float = 0.8,
 ) -> dict:
     """
     Evaluate *model* on a GSM8K-formatted JSONL file using the SAME scoring
@@ -388,12 +390,16 @@ def evaluate_gsm8k(
     _MAX_ERROR_WARNINGS = 3
 
     # Per-solution reward accumulators (populated when reward_fn is supplied).
-    # Each element corresponds to one evaluated solution.
-    _combined:  list[float] = []   # full training objective score
-    _gt_match:  list[float] = []   # 1.0 / 0.0 — exact answer correct?
-    _prm_comp:  list[float] = []   # PRM step-quality component
-    _sympy_comp:list[float] = []   # SymPy verification component
-    _fmt_comp:  list[float] = []   # format compliance component
+    _combined:  list[float] = []
+    _gt_match:  list[float] = []
+    _prm_comp:  list[float] = []
+    _prm_final: list[float] = []   # PRM score on final reasoning step
+    _step_acc:  list[float] = []   # fraction of steps rated correct by PRM (>0.5)
+    _sympy_comp:list[float] = []
+    _fmt_comp:  list[float] = []
+
+    # Pass@K accumulators: for each problem, did ANY of K samples get it right?
+    _pak_any_correct: list[int] = []   # 1 if any of K samples correct, else 0
 
     pbar = tqdm(
         rows, total=total, desc="GSM8K eval",
@@ -408,7 +414,6 @@ def evaluate_gsm8k(
                 max_new_tokens=max_new_tokens,
                 temperature=temperature, top_p=top_p, greedy=greedy,
             )
-            # Keep final-answer tracking for the debug line.
             pred_final = extract_final_answer_numeric_str(pred_text) or ""
             if _equiv_expr(pred_final, row["gold_final"]):
                 correct += 1
@@ -427,18 +432,38 @@ def evaluate_gsm8k(
                 )
             _logger.debug("Sample %d error: %s", i, exc, exc_info=True)
 
+        # ── Pass@K: sample K solutions at T=0.8 and check if any is correct ─
+        # This is the fair comparison to batch_acc during training (also K samples
+        # at T=0.8). Greedy (pass@1) is pessimistic; pass@k shows the upper bound
+        # the model can achieve with sampling, matching the training regime.
+        if pass_at_k > 1 and row.get("gold_final"):
+            _any = 0
+            for _ in range(pass_at_k):
+                try:
+                    s = _generate(
+                        model=model, tokenizer=tokenizer,
+                        problem=row["question"],
+                        max_new_tokens=max_new_tokens,
+                        temperature=pass_at_k_temperature,
+                        top_p=top_p, greedy=False,
+                    )
+                    pf = extract_final_answer_numeric_str(s) or ""
+                    if _equiv_expr(pf, row["gold_final"]):
+                        _any = 1
+                        break
+                except Exception:
+                    pass
+            _pak_any_correct.append(_any)
+
         # ── Apply the SAME reward function used during GRPO training ──────────
-        # reward_fn(question, solution, gold) -> dict with at minimum
-        # {"combined_score": float} and optionally the component breakdown.
-        # This makes the eval metric IDENTICAL to the training objective so
-        # every improvement — better reasoning steps, better formatting,
-        # better SymPy-verifiable chains — shows up immediately.
         if reward_fn is not None and pred_text:
             try:
                 r = reward_fn(row["question"], pred_text, row["gold_final"])
                 _combined.append(float(r.get("combined_score",   0.0)))
                 _gt_match.append(1.0 if r.get("gt_match", False) else 0.0)
                 _prm_comp.append(float(r.get("prm_mean_score",   0.0)))
+                _prm_final.append(float(r.get("prm_final_score", 0.0)))
+                _step_acc.append(float(r.get("step_accuracy",    0.0)))
                 _sympy_comp.append(float(r.get("sympy_score",    0.0)))
                 _fmt_comp.append(float(r.get("format_score",     0.0)))
             except Exception as rfn_exc:
@@ -450,7 +475,8 @@ def evaluate_gsm8k(
             _pf: dict = dict(
                 score=f"{sum(_combined) / len(_combined):.3f}",
                 correct=f"{sum(_gt_match):.0f}/{len(_combined)}",
-                prm=f"{sum(_prm_comp) / len(_prm_comp):.3f}" if _prm_comp else "—",
+                step_acc=f"{sum(_step_acc)/len(_step_acc):.1%}" if _step_acc else "—",
+                pak=f"{sum(_pak_any_correct)/len(_pak_any_correct):.1%}" if _pak_any_correct else "—",
             )
         else:
             _pf = dict(acc=f"{correct / done:.1%}", correct=f"{correct}/{done}")
@@ -460,26 +486,32 @@ def evaluate_gsm8k(
     n_scored = len(_combined)
     _avg = lambda lst: round(sum(lst) / len(lst), 4) if lst else 0.0
 
+    # Pass@K: fraction of problems where any of K sampled solutions was correct.
+    pass_at_k_score = _avg(_pak_any_correct) if _pak_any_correct else None
+
     if reward_fn is not None:
         combined_score = _avg(_combined)
         result: dict = {
-            # PRIMARY: mean training-objective score — captures ALL components.
-            # Same formula as GRPO reward: 0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format
+            # PRIMARY: mean training-objective score.
+            # Formula: 0.50×correct + 0.40×process(prm_final, prm_mean) + 0.10×format
             "accuracy":       combined_score,
             "combined_score": combined_score,
-            # Component breakdown — tells you WHICH aspect is driving improvement.
+            # PROCESS metric — improves before correct_rate does
+            "step_accuracy":  _avg(_step_acc),
+            # Answer correctness
             "correct_rate":   _avg(_gt_match),
+            # PRM components
             "prm_mean":       _avg(_prm_comp),
+            "prm_final":      _avg(_prm_final),
+            # Format / SymPy (informational)
             "sympy_mean":     _avg(_sympy_comp),
             "format_mean":    _avg(_fmt_comp),
             "n_scored":       n_scored,
             "total":          total,
-            # Debug: raw final-answer count
-            "final_answer_correct": correct,
+            "final_answer_correct":  correct,
             "final_answer_accuracy": correct / total if total else 0.0,
         }
     else:
-        # No reward_fn — fall back to binary final-answer accuracy.
         _logger.warning(
             "evaluate_gsm8k: no reward_fn provided — using final-answer accuracy. "
             "Pass reward_fn=math_env.compute_grounded_reward for full training-objective eval."
@@ -497,6 +529,10 @@ def evaluate_gsm8k(
             "final_answer_correct":  correct,
             "final_answer_accuracy": fa_acc,
         }
+    # Attach pass@k if it was computed
+    if pass_at_k_score is not None:
+        result["pass_at_k"]     = pass_at_k_score
+        result["pass_at_k_k"]   = pass_at_k
     return result
 
 

@@ -184,7 +184,7 @@ python -u scripts/run_grpo_training.py \
     --output-dir checkpoints/grpo \
     --gsm8k-data data/sft/gsm8k_sft.jsonl \
     --eval-data-path data/sft/gsm8k_test.jsonl \
-    --num-iterations 100 \
+    --num-iterations 30 \
     --group-size 8 \
     --questions-per-iter 16 \
     --learning-rate 1e-5 \
@@ -196,14 +196,14 @@ python -u scripts/run_grpo_training.py \
     --warmup-iters 5 \
     --min-lr-ratio 0.1 \
     --difficulty-alpha 3.0 \
-    --self-play-ratio 0.15 \
+    --self-play-ratio 0.30 \
     --math-mix-ratio 0.3 \
     --math-max-difficulty 3 \
     --overlong-filter \
-    --eval-every 10 \
+    --eval-every 5 \
     --eval-max-samples 250 \
     --eval-max-new-tokens 512 \
-    --save-every 10 \
+    --save-every 5 \
     --keep-last 3 \
     --use-prm \
     --prm-model Qwen/Qwen2.5-Math-PRM-7B \

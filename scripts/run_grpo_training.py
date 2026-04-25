@@ -344,18 +344,30 @@ def compute_grounded_reward(
     solution: str,
     gold_final: str,
     math_env: CurriculumMathEnvironment,
-) -> float:
+) -> Dict[str, float]:
     """Score a solution against a known gold answer (grounded path).
 
-    Reward breakdown: 0.60×correct + 0.15×PRM_mean + 0.15×SymPy + 0.10×format.
-    PRM is handled inside math_env (loaded at startup); no need to pass it here.
+    Returns a dict with:
+      combined_score  – 0.50×correct + 0.40×process(prm_final,prm_mean) + 0.10×fmt
+      step_accuracy   – fraction of PRM steps rated > 0.5 (the core process metric)
+      prm_mean_score  – PRM mean across all steps
+      prm_final_score – PRM score on the final reasoning step
+      gt_match        – bool, whether pred matches gold
+      format_score    – format compliance score
     """
     result = math_env.compute_grounded_reward(
         question=question,
         solution=solution,
         gold_final=gold_final,
     )
-    return float(result["combined_score"])
+    return {
+        "combined_score":  float(result.get("combined_score",  0.0)),
+        "step_accuracy":   float(result.get("step_accuracy",   0.0)),
+        "prm_mean_score":  float(result.get("prm_mean_score",  0.0)),
+        "prm_final_score": float(result.get("prm_final_score", 0.0)),
+        "gt_match":        bool(result.get("gt_match",         False)),
+        "format_score":    float(result.get("format_score",    0.0)),
+    }
 
 
 def compute_self_play_reward(
@@ -736,20 +748,17 @@ def grpo_loss_for_group(
 # ---------------------------------------------------------------------------
 
 def _log_eval_result(label: str, res: Dict, best: Optional[float]) -> None:
-    """Print a structured evaluation summary that mirrors the training objective.
-
-    The primary number shown is ``combined_score`` — identical to the GRPO
-    reward formula — so the eval metric and training metric are directly
-    comparable.  All four components are shown so it's immediately obvious
-    which one is driving any change.
-    """
-    cs     = float(res.get("combined_score", 0.0))
-    cr     = float(res.get("correct_rate",   0.0))
-    prm    = float(res.get("prm_mean",       0.0))
-    sympy  = float(res.get("sympy_mean",     0.0))
-    fmt    = float(res.get("format_mean",    0.0))
-    n_sc   = int(res.get("n_scored", res.get("total", 0)))
-    fa_acc = float(res.get("final_answer_accuracy", cr))
+    """Print a structured evaluation summary that mirrors the training objective."""
+    cs      = float(res.get("combined_score",  0.0))
+    cr      = float(res.get("correct_rate",    0.0))
+    step_a  = float(res.get("step_accuracy",   0.0))
+    prm     = float(res.get("prm_mean",        0.0))
+    prm_fin = float(res.get("prm_final",       0.0))
+    fmt     = float(res.get("format_mean",     0.0))
+    n_sc    = int(res.get("n_scored", res.get("total", 0)))
+    fa_acc  = float(res.get("final_answer_accuracy", cr))
+    pak     = res.get("pass_at_k")
+    pak_k   = int(res.get("pass_at_k_k", 4))
 
     best_str = f" (best={best:.4f})" if best is not None else ""
     logger.info(
@@ -757,12 +766,25 @@ def _log_eval_result(label: str, res: Dict, best: Optional[float]) -> None:
         label, cs, best_str, n_sc,
     )
     logger.info(
-        "  Components    : 0.60×correct(%.1f%%) + 0.15×PRM(%.3f) + "
-        "0.15×SymPy(%.3f) + 0.10×fmt(%.3f) = %.4f",
-        100 * cr, prm, sympy, fmt, cs,
+        "  Components    : 0.50×correct(%.1f%%) + 0.40×process + 0.10×fmt(%.3f)",
+        100 * cr, fmt,
     )
     logger.info(
-        "  (debug) final-answer accuracy: %.1f%%  (binary, not used for ckpt)",
+        "  Process score : prm_mean=%.3f  prm_final=%.3f  → weighted=%.3f",
+        prm, prm_fin, 0.60 * prm_fin + 0.40 * prm,
+    )
+    logger.info(
+        "  Step accuracy : %.1f%%  ← fraction of reasoning steps PRM rates correct (>0.5)",
+        100 * step_a,
+    )
+    if pak is not None:
+        logger.info(
+            "  pass@%d (T=0.8): %.1f%%  |  greedy correct: %.1f%%  "
+            "← ceiling vs floor gap",
+            pak_k, 100 * pak, 100 * cr,
+        )
+    logger.info(
+        "  (debug) final-answer accuracy: %.1f%%",
         100 * fa_acc,
     )
 
@@ -774,6 +796,7 @@ def evaluate_policy(
     max_samples: int,
     max_new_tokens: int,
     math_env: Optional[Any] = None,
+    pass_at_k: int = 4,
 ) -> Dict[str, object]:
     """Run GSM8K evaluation using the SAME reward formula as GRPO training.
 
@@ -810,6 +833,7 @@ def evaluate_policy(
         max_samples=max_samples,
         max_new_tokens=max_new_tokens,
         reward_fn=reward_fn,
+        pass_at_k=pass_at_k,
     )
     model.train()
     return results
@@ -840,6 +864,11 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--eval-max-samples", type=int, default=250)
     parser.add_argument("--eval-max-new-tokens", type=int, default=512)
+    parser.add_argument(
+        "--eval-pass-at-k", type=int, default=4,
+        help="Number of sampled solutions per eval problem for pass@k (0 to disable). "
+             "Makes eval directly comparable to training batch_acc (both K samples at T=0.8).",
+    )
     parser.add_argument("--use-prm", dest="use_prm", action="store_true", default=True)
     parser.add_argument("--no-prm", dest="use_prm", action="store_false")
     parser.add_argument("--prm-model", default="Qwen/Qwen2.5-Math-PRM-7B")
@@ -1303,6 +1332,7 @@ def main() -> None:
             model, tokenizer,
             args.eval_data_path, args.eval_max_samples, args.eval_max_new_tokens,
             math_env=math_env,
+            pass_at_k=args.eval_pass_at_k,
         )
         # accuracy == combined_score = 0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format
         # This is identical to the GRPO training objective.
@@ -1342,7 +1372,10 @@ def main() -> None:
         logger.info("LR this iteration: %.2e", cur_lr)
 
         all_rewards:   List[float] = []
-        all_q_rewards: List[float] = []   # question_reward for self-play groups only
+        all_q_rewards: List[float] = []
+        _grounded_rewards:   List[float] = []
+        _sp_rewards:         List[float] = []
+        _grounded_step_accs: List[float] = []   # step_accuracy from grounded rollouts
         # Per-component question quality accumulators
         _qc_topic:      List[float] = []
         _qc_diff:       List[float] = []
@@ -1483,14 +1516,21 @@ def main() -> None:
                     _qc_novelty.append(q_met["novelty"])
                     _qc_solvability.append(q_met["solvability"])
                 else:
-                    r = compute_grounded_reward(
+                    r_dict = compute_grounded_reward(
                         question=question,
                         solution=sol,
                         gold_final=gold,
                         math_env=math_env,
                     )
+                    r = r_dict["combined_score"]
+                    _grounded_step_accs.append(r_dict["step_accuracy"])
                 rewards.append(r)
             all_rewards.extend(rewards)
+            # Route to path-specific accumulators for separate batch_acc reporting
+            if use_self_play:
+                _sp_rewards.extend(rewards)
+            else:
+                _grounded_rewards.extend(rewards)
 
             # A self-play group is "accurate" if the question it generated scored
             # above 0.5 on question quality — meaning it was clear, on-topic,
@@ -1568,7 +1608,15 @@ def main() -> None:
         mean_r   = float(np.mean(all_rewards))             if all_rewards   else 0.0
         std_r    = float(np.std(all_rewards))              if all_rewards   else 0.0
         acc_r    = float(np.mean([r > 0.5 for r in all_rewards])) if all_rewards else 0.0
-        mean_q_r = float(np.mean(all_q_rewards))           if all_q_rewards else 0.0
+        grounded_acc_r = (
+            float(np.mean([r > 0.5 for r in _grounded_rewards]))
+            if _grounded_rewards else 0.0
+        )
+        mean_step_acc = (
+            float(np.mean(_grounded_step_accs))
+            if _grounded_step_accs else 0.0
+        )
+        mean_q_r = float(np.mean(all_q_rewards)) if all_q_rewards else 0.0
 
         # Question generation accuracy metrics (self-play only)
         q_gen_valid_rate = (q_gen_valid   / q_gen_attempts)  if q_gen_attempts  > 0 else 0.0
@@ -1585,9 +1633,13 @@ def main() -> None:
         # ── Primary summary line ─────────────────────────────────────────────
         logger.info(
             "Iter %d | loss=%.4f | reward mean=%.3f std=%.3f | "
-            "batch_acc=%.1f%% | groups=%d skipped=%d | lr=%.2e | %.1fs",
+            "grounded_acc=%.1f%% | step_acc=%.1f%% | batch_acc=%.1f%% | "
+            "groups=%d skipped=%d | lr=%.2e | %.1fs",
             iteration, loss_val, mean_r, std_r,
-            100 * acc_r, n_groups, skipped, _cur_lr, iter_time,
+            100 * grounded_acc_r,  # grounded final-answer pass rate
+            100 * mean_step_acc,   # fraction of reasoning steps rated correct by PRM
+            100 * acc_r,           # all rollouts incl. self-play
+            n_groups, skipped, _cur_lr, iter_time,
         )
 
         # ── Question-generation accuracy line (only when self-play is active) ─
@@ -1608,6 +1660,8 @@ def main() -> None:
             "mean_reward":           mean_r,
             "std_reward":            std_r,
             "batch_accuracy":        acc_r,
+            "grounded_accuracy":     grounded_acc_r,
+            "step_accuracy":         mean_step_acc,
             "n_groups":              n_groups,
             "skipped_groups":        skipped,
             "learning_rate":         _cur_lr,
@@ -1633,6 +1687,7 @@ def main() -> None:
                 model, tokenizer,
                 args.eval_data_path, args.eval_max_samples, args.eval_max_new_tokens,
                 math_env=math_env,
+                pass_at_k=args.eval_pass_at_k,
             )
             # accuracy == combined_score: 0.60×correct + 0.15×PRM + 0.15×SymPy + 0.10×format
             cur_combined = float(eval_res.get("combined_score", best_combined))

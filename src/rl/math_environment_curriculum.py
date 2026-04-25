@@ -158,19 +158,31 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         return instruction, topic, difficulty
 
     def _compute_sympy_and_format(self, sympy_summary: Dict[str, Any]) -> Dict[str, float]:
-        """Shared SymPy step + format scoring used by PRM and grounded paths."""
-        steps_total = int(sympy_summary.get("steps_total", 0))
-        steps_ok = int(sympy_summary.get("steps_verified_ok", 0))
-        steps_failed = int(sympy_summary.get("steps_failed", 0))
-        steps_skipped = int(sympy_summary.get("steps_skipped_no_equality", 0))
-        final_status = str(sympy_summary.get("final_answer", ""))
+        """Shared SymPy step + format scoring used by PRM and grounded paths.
 
-        if steps_total == 0:
-            sympy_score = 0.0
+        SymPy score logic:
+          - steps_ok      = lines with a verifiable equality chain that SymPy confirmed
+          - steps_failed  = lines with a verifiable equality chain that SymPy REJECTED
+          - steps_skipped = lines with no '=' (prose, narration) — NOT penalised
+
+        Score = ok / (ok + failed)   when at least one equation is present.
+        Prose-only solutions (all skipped) get a neutral 0.5 rather than 0 so the
+        model is not punished for writing human-readable reasoning with no equations.
+        """
+        steps_total   = int(sympy_summary.get("steps_total", 0))
+        steps_ok      = int(sympy_summary.get("steps_verified_ok", 0))
+        steps_failed  = int(sympy_summary.get("steps_failed", 0))
+        steps_skipped = int(sympy_summary.get("steps_skipped_no_equality", 0))
+        final_status  = str(sympy_summary.get("final_answer", ""))
+
+        verifiable = steps_ok + steps_failed   # steps where SymPy could actually check
+        if verifiable == 0:
+            # No equations at all — could be pure prose or no Step lines found.
+            # Give neutral 0.5: don't reward it but don't harshly penalise it.
+            sympy_score = 0.5
         else:
-            ok_ratio = steps_ok / steps_total
-            fail_ratio = steps_failed / steps_total
-            sympy_score = max(0.0, min(1.0, ok_ratio - 0.3 * fail_ratio))
+            # Precision over verifiable equations only (skipped prose doesn't count).
+            sympy_score = steps_ok / verifiable
 
         total_step_lines = steps_total + steps_skipped
         equation_ratio = (
@@ -346,17 +358,15 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             solution_reward = 0.0
             sol_valid = False
             logger.info(
-                "PRM degraded (%s); sol_reward set to 0.0 (sympy=%.2f, format=%.2f).",
+                "PRM degraded (%s); sol_reward set to 0.0 (format=%.2f).",
                 prm_result.get("degraded_reason", "unknown"),
-                sympy_score,
                 format_score,
             )
         else:
             solution_reward = (
-                0.55 * prm_mean
+                0.50 * prm_mean
+                + 0.30 * prm_final
                 + 0.20 * prm_min
-                + 0.15 * sympy_score
-                + 0.10 * format_score
             )
             sol_valid = True
         solution_reward = max(0.0, min(1.0, solution_reward))
@@ -434,8 +444,8 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         logger.info(
             "PRM reward%s: combined=%.3f = clip(base=%.3f + mod=%+.3f, cap=%.2f)%s "
             "| Q=%.2f sol=%.3f | "
-            "sol=0.55*PRM_mean(%.2f)+0.20*PRM_min(%.2f)+0.15*SymPy(%.2f)+0.10*Format(%.2f) "
-            "| steps=%d final_step=%.2f",
+            "sol=0.50*PRM_mean(%.2f)+0.30*PRM_final(%.2f)+0.20*PRM_min(%.2f) "
+            "| steps=%d",
             valid_tag,
             combined_score,
             base_combined_score,
@@ -445,11 +455,9 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             effective_question_reward,
             solution_reward,
             prm_mean,
-            prm_min,
-            sympy_score,
-            format_score,
-            prm_num_steps,
             prm_final,
+            prm_min,
+            prm_num_steps,
         )
 
         # Shape a consensus-style verification_details dict so downstream
@@ -570,11 +578,12 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
         gt_match_bool = self._answers_equivalent(pred_final, gold_final)
         gt_match = 1.0 if gt_match_bool else 0.0
 
-        # Optional PRM step-level quality on grounded rollouts.  On this
-        # path gt_match already carries the dominant signal, so we only
-        # use PRM as a 15% quality bonus to discriminate between "right
-        # answer for right reasons" and "right answer by lucky guess".
-        prm_mean = 0.0
+        # Optional PRM step-level quality on grounded rollouts.
+        # prm_final (last step score) is the strongest single predictor of
+        # answer correctness. step_accuracy = fraction of steps the PRM
+        # considers correct — the direct measure of reasoning process quality.
+        prm_mean   = 0.0
+        prm_final  = 0.0
         prm_step_scores: List[float] = []
         prm_num_steps = 0
         prm_degraded = True
@@ -584,54 +593,70 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             )
             prm_degraded = bool(prm_result.get("degraded", False))
             if not prm_degraded:
-                prm_mean = float(prm_result.get("mean_score", 0.0))
-                prm_step_scores = list(prm_result.get("step_scores", []))
-                prm_num_steps = int(prm_result.get("num_steps", 0))
+                prm_mean        = float(prm_result.get("mean_score",   0.0))
+                prm_final       = float(prm_result.get("final_score",  0.0))
+                prm_step_scores = list(prm_result.get("step_scores",   []))
+                prm_num_steps   = int(prm_result.get("num_steps",      0))
+
+        # Step accuracy: fraction of individual steps rated correct by PRM.
+        # This is the key process metric — it improves even when the final
+        # answer is still wrong, making training progress visible.
+        step_accuracy = (
+            sum(1.0 for s in prm_step_scores if s > 0.5) / len(prm_step_scores)
+            if prm_step_scores else 0.0
+        )
 
         if self.prm_scorer is not None and not prm_degraded:
+            # process_score: weight prm_final (conclusion step) more than mean
+            # — the final step is the most critical and most predictive.
+            process_score = 0.60 * prm_final + 0.40 * prm_mean
             combined = (
-                0.60 * gt_match
-                + 0.15 * prm_mean
-                + 0.15 * sympy_score
+                0.50 * gt_match
+                + 0.40 * process_score
                 + 0.10 * format_score
             )
             components_str = (
-                f"0.60×{gt_match:.2f} + 0.15×PRM({prm_mean:.2f}) + "
-                f"0.15×{sympy_score:.3f} + 0.10×{format_score:.3f}"
+                f"0.50×{gt_match:.2f} + 0.40×proc({process_score:.3f}"
+                f"[fin={prm_final:.2f},mean={prm_mean:.2f}]) + "
+                f"0.10×fmt({format_score:.3f})"
             )
         else:
-            combined = 0.7 * gt_match + 0.2 * sympy_score + 0.1 * format_score
+            combined = 0.85 * gt_match + 0.15 * format_score
             components_str = (
-                f"0.70×{gt_match:.2f} + 0.20×{sympy_score:.3f} + "
-                f"0.10×{format_score:.3f}"
+                f"0.85×{gt_match:.2f} + 0.15×fmt({format_score:.3f})"
             )
         combined = max(0.0, min(1.0, combined))
 
         logger.info(
             "Grounded reward: combined=%.3f = %s | pred=%r gold=%r | "
-            "SymPy: %d/%d ok, %d failed, final=%s",
+            "step_acc=%.0f%% (%d/%d steps ok) n_steps=%d",
             combined,
             components_str,
             pred_final,
             gold_final,
-            int(summary.get("steps_verified_ok", 0)),
-            int(summary.get("steps_total", 0)),
-            int(summary.get("steps_failed", 0)),
-            str(summary.get("final_answer", "")) or "missing",
+            100 * step_accuracy,
+            sum(1 for s in prm_step_scores if s > 0.5),
+            len(prm_step_scores),
+            prm_num_steps,
         )
 
         return {
-            "combined_score": combined,
-            "gt_match": gt_match_bool,
-            "sympy_score": sympy_score,
-            "format_score": format_score,
-            "pred_final": pred_final,
-            "gold_final": gold_final,
-            "sympy_summary": summary,
-            "prm_mean_score": prm_mean,
-            "prm_step_scores": prm_step_scores,
-            "prm_num_steps": prm_num_steps,
-            "prm_degraded": prm_degraded,
+            "combined_score":    combined,
+            "gt_match":          gt_match_bool,
+            # step-level accuracy — the key process metric
+            "step_accuracy":     step_accuracy,
+            "prm_mean_score":    prm_mean,
+            "prm_final_score":   prm_final,
+            "prm_step_scores":   prm_step_scores,
+            "prm_num_steps":     prm_num_steps,
+            "prm_degraded":      prm_degraded,
+            # format / answer
+            "format_score":      format_score,
+            "pred_final":        pred_final,
+            "gold_final":        gold_final,
+            # kept for backward compat / plotting
+            "sympy_score":       scores.get("sympy_score", 0.0),
+            "sympy_summary":     summary,
         }
 
     def rollout_grounded_trajectory(self, qa_pair: Dict[str, str]) -> Trajectory:
