@@ -1928,8 +1928,6 @@ def main() -> None:
                         # Aggregate question reward = mean of its solution rewards
                         _q_agg = float(np.mean(_sol_rewards))
                         _question_agg_rewards.append(_q_agg)
-                        if _q_agg > 0.5:
-                            q_quality_good += 1
 
                         # ── Solution-level GRPO update ───────────────────────
                         _sol_loss = grpo_loss_for_group(
@@ -1977,6 +1975,10 @@ def main() -> None:
                             [f"{r:.3f}" for r in _question_agg_rewards],
                             float(np.var(_question_agg_rewards)),
                         )
+
+                    # Group-level quality: at least one candidate scored > 0.5
+                    if any(r > 0.5 for r in _question_agg_rewards):
+                        q_quality_good += 1
 
                     # pbar update then skip to next group (all done above)
                     _mean_r_sp = float(np.mean(all_rewards[-len(_valid_q)*args.group_size:])) if all_rewards else 0.0
@@ -2175,6 +2177,19 @@ def main() -> None:
                 _q_wins[_key] += sum(1 for r in rewards if r > _group_median)
 
             # --- GRPO loss (IS clip + optional KL penalty) + immediate backward ---
+            # Skip near-uniform groups early: when reward std < 0.02 (on a [0,1]
+            # scale) all advantages collapse to ~0 and the gradient contribution
+            # is negligible — equivalent to wasted compute. This is a stricter
+            # guard than the eps=1e-8 inside grpo_loss_for_group, which only
+            # catches exactly-equal rewards (e.g. all 0.998 passes through it).
+            _reward_std = float(np.std(rewards))
+            if _reward_std < 0.02:
+                skipped += 1
+                _skipped_zero_var += 1
+                _pf_zv: Dict = dict(mean_r=f"{np.mean(rewards):.3f}", skip=skipped, loss="0var")
+                pbar.set_postfix(**_pf_zv)
+                continue
+
             group_loss = grpo_loss_for_group(
                 model=model,
                 input_ids_list=input_ids_list,
