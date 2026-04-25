@@ -20,3 +20,7 @@ report
 # Core dumps from interrupted native processes
 core
 core.*
+
+*.agents
+*AGENTS.md
+*.DS_Store
