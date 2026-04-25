@@ -212,12 +212,20 @@ python -u scripts/run_grpo_training.py \
     --warmup-iters 8 \
     --min-lr-ratio 0.1 \
     --difficulty-alpha 3.0 \
-    --self-play-ratio 0.30 \
+    --self-play-ratio 0.70 \
     --math-mix-ratio 0.3 \
     --math-mix-ratio-late 0.5 \
     --math-ramp-start 15 \
     --math-max-difficulty 3 \
     --overlong-filter \
+    --min-warmup 10 \
+    --selfplay-gt-thresh 0.55 \
+    --selfplay-grounded-thresh 0.60 \
+    --selfplay-step-thresh 0.65 \
+    --selfplay-ramp-iters 20 \
+    --grounded-floor 0.50 \
+    --extractor-model Qwen/Qwen2.5-0.5B-Instruct \
+    --extraction-cache data/extraction_cache.json \
     --eval-every 5 \
     --eval-max-samples 100 \
     --eval-max-new-tokens 400 \

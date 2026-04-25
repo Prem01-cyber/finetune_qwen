@@ -95,6 +95,7 @@ class CurriculumMathEnvironment:
         top_p: float = 0.9,
         consensus_temperature: float = 0.7,
         device: Optional[torch.device] = None,
+        unified_accuracy_calc: Optional[Any] = None,
     ):
         # ── Core model attributes (used by generation helpers) ───────────
         self.policy = policy_model
@@ -129,6 +130,12 @@ class CurriculumMathEnvironment:
         # will cause compute_reward/compute_grounded_reward to raise at
         # call time — GRPO training always supplies the PRM.
         self.prm_scorer = prm_scorer
+        # Unified accuracy calculator — activated on Phase 2+ transition.
+        # When use_chain_scoring is True, chain_integrity_score from this
+        # calculator replaces PRM-based process_score in both grounded and
+        # self-play reward paths.
+        self.unified_accuracy_calc: Optional[Any] = unified_accuracy_calc
+        self.use_chain_scoring: bool = False
         self.expert_panel = SimulatedExpertPanel()
         self.replay_buffer = GenerationalReplayBuffer(max_size=500)
         self.quality_filter = QualityFilter(novelty_threshold=0.5)
@@ -380,6 +387,7 @@ class CurriculumMathEnvironment:
             solution_reward = 0.0
             _sp_lccp = 0.0
             sol_valid = False
+            _sp_chain_integrity: Optional[float] = None
             logger.info(
                 "PRM degraded (%s); sol_reward set to 0.0 (format=%.2f).",
                 prm_result.get("degraded_reason", "unknown"),
@@ -404,6 +412,24 @@ class CurriculumMathEnvironment:
                 + 0.35 * prm_mean
                 + 0.20 * _sp_lccp
             )
+            # Phase 2+ chain scoring: replace PRM solution blend with unified
+            # chain integrity + dependency consistency.  This also populates the
+            # question_score from the unified calculator so the Q/Sol weighting
+            # below uses chain-verified signals instead of PRM proxies.
+            _sp_chain_integrity = None
+            if self.use_chain_scoring and self.unified_accuracy_calc is not None:
+                try:
+                    _sp_report = self.unified_accuracy_calc.compute(
+                        solution=solution,
+                        gold_answer=None,
+                        question=question,
+                        topic=target_topic,
+                        phase="selfplay",
+                    )
+                    solution_reward = _sp_report.composite_accuracy
+                    _sp_chain_integrity = _sp_report.chain_integrity_score
+                except Exception as _sp_exc:
+                    logger.debug("Unified accuracy calc (self-play) failed: %s", _sp_exc)
             sol_valid = True
         solution_reward = max(0.0, min(1.0, solution_reward))
 
@@ -575,6 +601,8 @@ class CurriculumMathEnvironment:
                 "measured_difficulty": question_result["measured_difficulty"],
             },
             "expert_metrics": expert_adjustment,
+            # Chain scoring metrics (Phase 2+; None when use_chain_scoring=False)
+            "sp_chain_integrity_score": _sp_chain_integrity,
         }
 
     # ------------------------------------------------------------------
@@ -699,7 +727,35 @@ class CurriculumMathEnvironment:
             components_str = (
                 f"0.85×{gt_match:.2f} + 0.15×fmt({format_score:.3f})"
             )
-        combined = max(0.0, min(1.0, combined))
+
+        # Phase 2+ chain scoring: override process_score, step_accuracy, lccp,
+        # and combined with formally-verified chain integrity metrics.
+        # PRM is still called above so its scores remain logged for comparison.
+        _chain_report = None
+        if self.use_chain_scoring and self.unified_accuracy_calc is not None:
+            try:
+                _chain_report = self.unified_accuracy_calc.compute(
+                    solution=solution,
+                    gold_answer=gold_final,
+                    topic="grounded",
+                    phase="grounded",
+                )
+                process_score = _chain_report.chain_integrity_score
+                step_accuracy = _chain_report.step_arithmetic_score
+                lccp = _chain_report.lccp_score
+                combined = max(0.0, min(1.0,
+                    0.50 * gt_match + 0.30 * process_score + 0.20 * lccp
+                ))
+                components_str = (
+                    f"0.50×{gt_match:.2f} + 0.30×chain({process_score:.3f}"
+                    f"[arith={_chain_report.step_arithmetic_score:.2f},"
+                    f"dep={_chain_report.step_dependency_score:.2f}]) + "
+                    f"0.20×lccp({lccp:.3f})"
+                )
+            except Exception as _chain_exc:
+                logger.debug("Unified accuracy calc failed, keeping PRM scores: %s", _chain_exc)
+        else:
+            combined = max(0.0, min(1.0, combined))
 
         # Hard negative mining: wrong-answer solutions still get a partial signal
         # proportional to how far they got before the first error (LCCP).
@@ -743,6 +799,12 @@ class CurriculumMathEnvironment:
             "format_score":      format_score,
             "pred_final":        pred_final,
             "gold_final":        gold_final,
+            # chain scoring metrics (populated in Phase 2+, None otherwise)
+            "chain_arith_score":     _chain_report.step_arithmetic_score if _chain_report else None,
+            "chain_dep_score":       _chain_report.step_dependency_score if _chain_report else None,
+            "chain_integrity_score": _chain_report.chain_integrity_score if _chain_report else None,
+            "first_failure_step":    _chain_report.first_failure_step    if _chain_report else None,
+            "final_consistent":      _chain_report.final_answer_consistent if _chain_report else None,
         }
 
     def rollout_grounded_trajectory(self, qa_pair: Dict[str, str]) -> Trajectory:

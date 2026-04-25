@@ -340,6 +340,108 @@ def load_math_dataset(
 # Reward
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Self-play verification cascade
+# ---------------------------------------------------------------------------
+# Routes each self-play group to the right verification tool based on
+# problem type and difficulty, then gates the GRPO update on the result.
+# Returns False (→ skip group) when no tool can verify cleanly, preventing
+# circular PRM-only reward from anchoring the training signal.
+
+import re as _re
+
+_FINAL_ANSWER_RE = _re.compile(r"final answer[:\s]*([^\n]+)", _re.I)
+
+# Problem-type routing tables
+_PAL_TOPICS     = frozenset({"arithmetic", "algebra", "prealgebra", "grounded"})
+_SYMPY_TOPICS   = frozenset({
+    "number_theory", "intermediate_algebra", "precalculus",
+    "counting_and_probability",
+})
+_EXCLUDE_TOPICS = frozenset({"geometry"})  # spatial reasoning; cannot verify programmatically
+
+
+def _extract_final_answer(solution: str) -> Optional[str]:
+    """Extract the text after 'Final Answer:' from a solution string."""
+    m = _FINAL_ANSWER_RE.search(solution)
+    return m.group(1).strip() if m else None
+
+
+def _pal_eval(answer_str: str) -> Optional[float]:
+    """Tier 1: arithmetic / basic algebra via safe eval (no builtins, no names)."""
+    try:
+        val = eval(answer_str, {"__builtins__": {}}, {})  # noqa: S307
+        f = float(val)
+        return None if f != f else f  # NaN guard
+    except Exception:
+        return None
+
+
+def _sympy_eval(answer_str: str) -> Optional[float]:
+    """Tier 2: symbolic evaluation via SymPy for algebra, number theory, etc."""
+    try:
+        from sympy import sympify, N as _N  # type: ignore
+        f = float(_N(sympify(answer_str), 15))
+        return None if f != f else f  # NaN guard
+    except Exception:
+        return None
+
+
+def _verify_self_play_answer(
+    solutions: List[str],
+    target_topic: str,
+    target_difficulty: float,
+) -> bool:
+    """
+    Tiered verification cascade for self-play groups.
+
+    Returns True only when a majority of solutions agree on an answer that an
+    independent tool (PAL eval or SymPy) can verify as a finite number.
+
+    Returns False — drop this group, no gradient — when:
+      * topic is geometry (spatial reasoning, can't verify programmatically)
+      * difficulty >= 4.0 (should have been blocked at generation, guard here too)
+      * no tool can parse a consistent numerical answer
+      * fewer than half of solutions agree on the majority answer
+
+    Coverage for GSM8K + MATH:
+      GSM8K              → PAL tier, ~95%+ verified
+      MATH L1-L2 algebra → PAL + SymPy fallback, ~80% verified
+      MATH number theory / intermediate algebra → SymPy primary, ~70% verified
+      MATH geometry      → excluded entirely (~3-5% of MATH)
+      MATH L4-L5         → excluded at generation time (see call site)
+    """
+    topic = target_topic.lower().replace(" ", "_")
+
+    # Hard exclusions (guard even if called after generation-time check)
+    if topic in _EXCLUDE_TOPICS or target_difficulty >= 4.0:
+        return False
+
+    answers: List[float] = []
+    for sol in solutions:
+        raw = _extract_final_answer(sol)
+        if raw is None:
+            continue
+
+        val: Optional[float]
+        if topic in _PAL_TOPICS or target_difficulty <= 2:
+            val = _pal_eval(raw) or _sympy_eval(raw)
+        elif topic in _SYMPY_TOPICS:
+            val = _sympy_eval(raw) or _pal_eval(raw)
+        else:
+            # Unknown topic: try both
+            val = _pal_eval(raw) or _sympy_eval(raw)
+
+        if val is not None:
+            answers.append(round(val, 6))
+
+    if not answers:
+        return False  # Tier 4: cannot verify — exclude
+
+    majority = max(set(answers), key=answers.count)
+    return answers.count(majority) >= max(1, len(solutions) // 2)
+
+
 def compute_grounded_reward(
     question: str,
     solution: str,
@@ -422,6 +524,8 @@ def compute_self_play_reward(
         "clarity":        float(q_metrics_raw.get("clarity",           0.0)),
         "novelty":        float(q_metrics_raw.get("novelty_combined",  0.0)),
         "solvability":    float(q_metrics_raw.get("solvability_score", 0.0)),
+        # Chain integrity score from Phase 2+ unified calculator (None if inactive)
+        "sp_chain_integrity_score": result.get("sp_chain_integrity_score"),
     }
     return combined, q_reward, s_reward, q_metrics
 
@@ -1085,6 +1189,56 @@ def main() -> None:
              "Default 0.3 — mirrors the PPO default of 30%% grounded / 70%% self-play "
              "(inverted here because grounded is our primary accuracy signal).",
     )
+    # ── Phase-curriculum parameters ───────────────────────────────────────────
+    parser.add_argument(
+        "--min-warmup", type=int, default=10,
+        help="Minimum iterations in Phase 1 (grounded-only) before considering graduation "
+             "to Phase 2 (self-play ramp). Prevents graduating on a lucky early batch. "
+             "Default 10.",
+    )
+    parser.add_argument(
+        "--selfplay-gt-thresh", type=float, default=0.55,
+        help="gt_match_rate threshold required to graduate from Phase 1 to Phase 2. "
+             "Measures raw answer correctness (SymPy exact match), not reward-gamed "
+             "combined_score. Default 0.55.",
+    )
+    parser.add_argument(
+        "--selfplay-grounded-thresh", type=float, default=0.60,
+        help="grounded_accuracy (combined_score > 0.5) threshold for Phase 1 graduation. "
+             "Default 0.60.",
+    )
+    parser.add_argument(
+        "--selfplay-step-thresh", type=float, default=0.65,
+        help="step_accuracy (PRM steps rated > 0.5) threshold for Phase 1 graduation. "
+             "Ensures the model has learned clean step format before entering self-play. "
+             "Default 0.65.",
+    )
+    parser.add_argument(
+        "--selfplay-ramp-iters", type=int, default=20,
+        help="Number of iterations to ramp self-play ratio from ~0%% to --self-play-ratio "
+             "(Phase 2). Grounded anchor stays at ≥30%% throughout. Default 20.",
+    )
+    parser.add_argument(
+        "--grounded-floor", type=float, default=0.50,
+        help="Minimum gt_match_rate to maintain during Phase 3. If it falls below this "
+             "value, self-play is suspended until grounded performance recovers. "
+             "Should be slightly below --selfplay-gt-thresh. Default 0.50.",
+    )
+    # ── Unified accuracy calculator parameters ────────────────────────────────
+    parser.add_argument(
+        "--extractor-model", default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="Small model used for step chain extraction in the unified accuracy "
+             "calculator (Phase 2+). Loaded in 4-bit to minimise VRAM. "
+             "Default Qwen/Qwen2.5-0.5B-Instruct.",
+    )
+    parser.add_argument(
+        "--extraction-cache", default=None,
+        help="Path to a pre-built JSON extraction cache from "
+             "scripts/precompute_extraction_cache.py. When provided, grounded-data "
+             "extractions are served from cache instead of calling the extractor LLM "
+             "at training time. Only novel self-play solutions require live extraction. "
+             "Default None (extraction always uses the LLM).",
+    )
     args = parser.parse_args()
 
     # ── Run identity ─────────────────────────────────────────────────────────
@@ -1405,6 +1559,24 @@ def main() -> None:
     # Build a minimal math_env just for its reward utilities (compute_grounded_reward).
     # value_model=None is safe: it's only stored as self.value and never invoked on
     # the grounded-reward path, so GRPO avoids the ~3 GB ValueHead backbone entirely.
+    from src.rl.unified_accuracy import StepChainExtractor, UnifiedAccuracyCalculator
+    _extractor = StepChainExtractor(
+        model_name=args.extractor_model,
+        device=str(device),
+        cache_path=args.extraction_cache,
+    )
+    _unified_calc = UnifiedAccuracyCalculator(extractor=_extractor, question_evaluator=None)
+    logger.info(
+        "Unified accuracy calculator ready (extractor=%s, cache=%s)",
+        args.extractor_model,
+        args.extraction_cache or "none",
+    )
+    # Eagerly load the extractor model now to avoid a 30–60 s stall on the
+    # first training iteration that triggers live (non-cached) extraction.
+    logger.info("Warming up step-chain extractor (eager load)...")
+    _extractor.warmup()
+    logger.info("Extractor warmup complete")
+
     math_env = CurriculumMathEnvironment(
         policy_model=model,
         value_model=None,
@@ -1417,7 +1589,10 @@ def main() -> None:
         prm_scorer=prm,
         max_solution_tokens=args.max_new_tokens,
         device=device,
+        unified_accuracy_calc=_unified_calc,
     )
+    # Wire the question_evaluator into the unified calc after math_env is available
+    _unified_calc.question_evaluator = math_env.question_evaluator
 
     # ── Difficulty-adaptive sampling state ───────────────────────────────────
     # Track per-question win-rate.  Questions where the model scores correctly
@@ -1495,6 +1670,42 @@ def main() -> None:
         best_combined = 0.0
         best_prm_mean = 0.0
 
+    # ── Training curriculum phase FSM ────────────────────────────────────────
+    # Phase 1 — GROUNDED_ONLY: self-play ratio is forced to 0 until the model
+    #   has established reliable answer correctness (gt_match_rate) and step
+    #   quality (step_accuracy) on grounded data.
+    # Phase 2 — SELFPLAY_RAMP: self-play ratio ramps from ~0 → self_play_ratio
+    #   ceiling over selfplay_ramp_iters, keeping ≥30% grounded as an anchor.
+    # Phase 3 — CONTINUOUS: ratio holds at ceiling; grounded floor is monitored
+    #   and self-play is suspended whenever gt_match_rate drops below the floor.
+    from enum import Enum, auto as _auto
+
+    class _Phase(Enum):
+        GROUNDED_ONLY = _auto()
+        SELFPLAY_RAMP = _auto()
+        CONTINUOUS    = _auto()
+
+    _phase: _Phase = _Phase.GROUNDED_ONLY
+    _selfplay_iterations: int = 0    # iterations spent in Phase 2+
+    _selfplay_suspended: bool = False
+    _effective_sp_ratio: float = 0.0  # computed each iteration from phase
+
+    # ── Chain scoring calibration state ──────────────────────────────────────
+    # During Phase 2 SELFPLAY_RAMP the extractor runs in shadow mode (computing
+    # scores but NOT affecting rewards) to build a rolling calibration window.
+    # use_chain_scoring only flips True when both the chain↔PRM correlation AND
+    # the extraction success rate cross their thresholds — a data-driven gate,
+    # not a schedule-driven one.
+    _use_chain_as_primary: bool = False     # True once calibration passes
+    _chain_prm_correlation: float = 0.0    # rolling Pearson r (chain vs PRM)
+    _extraction_success_rate: float = 0.0  # rolling extraction success fraction
+    # Cross-iteration rolling window (up to 200 paired samples)
+    _rolling_chain_scores:  List[float] = []
+    _rolling_prm_scores:    List[float] = []
+    _rolling_successes:     List[int]   = []   # 1 = successful extraction, 0 = failed
+    _CALIB_WINDOW = 50    # minimum samples before computing correlation
+    _CALIB_MAX    = 200   # cap rolling lists at this length
+
     # ── Training ─────────────────────────────────────────────────────────────
     for iteration in range(1, args.num_iterations + 1):
         iter_start = time.perf_counter()
@@ -1546,6 +1757,13 @@ def main() -> None:
         _sp_rewards:         List[float] = []
         _grounded_step_accs: List[float] = []
         _grounded_lccps:     List[float] = []
+        _grounded_gt_matches: List[bool] = []
+        # Chain scoring accumulators (populated only in Phase 2+ when
+        # math_env.use_chain_scoring is True)
+        _chain_arith_scores:     List[float] = []
+        _chain_dep_scores:       List[float] = []
+        _chain_integrity_scores: List[float] = []
+        _sp_chain_scores:        List[float] = []   # self-play chain integrity
         _skipped_zero_var:   int = 0   # groups skipped due to zero reward variance
         # Per-component question quality accumulators
         _qc_topic:      List[float] = []
@@ -1564,7 +1782,21 @@ def main() -> None:
 
         # Determine how many of this iteration's groups use self-play question
         # generation vs grounded (dataset) questions.
-        n_self_play_target = int(round(len(questions_batch) * args.self_play_ratio))
+        # Phase-driven ratio: Phase 1 forces 0; Phase 2 ramps from 0 to ceiling;
+        # Phase 3 holds at ceiling (args.self_play_ratio). Grounded floor recovery
+        # (computed at end of previous iteration) overrides to 0 regardless of phase.
+        if _phase == _Phase.GROUNDED_ONLY:
+            _effective_sp_ratio = 0.0
+        elif _phase == _Phase.SELFPLAY_RAMP:
+            _grounded_anchor = max(0.30, 1.0 - (_selfplay_iterations / max(1, args.selfplay_ramp_iters)))
+            _effective_sp_ratio = 1.0 - _grounded_anchor
+        else:  # CONTINUOUS
+            _effective_sp_ratio = args.self_play_ratio
+
+        if _selfplay_suspended:
+            _effective_sp_ratio = 0.0   # grounded floor recovery pass
+
+        n_self_play_target = int(round(len(questions_batch) * _effective_sp_ratio))
 
         # Build a random set of group indices that will use self-play.
         # Random interleaving distributes self-play uniformly across the batch
@@ -1594,6 +1826,12 @@ def main() -> None:
                 # ── SELF-PLAY BRANCH ─────────────────────────────────────────
                 # 1. Sample a curriculum instruction (topic + difficulty target)
                 instruction, target_topic, target_difficulty = math_env.sample_instruction()
+
+                # MATH L4-L5: exclude from self-play generation — problems at this
+                # difficulty produce unanchored reward because the verification
+                # cascade cannot reliably confirm answers.  Fall back to grounded.
+                if target_difficulty >= 4.0:
+                    use_self_play = False
 
                 # 2. Model generates the question from the instruction.
                 #    This is the "proposer" role in Theme #4 self-improvement:
@@ -1842,6 +2080,10 @@ def main() -> None:
                     _qc_clarity.append(q_met["clarity"])
                     _qc_novelty.append(q_met["novelty"])
                     _qc_solvability.append(q_met["solvability"])
+                    # Self-play chain integrity (Phase 2+ only; None in Phase 1)
+                    _sp_ci = q_met.get("sp_chain_integrity_score")
+                    if _sp_ci is not None:
+                        _sp_chain_scores.append(float(_sp_ci))
                 else:
                     r_dict = compute_grounded_reward(
                         question=question,
@@ -1852,6 +2094,41 @@ def main() -> None:
                     r = r_dict["combined_score"]
                     _grounded_step_accs.append(r_dict["step_accuracy"])
                     _grounded_lccps.append(r_dict["lccp"])
+                    _grounded_gt_matches.append(bool(r_dict["gt_match"]))
+                    if r_dict.get("chain_arith_score") is not None:
+                        _chain_arith_scores.append(float(r_dict["chain_arith_score"]))
+                    if r_dict.get("chain_dep_score") is not None:
+                        _chain_dep_scores.append(float(r_dict["chain_dep_score"]))
+                    if r_dict.get("chain_integrity_score") is not None:
+                        _chain_integrity_scores.append(float(r_dict["chain_integrity_score"]))
+
+                    # Shadow extraction for calibration: during SELFPLAY_RAMP,
+                    # run the chain extractor even before use_chain_scoring is
+                    # activated so we can measure chain↔PRM correlation.  These
+                    # scores do NOT affect the reward — they only feed the
+                    # calibration window that decides when to flip use_chain_scoring.
+                    if (
+                        _phase == _Phase.SELFPLAY_RAMP
+                        and not _use_chain_as_primary
+                        and _unified_calc is not None
+                    ):
+                        _prm_ps = (
+                            0.60 * r_dict.get("prm_final_score", 0.0)
+                            + 0.40 * r_dict.get("prm_mean_score", 0.0)
+                        )
+                        try:
+                            _shadow = _unified_calc.compute(
+                                solution=sol,
+                                gold_answer=gold,
+                                question=question,
+                                topic=target_topic,
+                                phase="grounded",
+                            )
+                            _rolling_chain_scores.append(_shadow.chain_integrity_score)
+                            _rolling_prm_scores.append(_prm_ps)
+                            _rolling_successes.append(1 if _shadow.extraction_succeeded else 0)
+                        except Exception:
+                            _rolling_successes.append(0)
                 rewards.append(r)
             all_rewards.extend(rewards)
             # Route to path-specific accumulators for separate batch_acc reporting
@@ -1866,6 +2143,15 @@ def main() -> None:
             if use_self_play and _sp_q_rew_this_group:
                 if float(np.mean(_sp_q_rew_this_group)) > 0.5:
                     q_quality_good += 1
+
+            # --- PAL/SymPy verification gate (self-play only) ---
+            # Drop the group if the tiered cascade cannot confirm a consistent,
+            # independently-verifiable answer.  This prevents circular PRM reward
+            # from being the sole correctness anchor on self-play examples.
+            if use_self_play:
+                if not _verify_self_play_answer(solutions, target_topic, target_difficulty):
+                    skipped += 1
+                    continue  # no gradient for this group
 
             # --- Update difficulty stats (grounded questions only — self-play
             #     questions are ephemeral and have no stable key) ---
@@ -1956,6 +2242,113 @@ def main() -> None:
         )
         mean_q_r = float(np.mean(all_q_rewards)) if all_q_rewards else 0.0
 
+        # Chain scoring batch means (non-None only in Phase 2+)
+        mean_chain_arith     = float(np.mean(_chain_arith_scores))     if _chain_arith_scores     else None
+        mean_chain_dep       = float(np.mean(_chain_dep_scores))       if _chain_dep_scores       else None
+        mean_chain_integrity = float(np.mean(_chain_integrity_scores)) if _chain_integrity_scores else None
+        mean_sp_chain        = float(np.mean(_sp_chain_scores))        if _sp_chain_scores        else None
+
+        # ── gt_match_rate: raw answer-correctness on grounded examples ────────
+        # This is the primary Phase-1 graduation signal — unlike grounded_acc_r
+        # which is (combined_score > 0.5), gt_match_rate is the direct SymPy
+        # exact-match fraction and cannot be gamed by a high PRM/format score.
+        gt_match_rate = (
+            float(sum(_grounded_gt_matches) / len(_grounded_gt_matches))
+            if _grounded_gt_matches else 0.0
+        )
+
+        # ── Phase FSM transitions ─────────────────────────────────────────────
+        if _phase == _Phase.GROUNDED_ONLY:
+            _graduation_ready = (
+                gt_match_rate    >= args.selfplay_gt_thresh
+                and grounded_acc_r >= args.selfplay_grounded_thresh
+                and mean_step_acc  >= args.selfplay_step_thresh
+                and iteration      >= args.min_warmup
+            )
+            if _graduation_ready:
+                _phase = _Phase.SELFPLAY_RAMP
+                logger.info(
+                    "PHASE → SELFPLAY_RAMP at iter %d "
+                    "(gt_match=%.2f grounded_acc=%.2f step_acc=%.2f) — "
+                    "shadow extraction active; chain scoring deferred until "
+                    "calibration passes (corr≥0.70, success_rate≥0.80)",
+                    iteration, gt_match_rate, grounded_acc_r, mean_step_acc,
+                )
+                # NOTE: do NOT set math_env.use_chain_scoring = True here.
+                # The extractor runs in shadow mode first; use_chain_scoring
+                # flips to True below once calibration thresholds are met.
+        elif _phase in (_Phase.SELFPLAY_RAMP, _Phase.CONTINUOUS):
+            _selfplay_iterations += 1
+            if _phase == _Phase.SELFPLAY_RAMP and _selfplay_iterations >= args.selfplay_ramp_iters:
+                _phase = _Phase.CONTINUOUS
+                logger.info(
+                    "PHASE → CONTINUOUS at iter %d (ramp complete after %d iters)",
+                    iteration, _selfplay_iterations,
+                )
+
+            # ── Data-driven chain scoring activation ─────────────────────────
+            # Trim rolling window to _CALIB_MAX before computing correlation.
+            if len(_rolling_chain_scores) > _CALIB_MAX:
+                _rolling_chain_scores = _rolling_chain_scores[-_CALIB_MAX:]
+                _rolling_prm_scores   = _rolling_prm_scores[-_CALIB_MAX:]
+                _rolling_successes    = _rolling_successes[-_CALIB_MAX:]
+
+            if not _use_chain_as_primary and len(_rolling_chain_scores) >= _CALIB_WINDOW:
+                from scipy.stats import pearsonr  # noqa: PLC0415
+                try:
+                    _r, _ = pearsonr(
+                        _rolling_chain_scores[-_CALIB_WINDOW:],
+                        _rolling_prm_scores[-_CALIB_WINDOW:],
+                    )
+                    _chain_prm_correlation = float(_r)
+                except Exception:
+                    _chain_prm_correlation = 0.0
+                _rolling_n = len(_rolling_successes[-_CALIB_WINDOW:])
+                _extraction_success_rate = (
+                    sum(_rolling_successes[-_CALIB_WINDOW:]) / _rolling_n
+                    if _rolling_n > 0 else 0.0
+                )
+                if (
+                    _chain_prm_correlation >= 0.70
+                    and _extraction_success_rate >= 0.80
+                ):
+                    _use_chain_as_primary = True
+                    math_env.use_chain_scoring = True
+                    logger.info(
+                        "CHAIN PRIMARY activated at iter %d: "
+                        "corr=%.2f extraction_rate=%.2f (window=%d) — "
+                        "unified calculator now drives reward scoring",
+                        iteration, _chain_prm_correlation,
+                        _extraction_success_rate, _CALIB_WINDOW,
+                    )
+                else:
+                    logger.debug(
+                        "Chain calibration: corr=%.2f success_rate=%.2f "
+                        "(need corr≥0.70, success≥0.80; window=%d/%d)",
+                        _chain_prm_correlation, _extraction_success_rate,
+                        len(_rolling_chain_scores), _CALIB_WINDOW,
+                    )
+
+            # Grounded floor monitoring: suspend self-play if answer correctness
+            # drops below the floor set at graduation minus 5pp.  Self-play
+            # resumes automatically next iteration if performance recovers.
+            _prev_suspended = _selfplay_suspended
+            _selfplay_suspended = (
+                bool(_grounded_gt_matches) and gt_match_rate < args.grounded_floor
+            )
+            if _selfplay_suspended and not _prev_suspended:
+                logger.warning(
+                    "GROUNDED FLOOR: gt_match_rate=%.2f fell below floor=%.2f — "
+                    "suspending self-play for recovery",
+                    gt_match_rate, args.grounded_floor,
+                )
+            elif not _selfplay_suspended and _prev_suspended:
+                logger.info(
+                    "GROUNDED FLOOR: gt_match_rate=%.2f recovered above floor=%.2f — "
+                    "resuming self-play",
+                    gt_match_rate, args.grounded_floor,
+                )
+
         # Question generation accuracy metrics (self-play only)
         q_gen_valid_rate = (q_gen_valid   / q_gen_attempts)  if q_gen_attempts  > 0 else 0.0
         q_quality_rate   = (q_quality_good / n_self_play)    if n_self_play     > 0 else 0.0
@@ -1971,13 +2364,16 @@ def main() -> None:
         # ── Primary summary line ─────────────────────────────────────────────
         logger.info(
             "Iter %d | loss=%.4f | reward mean=%.3f std=%.3f | "
-            "grounded_acc=%.1f%% | step_acc=%.1f%% | lccp=%.1f%% | batch_acc=%.1f%% | "
+            "gt_match=%.1f%% | grounded_acc=%.1f%% | step_acc=%.1f%% | lccp=%.1f%% | "
+            "batch_acc=%.1f%% | phase=%s sp_ratio=%.0f%% | "
             "groups=%d skipped=%d(0var=%d) | lr=%.2e | %.1fs",
             iteration, loss_val, mean_r, std_r,
+            100 * gt_match_rate,
             100 * grounded_acc_r,
             100 * mean_step_acc,
             100 * mean_lccp,
             100 * acc_r,
+            _phase.name, 100 * _effective_sp_ratio,
             n_groups, skipped, _skipped_zero_var, _cur_lr, iter_time,
         )
         # Starvation warning: if >30% of groups were skipped due to zero reward
@@ -2013,12 +2409,26 @@ def main() -> None:
             "std_reward":            std_r,
             "batch_accuracy":        acc_r,
             "grounded_accuracy":     grounded_acc_r,
+            "gt_match_rate":         round(gt_match_rate, 4),
             "step_accuracy":         mean_step_acc,
             "lccp":                  mean_lccp,
             "n_groups":              n_groups,
             "skipped_groups":        skipped,
             "learning_rate":         _cur_lr,
             "iter_time_s":           iter_time,
+            # ── Phase curriculum metrics ────────────────────────────────────
+            "training_phase":        _phase.name,
+            "effective_sp_ratio":    round(_effective_sp_ratio, 3),
+            "selfplay_suspended":    int(_selfplay_suspended),
+            # ── Chain scoring metrics (Phase 2+, None in Phase 1) ────────────
+            "chain_arith_score":       round(mean_chain_arith, 4)     if mean_chain_arith     is not None else None,
+            "chain_dep_score":         round(mean_chain_dep, 4)       if mean_chain_dep       is not None else None,
+            "chain_integrity_score":   round(mean_chain_integrity, 4) if mean_chain_integrity is not None else None,
+            "sp_chain_integrity_score": round(mean_sp_chain, 4)       if mean_sp_chain        is not None else None,
+            # ── Chain calibration metrics (populated during SELFPLAY_RAMP shadow mode)
+            "chain_prm_correlation":   round(_chain_prm_correlation, 3),
+            "extraction_success_rate": round(_extraction_success_rate, 3),
+            "chain_scoring_active":    int(_use_chain_as_primary),
             # ── Question-generation metrics ─────────────────────────────────
             "n_self_play_groups":    n_self_play,
             "q_gen_attempts":        q_gen_attempts,
