@@ -865,9 +865,11 @@ def main() -> None:
     parser.add_argument("--eval-max-samples", type=int, default=250)
     parser.add_argument("--eval-max-new-tokens", type=int, default=512)
     parser.add_argument(
-        "--eval-pass-at-k", type=int, default=4,
+        "--eval-pass-at-k", type=int, default=0,
         help="Number of sampled solutions per eval problem for pass@k (0 to disable). "
-             "Makes eval directly comparable to training batch_acc (both K samples at T=0.8).",
+             "Makes eval directly comparable to training batch_acc (both K samples at T=0.8). "
+             "Disabled by default — enable with e.g. --eval-pass-at-k 4 for demo runs only "
+             "(adds K×eval_samples extra forward passes).",
     )
     parser.add_argument("--use-prm", dest="use_prm", action="store_true", default=True)
     parser.add_argument("--no-prm", dest="use_prm", action="store_false")

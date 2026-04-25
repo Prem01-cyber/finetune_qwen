@@ -201,8 +201,9 @@ python -u scripts/run_grpo_training.py \
     --math-max-difficulty 3 \
     --overlong-filter \
     --eval-every 5 \
-    --eval-max-samples 250 \
-    --eval-max-new-tokens 512 \
+    --eval-max-samples 100 \
+    --eval-max-new-tokens 400 \
+    --eval-pass-at-k 0 \
     --save-every 5 \
     --keep-last 3 \
     --use-prm \
