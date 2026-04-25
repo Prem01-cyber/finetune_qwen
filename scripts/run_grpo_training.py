@@ -643,8 +643,8 @@ def generate_questions_batched(
         questions       : K_q decoded question strings
         input_ids_list  : K_q full (prompt+response) token ID tensors
         response_masks  : K_q bool masks (True = non-pad response token)
-        old_log_probs   : K_q scalar tensors (sum log π_old over response),
-                          no_grad — used as denominator in IS ratio.
+        old_log_probs   : K_q 1D tensors (log π_old for each response token),
+                          no_grad — used for IS clip ratio in the loss.
     """
     messages = create_generator_messages(instruction)
     try:
@@ -726,8 +726,8 @@ def generate_questions_batched(
             ]
             resp_lps = lp_tokens[shift_mask]
             old_log_probs.append(
-                resp_lps.sum().detach() if resp_lps.numel() > 0
-                else torch.tensor(0.0, device=device)
+                resp_lps.detach() if resp_lps.numel() > 0
+                else torch.empty(0, device=device)
             )
 
     return questions, input_ids_list, response_masks, old_log_probs
