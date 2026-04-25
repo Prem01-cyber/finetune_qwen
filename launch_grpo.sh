@@ -218,7 +218,7 @@ python -u scripts/run_grpo_training.py \
     --math-ramp-start 15 \
     --math-max-difficulty 3 \
     --overlong-filter \
-    --min-warmup 10 \
+    --min-warmup 8 \
     --selfplay-gt-thresh 0.55 \
     --selfplay-grounded-thresh 0.60 \
     --selfplay-step-thresh 0.65 \
