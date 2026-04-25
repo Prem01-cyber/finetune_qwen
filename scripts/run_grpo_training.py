@@ -363,6 +363,7 @@ def compute_grounded_reward(
     return {
         "combined_score":  float(result.get("combined_score",  0.0)),
         "step_accuracy":   float(result.get("step_accuracy",   0.0)),
+        "lccp":            float(result.get("lccp",            0.0)),
         "prm_mean_score":  float(result.get("prm_mean_score",  0.0)),
         "prm_final_score": float(result.get("prm_final_score", 0.0)),
         "gt_match":        bool(result.get("gt_match",         False)),
@@ -752,6 +753,7 @@ def _log_eval_result(label: str, res: Dict, best: Optional[float]) -> None:
     cs      = float(res.get("combined_score",  0.0))
     cr      = float(res.get("correct_rate",    0.0))
     step_a  = float(res.get("step_accuracy",   0.0))
+    lccp    = float(res.get("lccp",            0.0))
     prm     = float(res.get("prm_mean",        0.0))
     prm_fin = float(res.get("prm_final",       0.0))
     fmt     = float(res.get("format_mean",     0.0))
@@ -774,8 +776,13 @@ def _log_eval_result(label: str, res: Dict, best: Optional[float]) -> None:
         prm, prm_fin, 0.60 * prm_fin + 0.40 * prm,
     )
     logger.info(
-        "  Step accuracy : %.1f%%  ← fraction of reasoning steps PRM rates correct (>0.5)",
+        "  Step accuracy : %.1f%%  (bag-of-steps: fraction of steps PRM >0.5)",
         100 * step_a,
+    )
+    logger.info(
+        "  Chain integrity (LCCP): %.1f%%  ← fraction of steps before first failure\n"
+        "    [LCCP=100%% → all steps correct; LCCP=0%% → first step wrong]",
+        100 * lccp,
     )
     if pak is not None:
         logger.info(
@@ -1377,7 +1384,8 @@ def main() -> None:
         all_q_rewards: List[float] = []
         _grounded_rewards:   List[float] = []
         _sp_rewards:         List[float] = []
-        _grounded_step_accs: List[float] = []   # step_accuracy from grounded rollouts
+        _grounded_step_accs: List[float] = []
+        _grounded_lccps:     List[float] = []   # chain integrity per grounded rollout
         # Per-component question quality accumulators
         _qc_topic:      List[float] = []
         _qc_diff:       List[float] = []
@@ -1526,6 +1534,7 @@ def main() -> None:
                     )
                     r = r_dict["combined_score"]
                     _grounded_step_accs.append(r_dict["step_accuracy"])
+                    _grounded_lccps.append(r_dict["lccp"])
                 rewards.append(r)
             all_rewards.extend(rewards)
             # Route to path-specific accumulators for separate batch_acc reporting
@@ -1618,6 +1627,10 @@ def main() -> None:
             float(np.mean(_grounded_step_accs))
             if _grounded_step_accs else 0.0
         )
+        mean_lccp = (
+            float(np.mean(_grounded_lccps))
+            if _grounded_lccps else 0.0
+        )
         mean_q_r = float(np.mean(all_q_rewards)) if all_q_rewards else 0.0
 
         # Question generation accuracy metrics (self-play only)
@@ -1635,12 +1648,13 @@ def main() -> None:
         # ── Primary summary line ─────────────────────────────────────────────
         logger.info(
             "Iter %d | loss=%.4f | reward mean=%.3f std=%.3f | "
-            "grounded_acc=%.1f%% | step_acc=%.1f%% | batch_acc=%.1f%% | "
+            "grounded_acc=%.1f%% | step_acc=%.1f%% | lccp=%.1f%% | batch_acc=%.1f%% | "
             "groups=%d skipped=%d | lr=%.2e | %.1fs",
             iteration, loss_val, mean_r, std_r,
-            100 * grounded_acc_r,  # grounded final-answer pass rate
-            100 * mean_step_acc,   # fraction of reasoning steps rated correct by PRM
-            100 * acc_r,           # all rollouts incl. self-play
+            100 * grounded_acc_r,
+            100 * mean_step_acc,
+            100 * mean_lccp,
+            100 * acc_r,
             n_groups, skipped, _cur_lr, iter_time,
         )
 
@@ -1664,6 +1678,7 @@ def main() -> None:
             "batch_accuracy":        acc_r,
             "grounded_accuracy":     grounded_acc_r,
             "step_accuracy":         mean_step_acc,
+            "lccp":                  mean_lccp,
             "n_groups":              n_groups,
             "skipped_groups":        skipped,
             "learning_rate":         _cur_lr,

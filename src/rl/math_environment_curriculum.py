@@ -599,12 +599,24 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
                 prm_num_steps   = int(prm_result.get("num_steps",      0))
 
         # Step accuracy: fraction of individual steps rated correct by PRM.
-        # This is the key process metric — it improves even when the final
-        # answer is still wrong, making training progress visible.
         step_accuracy = (
             sum(1.0 for s in prm_step_scores if s > 0.5) / len(prm_step_scores)
             if prm_step_scores else 0.0
         )
+
+        # Longest Correct Consecutive Prefix (LCCP): fraction of steps from
+        # the start that are ALL rated correct before the first failure.
+        # This captures chain integrity — a broken step 3 makes steps 4+ invalid
+        # regardless of their individual PRM scores.
+        # LCCP=1.0 means every step was correct (necessary condition for right answer).
+        # LCCP=0.0 means step 1 itself was wrong (model never had a valid chain).
+        if prm_step_scores:
+            first_fail = next(
+                (i for i, s in enumerate(prm_step_scores) if s <= 0.5), len(prm_step_scores)
+            )
+            lccp = first_fail / len(prm_step_scores)
+        else:
+            lccp = 0.0
 
         if self.prm_scorer is not None and not prm_degraded:
             # process_score: weight prm_final (conclusion step) more than mean
@@ -627,24 +639,28 @@ class CurriculumMathEnvironment(ConsensusMathEnvironment):
             )
         combined = max(0.0, min(1.0, combined))
 
+        _chain_depth = first_fail if prm_step_scores else 0
         logger.info(
             "Grounded reward: combined=%.3f = %s | pred=%r gold=%r | "
-            "step_acc=%.0f%% (%d/%d steps ok) n_steps=%d",
+            "step_acc=%.0f%% lccp=%.0f%% (chain=%d/%d ok_count=%d) n_steps=%d",
             combined,
             components_str,
             pred_final,
             gold_final,
             100 * step_accuracy,
-            sum(1 for s in prm_step_scores if s > 0.5),
+            100 * lccp,
+            _chain_depth,
             len(prm_step_scores),
+            sum(1 for s in prm_step_scores if s > 0.5),
             prm_num_steps,
         )
 
         return {
             "combined_score":    combined,
             "gt_match":          gt_match_bool,
-            # step-level accuracy — the key process metric
+            # process metrics
             "step_accuracy":     step_accuracy,
+            "lccp":              lccp,        # longest correct consecutive prefix ratio
             "prm_mean_score":    prm_mean,
             "prm_final_score":   prm_final,
             "prm_step_scores":   prm_step_scores,

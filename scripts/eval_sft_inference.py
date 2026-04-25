@@ -402,8 +402,9 @@ def evaluate_gsm8k(
     _combined:  list[float] = []
     _gt_match:  list[float] = []
     _prm_comp:  list[float] = []
-    _prm_final: list[float] = []   # PRM score on final reasoning step
+    _prm_final: list[float] = []
     _step_acc:  list[float] = []   # fraction of steps rated correct by PRM (>0.5)
+    _lccp:      list[float] = []   # longest correct consecutive prefix ratio
     _sympy_comp:list[float] = []
     _fmt_comp:  list[float] = []
 
@@ -473,6 +474,7 @@ def evaluate_gsm8k(
                 _prm_comp.append(float(r.get("prm_mean_score",   0.0)))
                 _prm_final.append(float(r.get("prm_final_score", 0.0)))
                 _step_acc.append(float(r.get("step_accuracy",    0.0)))
+                _lccp.append(float(r.get("lccp",                 0.0)))
                 _sympy_comp.append(float(r.get("sympy_score",    0.0)))
                 _fmt_comp.append(float(r.get("format_score",     0.0)))
             except Exception as rfn_exc:
@@ -485,7 +487,7 @@ def evaluate_gsm8k(
                 score=f"{sum(_combined) / len(_combined):.3f}",
                 correct=f"{sum(_gt_match):.0f}/{len(_combined)}",
                 step_acc=f"{sum(_step_acc)/len(_step_acc):.1%}" if _step_acc else "—",
-                pak=f"{sum(_pak_any_correct)/len(_pak_any_correct):.1%}" if _pak_any_correct else "—",
+                lccp=f"{sum(_lccp)/len(_lccp):.1%}" if _lccp else "—",
             )
         else:
             _pf = dict(acc=f"{correct / done:.1%}", correct=f"{correct}/{done}")
@@ -505,8 +507,9 @@ def evaluate_gsm8k(
             # Formula: 0.50×correct + 0.40×process(prm_final, prm_mean) + 0.10×format
             "accuracy":       combined_score,
             "combined_score": combined_score,
-            # PROCESS metric — improves before correct_rate does
+            # PROCESS metrics — improve before correct_rate does
             "step_accuracy":  _avg(_step_acc),
+            "lccp":           _avg(_lccp),   # chain integrity: how far into solution stays correct
             # Answer correctness
             "correct_rate":   _avg(_gt_match),
             # PRM components
