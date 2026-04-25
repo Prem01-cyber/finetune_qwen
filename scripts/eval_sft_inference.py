@@ -53,23 +53,6 @@ from src.config.prompts import create_solver_messages
 from src.sft.solution_format import extract_final_answer_numeric_str, validate_sympy_solution_format
 from src.sft.sympy_normalize import normalize_for_parse_expr
 
-# Keep these for the standalone eval_sft_inference main() path which may be
-# called without the training process context.  The GRPO loop uses
-# create_solver_messages (below) so prompts are identical to training.
-SOLVER_SYSTEM_PROMPT = (
-    "You are a step-by-step math solver. "
-    "Solve the given problem one step at a time. "
-    "Each step must be on its own line, starting with 'Step N:'. "
-    "End with a line starting with 'Final Answer:'. "
-    "Write every mathematical expression in Python/SymPy syntax "
-    "so it can be verified programmatically."
-)
-
-USER_WRAPPER = (
-    "Solve the following problem. Show your reasoning as numbered steps, "
-    "then give the final numeric answer on the last line.\n\nProblem:\n{question}"
-)
-
 
 @dataclass
 class EvalRow:
