@@ -353,10 +353,17 @@ def evaluate_gsm8k(
                 if not line:
                     continue
                 obj = json.loads(line)
-                if "question" in obj and "answer" in obj:
+                if "question" in obj and "gold_final" in obj and obj["gold_final"]:
+                    # Pre-extracted format (our gsm8k_test.jsonl)
+                    rows.append({"question": obj["question"].strip(), "gold_final": obj["gold_final"].strip()})
+                elif "question" in obj and "answer" in obj:
                     _, final = parse_gsm8k_answer(obj["answer"])
-                    rows.append({"question": obj["question"].strip(), "gold_final": final})
+                    if final:
+                        rows.append({"question": obj["question"].strip(), "gold_final": final})
                 elif "messages" in obj:
+                    task_type = obj.get("task_type", "solve")
+                    if task_type != "solve":
+                        continue   # skip question-generation entries
                     user = next(
                         (m["content"] for m in obj["messages"] if m.get("role") == "user"), ""
                     ).strip()
@@ -364,6 +371,8 @@ def evaluate_gsm8k(
                         (m["content"] for m in obj["messages"] if m.get("role") == "assistant"), ""
                     )
                     gold = extract_final_answer_numeric_str(asst) or ""
+                    if not gold:
+                        continue   # skip entries with no parseable gold answer
                     user = re.sub(r"^Solve the following problem\..*?Problem:\n", "", user, flags=re.S)
                     rows.append({"question": user.strip(), "gold_final": gold.strip()})
     else:
