@@ -229,19 +229,27 @@ class ProcessRewardScorer:
         positive_probs = sample[sample != 0].view(-1, 2)[:, 1]
         step_scores: List[float] = positive_probs.float().cpu().tolist()
 
-        # Truncation may have dropped trailing separators.  Align lengths
-        # conservatively by padding missing positions with the mean of what
-        # we did see.  Log a warning so callers know the scores are partial.
-        if len(step_scores) < len(steps) and step_scores:
-            pad_val = float(sum(step_scores) / len(step_scores))
-            n_padded = len(steps) - len(step_scores)
-            step_scores = step_scores + [pad_val] * n_padded
+        # Truncation may have dropped trailing separators.  The tail steps are
+        # precisely the ones most likely to contain the conclusion and final
+        # answer — padding them with the mean of earlier (likely correct-looking)
+        # steps inflates the score for wrong/truncated solutions and produces
+        # false-positive training signal.
+        #
+        # Policy: if any steps are missing we mark the result as degraded=True
+        # so the caller (compute_grounded_reward / _compute_reward_with_prm)
+        # falls back to the degraded path (reward=0 or binary only).  We still
+        # store the partial step_scores for diagnostic logging.
+        _truncated = False
+        if len(step_scores) < len(steps):
+            n_missing = len(steps) - len(step_scores)
             logger.warning(
-                "PRM: %d/%d steps scored; %d tail step(s) padded with mean=%.3f "
-                "(sequence likely truncated at %d tokens).",
-                len(step_scores) - n_padded, len(steps), n_padded, pad_val,
+                "PRM: %d/%d steps scored; %d tail step(s) missing "
+                "(sequence likely truncated at %d tokens). "
+                "Marking result as degraded to avoid inflated scores.",
+                len(step_scores), len(steps), n_missing,
                 self.max_input_tokens,
             )
+            _truncated = True
         elif len(step_scores) > len(steps):
             step_scores = step_scores[: len(steps)]
 
@@ -266,8 +274,13 @@ class ProcessRewardScorer:
             "mean_score": mean_score,
             "min_score": min_score,
             "final_score": final_score,
-            "degraded": False,
-            "padded_steps": len(step_scores) < len(steps),  # True if tail was padded
+            # degraded=True when the sequence was truncated: tail steps (the most
+            # critical ones for answer correctness) were not scored by the PRM.
+            "degraded": _truncated,
+            "degraded_reason": (
+                f"sequence truncated at {self.max_input_tokens} tokens; "
+                f"{len(steps) - len(step_scores)} tail step(s) unscored"
+            ) if _truncated else None,
         }
 
     @torch.no_grad()

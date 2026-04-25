@@ -184,7 +184,7 @@ def load_gsm8k(path: str) -> List[Dict[str, str]]:
                 gold = answer_str.strip()
 
             if question and gold:
-                pairs.append({"question": question, "gold_final": gold})
+                pairs.append({"question": question, "gold_final": gold, "topic": "arithmetic", "difficulty": 2})
     logger.info("Loaded %d GSM8K QA pairs from %s", len(pairs), path)
     return pairs
 
@@ -194,19 +194,46 @@ def load_gsm8k(path: str) -> List[Dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 def _extract_boxed(text: str) -> Optional[str]:
-    r"""Extract the content of the first ``\boxed{...}`` in *text*."""
-    m = re.search(r"\\boxed\{([^}]*)\}", text)
-    return m.group(1).strip() if m else None
+    r"""Extract the content of the first ``\boxed{...}`` in *text*.
+
+    Handles one level of nested braces so that answers like ``\frac{3}{4}``
+    and ``\sqrt{2}`` are captured correctly.  The previous ``[^}]*`` regex
+    stopped at the first ``}`` and produced truncated strings like ``\frac{3``
+    for ``\boxed{\frac{3}{4}}``, silently dropping the example.
+    """
+    start = text.find(r"\boxed{")
+    if start == -1:
+        return None
+    i = start + len(r"\boxed{")
+    depth = 1
+    content_start = i
+    while i < len(text) and depth > 0:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+        i += 1
+    if depth != 0:
+        return None
+    return text[content_start : i - 1].strip()
 
 
 def _boxed_to_numeric(answer: str) -> Optional[str]:
     """
-    Convert a ``\\boxed{...}`` answer to a plain numeric string.
+    Convert a ``\\boxed{...}`` answer to a verifiable numeric string.
 
-    Returns a string of the form ``"42"`` or ``"3.5000"`` when the answer
-    is a recognisable integer, decimal, or simple fraction (``3/4`` or
-    ``\\frac{3}{4}``).  Returns ``None`` for symbolic / multi-part answers
-    like ``3\\sqrt{2}`` or ``(1, 2)``.
+    Returns one of:
+      - An integer string ``"42"`` for whole-number answers.
+      - A decimal string ``"3.5"`` only when the value is exactly representable
+        (i.e. terminates in decimal).  Non-terminating fractions (e.g. 1/3) are
+        stored as ``"1/3"`` to avoid the precision loss that occurred when they
+        were rounded to ``"0.3333"`` — SymPy's ``simplify(Rational(1,3) -
+        Float(0.3333))`` is non-zero, causing false negatives in answer matching.
+      - ``None`` for symbolic / multi-part answers (``3\\sqrt{2}``, ``(1,2)``).
+
+    Handles both plain fractions (``3/4``) and LaTeX fractions
+    (``\\frac{3}{4}``) now that ``_extract_boxed`` correctly extracts
+    nested-brace content.
     """
     ans = answer.strip()
     # Direct integer
@@ -214,26 +241,32 @@ def _boxed_to_numeric(answer: str) -> Optional[str]:
         return str(int(ans))
     except ValueError:
         pass
-    # Direct float (includes "3.5", "0.75", etc.)
+    # Direct float — only accept if it is exactly representable (terminates).
     try:
         v = float(ans)
-        return str(int(v)) if v == int(v) else f"{v:.4f}"
+        if v == int(v):
+            return str(int(v))
+        # Check for exact decimal representation by round-tripping.
+        if float(f"{v}") == v:
+            return str(v)
     except ValueError:
         pass
-    # LaTeX fraction  \frac{num}{den}
-    m = re.fullmatch(r"\\frac\{(\d+)\}\{(\d+)\}", ans)
+    # LaTeX fraction  \frac{num}{den}  — store as "num/den", not as float
+    m = re.fullmatch(r"\\frac\{(-?\d+)\}\{(-?\d+)\}", ans)
     if m:
         num, den = int(m.group(1)), int(m.group(2))
         if den:
-            v = num / den
-            return str(int(v)) if v == int(v) else f"{v:.4f}"
+            if num % den == 0:
+                return str(num // den)
+            return f"{num}/{den}"
     # Plain fraction  num/den
-    m = re.fullmatch(r"(\d+)/(\d+)", ans)
+    m = re.fullmatch(r"(-?\d+)/(-?\d+)", ans)
     if m:
         num, den = int(m.group(1)), int(m.group(2))
         if den:
-            v = num / den
-            return str(int(v)) if v == int(v) else f"{v:.4f}"
+            if num % den == 0:
+                return str(num // den)
+            return f"{num}/{den}"
     return None
 
 
@@ -312,6 +345,27 @@ def load_math_dataset(
             level = 5
         if level > max_difficulty:
             continue
+        
+        # Determine topic — map all 7 MATH dataset categories rather than
+        # collapsing Algebra/Geometry/Precalculus into a single "other" bucket
+        # (which made curriculum win-rate tracking blind to these large categories).
+        t_str = item.get("type", "")
+        if "Counting & Probability" in t_str:
+            topic = "combinatorics"
+        elif "Number Theory" in t_str:
+            topic = "number_theory"
+        elif "Prealgebra" in t_str:
+            topic = "arithmetic"
+        elif "Algebra" in t_str:
+            topic = "algebra"
+        elif "Geometry" in t_str:
+            topic = "geometry"
+        elif "Precalculus" in t_str:
+            topic = "precalculus"
+        elif "Intermediate Algebra" in t_str:
+            topic = "algebra"
+        else:
+            topic = "other"
 
         question = item.get("problem", "").strip()
         solution = item.get("solution", "")
@@ -321,7 +375,7 @@ def load_math_dataset(
         numeric  = _boxed_to_numeric(boxed)
         if not numeric:
             continue
-        pairs.append({"question": question, "gold_final": numeric})
+        pairs.append({"question": question, "gold_final": numeric, "topic": topic, "difficulty": level})
 
     if pairs:
         out_p = Path(cache_path)
@@ -337,6 +391,84 @@ def load_math_dataset(
 
 
 # ---------------------------------------------------------------------------
+# Big-Math dataset
+# ---------------------------------------------------------------------------
+
+def load_big_math(max_difficulty: int = 3) -> List[Dict[str, str]]:
+    """Load Big-Math-RL-Verified dataset and convert to unified format."""
+    pairs = []
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("SynthLabsAI/Big-Math-RL-Verified", split="train")
+    except Exception as e:
+        logger.warning(f"Big-Math unavailable ({e}). Skipping.")
+        return pairs
+
+    KEYWORDS = {
+        "combinat": "combinatorics", "permut": "combinatorics",
+        "sequen": "sequences", "series": "sequences",
+        "probab": "probability",
+    }
+
+    def get_topic(subject):
+        if not subject:
+            return "other"
+        s = subject.lower()
+        for kw, topic in KEYWORDS.items():
+            if kw in s:
+                return topic
+        return "other"
+
+    skipped_symbolic = 0
+    for row in ds:
+        topic = get_topic(row.get("subject", ""))
+        answer = str(row.get("answer", "")).strip()
+        if not answer:
+            continue
+        diff = min(int(row.get("difficulty", 2)), 3)
+        if diff > max_difficulty:
+            continue
+        # Validate that the answer is numerically verifiable via SymPy, the
+        # same way load_math_dataset does.  Big-Math-RL-Verified contains
+        # symbolic answers (\sqrt{3}, \pi/2, set-form, etc.) that will always
+        # produce reward=0 in _answers_equivalent (parse failure), silently
+        # wasting grounded training slots.
+        #
+        # Strategy: try _boxed_to_numeric first (handles integers, plain
+        # fractions, simple decimals); if that fails, accept the raw string
+        # only if SymPy can parse it without error (catches clean expressions
+        # like "2/3" that _boxed_to_numeric also accepts, but rejects
+        # '\sqrt{3}', 'x+1', etc.).
+        numeric_answer = _boxed_to_numeric(answer)
+        if numeric_answer is None:
+            # Attempt a direct SymPy parse of the raw answer string.
+            try:
+                from sympy.parsing.sympy_parser import parse_expr as _pe
+                from src.sft.sympy_normalize import normalize_for_parse_expr as _nfp
+                _parsed = _pe(_nfp(answer))
+                # Reject symbolic results (contain free symbols like x, sqrt, pi).
+                if _parsed.free_symbols:
+                    skipped_symbolic += 1
+                    continue
+                numeric_answer = answer   # keep raw string; SymPy will handle it at reward time
+            except Exception:
+                skipped_symbolic += 1
+                continue
+        pairs.append({
+            "question": row["problem"],
+            "gold_final": numeric_answer,
+            "topic": topic,
+            "difficulty": diff,
+        })
+
+    logger.info(
+        "Loaded %d Big-Math pairs (%d symbolic/unparseable answers skipped)",
+        len(pairs), skipped_symbolic,
+    )
+    return pairs
+
+
+# ---------------------------------------------------------------------------
 # Reward
 # ---------------------------------------------------------------------------
 
@@ -348,10 +480,12 @@ def compute_grounded_reward(
 ) -> Dict[str, float]:
     """Score a solution against a known gold answer (grounded path).
 
-    Returns a dict with:
-      combined_score  – 0.50×correct + 0.40×process(prm_final,prm_mean) + 0.10×fmt
-      step_accuracy   – fraction of PRM steps rated > 0.5 (the core process metric)
-      prm_mean_score  – PRM mean across all steps
+    Training reward is BINARY:
+      combined_score = 1.0 if predicted final answer == gold_final, else 0.0
+
+    Additional fields are diagnostic only (not part of the training signal):
+      step_accuracy   – fraction of PRM steps rated > 0.5
+      prm_mean_score  – PRM mean score across all steps
       prm_final_score – PRM score on the final reasoning step
       gt_match        – bool, whether pred matches gold
       format_score    – format compliance score
@@ -518,7 +652,11 @@ def generate_questions_batched(
             messages, tokenize=False, add_generation_prompt=True
         )
     except Exception:
-        prompt = f"{system}\n\n{instruction}\n"
+        # Fallback: mirrors the identical block in generate_question().
+        # 'system' was previously undefined here, causing a NameError crash
+        # whenever apply_chat_template raised (e.g. missing chat template).
+        _system = messages[0]["content"]
+        prompt = f"{_system}\n\n{instruction}\n"
 
     stop_ids = _build_stop_token_ids(tokenizer)
     pad_id: int = (
@@ -636,7 +774,7 @@ def generate_solutions_batched(
         solutions       : K decoded strings (prompt stripped, specials removed)
         input_ids_list  : K full (prompt+response) token ID tensors
         response_masks  : K bool masks (True = non-pad response token)
-        old_log_probs   : K scalar tensors, sum(log π_old(token)) over response,
+        old_log_probs   : K 1D tensors, log π_old(token) for each response token,
                           computed no_grad — used for IS clip ratio in the loss.
     """
     stop_ids = _build_stop_token_ids(tokenizer)
@@ -724,8 +862,8 @@ def generate_solutions_batched(
             ]  # [total_len-1]
             resp_lps = lp_tokens[shift_mask]
             old_log_probs.append(
-                resp_lps.sum().detach() if resp_lps.numel() > 0
-                else torch.tensor(0.0, device=device)
+                resp_lps.detach() if resp_lps.numel() > 0
+                else torch.empty(0, device=device)
             )
 
     return solutions, input_ids_list, response_masks, old_log_probs
@@ -737,9 +875,9 @@ def compute_sequence_log_prob(
     response_mask: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Forward pass through model to get sum of log probs for response tokens.
+    Forward pass through model to get log probs for response tokens.
 
-    Returns scalar tensor (differentiable).
+    Returns 1D tensor of log probs (differentiable).
     """
     # input_ids: [seq_len]  →  unsqueeze to [1, seq_len]
     ids = input_ids.unsqueeze(0)
@@ -758,11 +896,11 @@ def compute_sequence_log_prob(
         shift_labels,
     ]  # [seq_len-1]
 
-    # Sum log probs over response tokens only
+    # Return log probs for response tokens only
     response_log_probs = token_log_probs[shift_mask]
     if response_log_probs.numel() == 0:
-        return torch.tensor(0.0, requires_grad=True, device=input_ids.device)
-    return response_log_probs.sum()
+        return torch.empty(0, requires_grad=True, device=input_ids.device)
+    return response_log_probs
 
 
 # ---------------------------------------------------------------------------
@@ -816,34 +954,32 @@ def grpo_loss_for_group(
         input_ids_list, response_masks, advantages, old_log_probs
     ):
         new_lp = compute_sequence_log_prob(model, ids, mask)  # differentiable
-        n_response = int(mask[1:].sum().item())
+        n_response = new_lp.numel()
         if n_response == 0:
             continue
 
         adv_t = torch.tensor(adv, dtype=new_lp.dtype, device=_device)
+        old_lp_t = old_lp.to(_device).detach()
 
         # ── GRPO surrogate (with optional IS clip) ────────────────────────
+        # MUST be computed per-token, not per-sequence!
         if clip_eps > 0:
-            ratio = torch.exp(new_lp - old_lp.to(_device).detach())
-            surr_unclipped = ratio * adv_t / n_response
-            surr_clipped   = (
-                torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-                * adv_t / n_response
-            )
-            loss_i = -torch.min(surr_unclipped, surr_clipped)
+            ratio = torch.exp(new_lp - old_lp_t)
+            surr_unclipped = ratio * adv_t
+            surr_clipped   = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_t
+            loss_i = -torch.min(surr_unclipped, surr_clipped).mean()
         else:
-            loss_i = -(adv_t * new_lp / n_response)
+            loss_i = -(adv_t * new_lp).mean()
 
         # ── Reference-policy KL penalty ───────────────────────────────────
-        # KL(π_θ ‖ π_ref) = mean_token(log π_θ − log π_ref)
-        # Adding +β×KL to the minimisation objective penalises drift from
-        # the reference (frozen) checkpoint.  This is differentiable through
-        # new_lp; ref_lp is always detached (no grad through frozen model).
+        # DeepSeekMath unbiased KL estimator: exp(ref_lp - new_lp) - (ref_lp - new_lp) - 1
         if kl_coef > 0.0 and ref_model is not None:
             with torch.no_grad():
-                ref_lp = compute_sequence_log_prob(ref_model, ids, mask)
-            kl_per_token = (new_lp - ref_lp.to(_device).detach()) / n_response
-            loss_i = loss_i + kl_coef * kl_per_token
+                ref_lp = compute_sequence_log_prob(ref_model, ids, mask).to(_device).detach()
+            
+            diff = ref_lp - new_lp
+            kl_per_token = torch.exp(diff) - diff - 1.0
+            loss_i = loss_i + kl_coef * kl_per_token.mean()
 
         group_loss = group_loss + loss_i
         n_valid += 1
@@ -858,7 +994,12 @@ def grpo_loss_for_group(
 # ---------------------------------------------------------------------------
 
 def _log_eval_result(label: str, res: Dict, best: Optional[float]) -> None:
-    """Print a structured evaluation summary that mirrors the training objective."""
+    """Print a structured evaluation summary.
+
+    Training reward (grounded path) is binary: 1.0 if the final answer matches
+    gold, 0.0 otherwise.  PRM, step accuracy, LCCP, and format are logged for
+    diagnostics but do NOT contribute to the training signal.
+    """
     cs      = float(res.get("combined_score",  0.0))
     cr      = float(res.get("correct_rate",    0.0))
     step_a  = float(res.get("step_accuracy",   0.0))
@@ -873,34 +1014,38 @@ def _log_eval_result(label: str, res: Dict, best: Optional[float]) -> None:
 
     best_str = f" (best={best:.4f})" if best is not None else ""
     logger.info(
-        "Training Score  [%s]: %.4f%s  |  n=%d",
+        "Eval Score  [%s]: %.4f%s  |  n=%d",
         label, cs, best_str, n_sc,
     )
     logger.info(
-        "  Components    : 0.50×correct(%.1f%%) + 0.40×process + 0.10×fmt(%.3f)",
-        100 * cr, fmt,
+        "  Training reward : BINARY (correct=1.0 / wrong=0.0)  "
+        "→ correct_rate=%.1f%%",
+        100 * cr,
     )
     logger.info(
-        "  Process score : prm_mean=%.3f  prm_final=%.3f  → weighted=%.3f",
-        prm, prm_fin, 0.60 * prm_fin + 0.40 * prm,
+        "  Diagnostics (not part of training reward):",
     )
     logger.info(
-        "  Step accuracy : %.1f%%  (bag-of-steps: fraction of steps PRM >0.5)",
+        "    PRM : prm_mean=%.3f  prm_final=%.3f  fmt=%.3f",
+        prm, prm_fin, fmt,
+    )
+    logger.info(
+        "    Step accuracy : %.1f%%  (fraction of PRM steps >0.5)",
         100 * step_a,
     )
     logger.info(
-        "  Chain integrity (LCCP): %.1f%%  ← fraction of steps before first failure\n"
-        "    [LCCP=100%% → all steps correct; LCCP=0%% → first step wrong]",
+        "    Chain integrity (LCCP): %.1f%%  ← steps before first failure\n"
+        "      [LCCP=100%% → all steps correct; LCCP=0%% → first step wrong]",
         100 * lccp,
     )
     if pak is not None:
         logger.info(
-            "  pass@%d (T=0.8): %.1f%%  |  greedy correct: %.1f%%  "
+            "    pass@%d (T=0.8): %.1f%%  |  greedy correct: %.1f%%  "
             "← ceiling vs floor gap",
             pak_k, 100 * pak, 100 * cr,
         )
     logger.info(
-        "  (debug) final-answer accuracy: %.1f%%",
+        "  Final-answer accuracy (checkpoint metric): %.1f%%",
         100 * fa_acc,
     )
 
@@ -914,16 +1059,17 @@ def evaluate_policy(
     math_env: Optional[Any] = None,
     pass_at_k: int = 4,
 ) -> Dict[str, object]:
-    """Run GSM8K evaluation using the SAME reward formula as GRPO training.
+    """Run GSM8K evaluation aligned with the GRPO training signal.
 
-    When *math_env* is supplied a ``reward_fn`` is constructed that calls
-    ``math_env.compute_grounded_reward(question, solution, gold)``.  This
-    returns ``combined_score = 0.50×correct + 0.40×process(0.60×prm_final
-    + 0.40×prm_mean) + 0.10×format``, making the eval metric IDENTICAL to
-    the GRPO training objective.  Any improvement in step quality, chain
-    integrity, or format compliance shows up immediately in the accuracy
-    number instead of being hidden behind the coarse binary final-answer
-    signal.
+    When *math_env* is supplied, ``math_env.compute_grounded_reward`` is used
+    to score each prediction.  The grounded reward is BINARY: 1.0 if the
+    predicted final answer is mathematically equivalent to the gold answer,
+    0.0 otherwise.  PRM scores, step accuracy, LCCP, and format are recorded
+    as diagnostic fields but do not affect the reward or the checkpoint metric.
+
+    The checkpoint metric is ``final_answer_accuracy`` (exact binary match),
+    which directly measures whether the model gets the math right — not whether
+    it writes well-formatted wrong answers.
     """
     if not Path(eval_data_path).exists():
         return {"accuracy": 0.0, "combined_score": 0.0, "total": 0}
@@ -1365,29 +1511,37 @@ def main() -> None:
 
     # ── Load data ────────────────────────────────────────────────────────────
     gsm8k_pairs = load_gsm8k(args.gsm8k_data)
-    if not gsm8k_pairs:
-        logger.error("No GSM8K data found — cannot train. Exiting.")
+
+    # MATH dataset mixing
+    math_pairs: List[Dict[str, str]] = load_math_dataset(
+        local_path=args.math_data,
+        max_difficulty=args.math_max_difficulty,
+    )
+
+    # Big-Math dataset mixing
+    big_math_pairs: List[Dict[str, str]] = load_big_math(
+        max_difficulty=args.math_max_difficulty,
+    )
+
+    # Combined pool used for difficulty sampling
+    qa_pairs = gsm8k_pairs + math_pairs + big_math_pairs
+    
+    if not qa_pairs:
+        logger.error("No data found — cannot train. Exiting.")
         sys.exit(1)
 
-    # Optional MATH dataset mixing
-    math_pairs: List[Dict[str, str]] = []
-    if args.math_mix_ratio > 0.0:
-        math_pairs = load_math_dataset(
-            local_path=args.math_data,
-            max_difficulty=args.math_max_difficulty,
-        )
-        if math_pairs:
-            logger.info(
-                "MATH mixing: %.0f%% MATH (%d problems) + %.0f%% GSM8K (%d problems)",
-                100 * args.math_mix_ratio, len(math_pairs),
-                100 * (1 - args.math_mix_ratio), len(gsm8k_pairs),
-            )
-        else:
-            logger.warning("No MATH pairs loaded — using GSM8K only.")
-
-    # Combined pool used for difficulty sampling; kept separate for VRAM-aware
-    # batch construction (sampler draws from each pool proportionally).
-    qa_pairs = gsm8k_pairs  # for reward env (all GSM8K gold answers needed)
+    logger.info(
+        "Dataset built: %d total (GSM8K: %d, MATH: %d, Big-Math: %d)",
+        len(qa_pairs), len(gsm8k_pairs), len(math_pairs), len(big_math_pairs)
+    )
+    
+    # Print topic breakdown
+    from collections import defaultdict
+    topic_counts = defaultdict(int)
+    for row in qa_pairs:
+        topic_counts[row.get("topic", "other")] += 1
+    for topic, count in sorted(topic_counts.items()):
+        logger.info("  %s: %d", topic, count)
 
     # ── Load PRM (optional) ─────────────────────────────────────────────────
     prm: Optional[ProcessRewardScorer] = None
@@ -1424,14 +1578,22 @@ def main() -> None:
     # 20-80% of the time are "on the margin" and provide the richest gradient
     # signal.  Questions it always gets right (win_rate≈1) or always gets wrong
     # (win_rate≈0) contribute little after the first few iterations.
-    from collections import defaultdict
     _q_wins:     Dict[str, int] = defaultdict(int)
     _q_attempts: Dict[str, int] = defaultdict(int)
+    _topic_wins: Dict[str, int] = defaultdict(int)
+    _topic_attempts: Dict[str, int] = defaultdict(int)
 
     def _question_key(q: str) -> str:
         """Stable hash fingerprint — collision-resistant for any pool size."""
         import hashlib
         return hashlib.md5(q.encode(), usedforsecurity=False).hexdigest()
+
+    # Separate source pools for stratified sampling so --math-mix-ratio is
+    # actually respected.  Previously everything was concatenated into qa_pairs
+    # and sampled uniformly, which made effective MATH exposure ≈ 5% regardless
+    # of the flag value.
+    _gsm8k_pool = gsm8k_pairs
+    _math_pool  = math_pairs + big_math_pairs   # MATH + Big-Math treated as one harder pool
 
     def _sample_by_difficulty(
         pool: List[Dict[str, str]], n: int, alpha: float
@@ -1446,9 +1608,23 @@ def main() -> None:
         ``alpha`` sharpens the weighting (higher = stronger preference for win_rate≈0.5).
         Unseen questions get weight 0.75 to encourage exploration.
         A 5% floor prevents any question from being permanently excluded.
+
+        Issue #9 fix: emits a WARNING when the pool is smaller than ``n`` so
+        callers are not silently surprised by a shrunken batch.
         """
+        if not pool:
+            return []
+
+        actual_n = min(n, len(pool))
+        if actual_n < n:
+            logger.warning(
+                "_sample_by_difficulty: requested %d questions but pool only has %d; "
+                "batch will be smaller than --questions-per-iter.",
+                n, len(pool),
+            )
+
         if alpha <= 0.0:
-            return random.sample(pool, min(n, len(pool)))
+            return random.sample(pool, actual_n)
 
         weights = []
         for qa in pool:
@@ -1465,9 +1641,67 @@ def main() -> None:
         total_w = sum(weights)
         probs = [w / total_w for w in weights]
         chosen = np.random.choice(
-            len(pool), size=min(n, len(pool)), replace=False, p=probs
+            len(pool), size=actual_n, replace=False, p=probs
         )
         return [pool[i] for i in chosen]
+
+    def _compute_math_ratio(iteration: int) -> float:
+        """
+        Return the effective MATH fraction for this iteration, applying the
+        linear ramp from ``--math-mix-ratio`` to ``--math-mix-ratio-late``
+        over the window [math_ramp_start, math_ramp_start + 10].
+
+        Before ``math_ramp_start``:   ratio = math_mix_ratio
+        During ramp (10 iters):       ratio linearly increases
+        After ramp:                   ratio = math_mix_ratio_late
+        """
+        base = args.math_mix_ratio
+        late = args.math_mix_ratio_late
+        if late is None or late <= base:
+            return base
+        ramp_start = args.math_ramp_start
+        ramp_end   = ramp_start + 10
+        if iteration < ramp_start:
+            return base
+        if iteration >= ramp_end:
+            return late
+        frac = (iteration - ramp_start) / 10.0
+        return base + frac * (late - base)
+
+    def _sample_mixed_batch(n: int, iteration: int) -> List[Dict[str, str]]:
+        """
+        Sample ``n`` questions enforcing the configured MATH/GSM8K ratio.
+
+        Stratification:
+          math_n   = round(n × math_ratio)   drawn from MATH + Big-Math pool
+          gsm8k_n  = n - math_n              drawn from GSM8K pool
+
+        Both sub-samples use difficulty-weighted sampling independently so the
+        win-rate statistics stay per-source rather than blending across pools of
+        very different difficulty.
+
+        If either sub-pool is empty the other pool absorbs its allocation.
+        """
+        math_ratio = _compute_math_ratio(iteration)
+        math_n  = int(round(n * math_ratio))
+        gsm8k_n = n - math_n
+
+        # Fall back gracefully when one pool is empty
+        if not _math_pool:
+            math_n, gsm8k_n = 0, n
+        if not _gsm8k_pool:
+            gsm8k_n, math_n = 0, n
+
+        sampled_math  = _sample_by_difficulty(_math_pool,  math_n,  args.difficulty_alpha)
+        sampled_gsm8k = _sample_by_difficulty(_gsm8k_pool, gsm8k_n, args.difficulty_alpha)
+
+        batch = sampled_math + sampled_gsm8k
+        random.shuffle(batch)
+        logger.debug(
+            "Mixed batch iter %d: %d MATH + %d GSM8K = %d total (ratio=%.2f)",
+            iteration, len(sampled_math), len(sampled_gsm8k), len(batch), math_ratio,
+        )
+        return batch
 
     # ── Metrics log ─────────────────────────────────────────────────────────
     metrics_log: List[Dict] = []
@@ -1483,8 +1717,8 @@ def main() -> None:
             math_env=math_env,
             pass_at_k=args.eval_pass_at_k,
         )
-        # accuracy == combined_score = 0.50×correct + 0.40×process(prm_final,prm_mean) + 0.10×fmt
-        # This is identical to the GRPO training objective.
+        # Training reward is binary (1.0 if correct, 0.0 otherwise).
+        # PRM / format are diagnostic only.
         _log_eval_result("INITIAL (iter 0)", initial_eval, best=None)
         metrics_log.append({"iteration": 0, **initial_eval})
         best_accuracy  = float(initial_eval.get("accuracy",     0.0))
@@ -1502,33 +1736,9 @@ def main() -> None:
         logger.info("GRPO ITERATION %d/%d", iteration, args.num_iterations)
         logger.info("=" * 70)
 
-        # Sample questions — difficulty-weighted from the mixed pool.
-        # When math_pairs is non-empty, draw proportionally: N*ratio from MATH
-        # and N*(1-ratio) from GSM8K.  The difficulty sampler handles each pool
-        # independently so MATH problems get their own win-rate tracking.
-        #
-        # MATH ratio ramp: once past --math-ramp-start, linearly increase the
-        # MATH fraction toward --math-mix-ratio-late over the next 10 iterations.
-        # This progressively raises difficulty after the policy has stabilised.
-        _effective_math_ratio = args.math_mix_ratio
-        if args.math_mix_ratio_late is not None and iteration > args.math_ramp_start:
-            _ramp_progress = min(1.0, (iteration - args.math_ramp_start) / 10.0)
-            _effective_math_ratio = (
-                args.math_mix_ratio
-                + _ramp_progress * (args.math_mix_ratio_late - args.math_mix_ratio)
-            )
-
-        if math_pairs and _effective_math_ratio > 0.0:
-            n_math  = max(1, round(args.questions_per_iter * _effective_math_ratio))
-            n_gsm8k = max(1, args.questions_per_iter - n_math)
-            math_batch  = _sample_by_difficulty(math_pairs,  n_math,  alpha=args.difficulty_alpha)
-            gsm8k_batch = _sample_by_difficulty(gsm8k_pairs, n_gsm8k, alpha=args.difficulty_alpha)
-            questions_batch = math_batch + gsm8k_batch
-            random.shuffle(questions_batch)
-        else:
-            questions_batch = _sample_by_difficulty(
-                gsm8k_pairs, args.questions_per_iter, alpha=args.difficulty_alpha
-            )
+        # Sample questions — stratified by source (MATH vs GSM8K) to honour
+        # --math-mix-ratio, then difficulty-weighted within each sub-pool.
+        questions_batch = _sample_mixed_batch(args.questions_per_iter, iteration)
         cur_lr = optimizer.param_groups[0]["lr"]
         # Temperature annealing: linearly decay T from peak → min_temp over the run.
         # Early iterations need high T for exploration; later ones need lower T
@@ -1536,8 +1746,8 @@ def main() -> None:
         _anneal_frac = min(1.0, (iteration - 1) / max(1, args.num_iterations - 1))
         _annealed_temp = args.temperature * (1.0 - 0.5 * _anneal_frac)  # 0.8 → 0.4
         logger.info(
-            "LR this iteration: %.2e | T=%.3f | MATH ratio=%.0f%%",
-            cur_lr, _annealed_temp, 100 * _effective_math_ratio,
+            "LR this iteration: %.2e | T=%.3f",
+            cur_lr, _annealed_temp,
         )
 
         all_rewards:   List[float] = []
@@ -1562,17 +1772,29 @@ def main() -> None:
         q_quality_good  = 0    # self-play groups where question_reward > 0.5
         total_loss_val = 0.0
 
-        # Determine how many of this iteration's groups use self-play question
-        # generation vs grounded (dataset) questions.
+        # Randomly assign self-play slots before pre-sorting.
         n_self_play_target = int(round(len(questions_batch) * args.self_play_ratio))
-
-        # Build a random set of group indices that will use self-play.
-        # Random interleaving distributes self-play uniformly across the batch
-        # instead of front-loading all self-play groups, which would cause the
-        # gradient to shift mid-batch as the objective changes character.
         _all_indices = list(range(len(questions_batch)))
         random.shuffle(_all_indices)
         _self_play_indices = set(_all_indices[:n_self_play_target])
+
+        # CHANGE 2: Pre-sort batch — grounded questions first, self-play second.
+        # This lets us do a clean optimizer.step() on grounded gradients before
+        # the noisier self-play gradients accumulate. Two separate weight updates
+        # per iteration: one anchored to gold answers, one for self-play.
+        _grounded_items = [
+            (idx, qa) for idx, qa in enumerate(questions_batch)
+            if idx not in _self_play_indices
+        ]
+        _selfplay_items = [
+            (idx, qa) for idx, qa in enumerate(questions_batch)
+            if idx in _self_play_indices
+        ]
+        _ordered_batch = _grounded_items + _selfplay_items
+        _n_grounded = len(_grounded_items)
+        _grounded_step_done = False   # flag: intermediate step already fired
+        _grounded_n_groups  = 0       # groups counted in grounded phase
+        _grounded_loss_val  = 0.0     # loss accumulated in grounded phase
 
         # Zero gradients once before the loop — we accumulate them via
         # per-group .backward() calls instead of building one giant graph.
@@ -1583,12 +1805,33 @@ def main() -> None:
         # away; gradients accumulate in .grad tensors without extra memory.
         optimizer.zero_grad()
 
-        pbar = tqdm(questions_batch, desc=f"Iter {iteration} GRPO groups", unit="q")
-        for _group_idx, qa in enumerate(pbar):
+        pbar = tqdm(_ordered_batch, desc=f"Iter {iteration} GRPO groups", unit="q")
+        for _group_idx, qa in pbar:
 
             # ── Decide: self-play (model generates question) or grounded ─────
             # Random interleaving: self-play slots chosen before the loop.
             use_self_play = _group_idx in _self_play_indices
+
+            # CHANGE 2: At the first self-play group, step optimizer on
+            # accumulated grounded gradients before processing any self-play.
+            if use_self_play and not _grounded_step_done:
+                if _grounded_n_groups > 0:
+                    if _grounded_n_groups > 1:
+                        for _p in model.parameters():
+                            if _p.grad is not None:
+                                _p.grad.div_(_grounded_n_groups)
+                    torch.nn.utils.clip_grad_norm_(
+                        [_p for _p in model.parameters() if _p.requires_grad],
+                        args.max_grad_norm,
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    _grounded_loss_val_avg = _grounded_loss_val / _grounded_n_groups
+                    logger.info(
+                        "Grounded phase optimizer.step() | grounded_loss=%.4f | groups=%d",
+                        _grounded_loss_val_avg, _grounded_n_groups,
+                    )
+                _grounded_step_done = True
 
             if use_self_play:
                 # ── SELF-PLAY BRANCH ─────────────────────────────────────────
@@ -1822,21 +2065,21 @@ def main() -> None:
             _sp_q_rew_this_group: List[float] = []
             for sol in solutions:
                 if use_self_play:
-                    # compute_reward = 0.40×question_quality + 0.60×solution_quality
-                    # This is the core Theme #4 signal: the model is rewarded
-                    # for generating a well-formed, appropriately difficult,
-                    # solvable question AND for solving it correctly.
-                    r, q_rew, _, q_met = compute_self_play_reward(
+                    # CHANGE 3: Use solution-quality-only reward for the GRPO update.
+                    # The question reward is now adversarial (computed post-loop)
+                    # rather than a heuristic quality score.
+                    # compute_self_play_reward returns (combined, q_rew, sol_rew, q_met)
+                    _, q_rew, r, q_met = compute_self_play_reward(
                         question=question,
                         solution=sol,
                         target_topic=target_topic,
                         target_difficulty=target_difficulty,
                         math_env=math_env,
                     )
-                    _sp_q_rew_this_group.append(q_rew)
-                    all_q_rewards.append(q_rew)
-                    # Collect per-component breakdown (same question, all K solutions
-                    # get the same q_metrics — average to reduce noise).
+                    # r is now the solution-only reward (PRM-based, no q blending)
+                    _sp_q_rew_this_group.append(r)   # track sol scores for win-rate
+                    all_q_rewards.append(q_rew)      # keep q_rew for logging
+                    # Collect per-component breakdown
                     _qc_topic.append(q_met["topic_match"])
                     _qc_diff.append(q_met["difficulty_fit"])
                     _qc_clarity.append(q_met["clarity"])
@@ -1860,24 +2103,44 @@ def main() -> None:
             else:
                 _grounded_rewards.extend(rewards)
 
-            # A self-play group is "accurate" if the question it generated scored
-            # above 0.5 on question quality — meaning it was clear, on-topic,
-            # appropriately difficult, and solvable.
+            # CHANGE 3: Adversarial win-rate question reward.
+            # win_rate = fraction of K solutions with solution reward > 0.5
+            # Generator earns reward for questions the Solver finds HARD (low win_rate).
+            # Groups where win_rate==0.0 or 1.0 carry zero gradient variance — skip them.
             if use_self_play and _sp_q_rew_this_group:
-                if float(np.mean(_sp_q_rew_this_group)) > 0.5:
-                    q_quality_good += 1
+                _win_rate = float(np.mean([r > 0.5 for r in _sp_q_rew_this_group]))
+                if _win_rate == 0.0 or _win_rate == 1.0:
+                    # No variance in rewards — no gradient signal, don't update q stats
+                    logger.debug(
+                        "Self-play group skipped for q_reward: win_rate=%.2f (zero variance)",
+                        _win_rate,
+                    )
+                else:
+                    # Adversarial: harder questions (low win_rate) → higher q_reward
+                    _q_adv_reward = 1.0 - _win_rate
+                    all_q_rewards.append(_q_adv_reward)
+                    if _q_adv_reward > 0.5:   # win_rate < 0.5 → genuinely challenging
+                        q_quality_good += 1
+                    logger.debug(
+                        "Self-play adversarial q_reward: win_rate=%.2f → q_reward=%.2f",
+                        _win_rate, _q_adv_reward,
+                    )
 
             # --- Update difficulty stats (grounded questions only — self-play
             #     questions are ephemeral and have no stable key) ---
             if not use_self_play:
                 _key = _question_key(question)
+                _topic = qa.get("topic", "other")
                 _q_attempts[_key] += len(solutions)
+                _topic_attempts[_topic] += len(solutions)
                 # Win = reward in the top half of THIS group, not an absolute 0.5 threshold.
                 # Using a relative threshold avoids the case where all solutions score 0.55
                 # (all "wins" → easy) or all score 0.45 (all "losses" → impossible) when the
                 # rewards are actually similar and carry no difficulty information.
                 _group_median = float(np.median(rewards))
-                _q_wins[_key] += sum(1 for r in rewards if r > _group_median)
+                _wins = sum(1 for r in rewards if r > _group_median)
+                _q_wins[_key] += _wins
+                _topic_wins[_topic] += _wins
 
             # --- GRPO loss (IS clip + optional KL penalty) + immediate backward ---
             group_loss = grpo_loss_for_group(
@@ -1906,6 +2169,10 @@ def main() -> None:
             group_loss.backward()
             total_loss_val += group_loss.item()
             n_groups += 1
+            # CHANGE 2: Track per-phase group counts for per-phase normalisation.
+            if not _grounded_step_done:
+                _grounded_n_groups += 1
+                _grounded_loss_val += group_loss.item()
             _pf = dict(
                 mean_r=f"{np.mean(rewards):.3f}",
                 loss=f"{group_loss.item():.4f}",
@@ -1921,22 +2188,26 @@ def main() -> None:
             pbar.set_postfix(**_pf)
 
         # --- Gradient step: normalise accumulated grads then step ---
-        if n_groups > 0:
-            # Divide accumulated grads by n_groups to get the true average
-            # (equivalent to averaging the group losses before backward).
-            if n_groups > 1:
+        # CHANGE 2: If grounded step already fired (intermediate step done),
+        # only self-play gradients remain in .grad — normalise by their count.
+        # If no self-play groups exist, or self-play ratio=0, fall through as before.
+        _selfplay_n_groups = n_groups - _grounded_n_groups
+        _norm_groups = _selfplay_n_groups if _grounded_step_done else n_groups
+        if _norm_groups > 0 or (not _grounded_step_done and n_groups > 0):
+            _div = _norm_groups if _grounded_step_done else n_groups
+            if _div > 1:
                 for p in model.parameters():
                     if p.grad is not None:
-                        p.grad.div_(n_groups)
+                        p.grad.div_(_div)
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad],
                 args.max_grad_norm,
             )
             optimizer.step()
-            loss_val = total_loss_val / n_groups
+            loss_val = total_loss_val / max(1, n_groups)
         else:
             loss_val = 0.0
-        scheduler.step()
+        scheduler.step()   # advance LR once per iteration (not per phase)
 
         iter_time = time.perf_counter() - iter_start
         mean_r   = float(np.mean(all_rewards))             if all_rewards   else 0.0
@@ -1980,6 +2251,14 @@ def main() -> None:
             100 * acc_r,
             n_groups, skipped, _skipped_zero_var, _cur_lr, iter_time,
         )
+
+        # Print topic win rates
+        _topic_summary = {}
+        for t, attempts in _topic_attempts.items():
+            if attempts > 0:
+                _topic_summary[t] = round(_topic_wins[t] / attempts, 3)
+        if _topic_summary:
+            logger.info("Topic win rates: %s", _topic_summary)
         # Starvation warning: if >30% of groups were skipped due to zero reward
         # variance (all K solutions same score), the curriculum difficulty is
         # mis-calibrated — either too easy (all correct) or too hard (all wrong).
@@ -2042,20 +2321,22 @@ def main() -> None:
                 math_env=math_env,
                 pass_at_k=args.eval_pass_at_k,
             )
-            # accuracy == combined_score: 0.50×correct + 0.40×process(prm_final,prm_mean) + 0.10×fmt
+            # CHANGE 4: Use final_answer_accuracy as the primary checkpoint metric.
+            # combined_score blends PRM + format, so the model could get "better"
+            # at formatting while getting worse at actual math. We now save
+            # best_policy only when real math accuracy (exact-match %) improves.
             cur_combined = float(eval_res.get("combined_score", best_combined))
             cur_prm_mean = float(eval_res.get("prm_mean",       best_prm_mean))
+            cur_fa_acc   = float(eval_res.get("final_answer_accuracy", 0.0))
 
             _log_eval_result(f"iter {iteration}", eval_res, best=best_combined)
 
-            # ── Checkpoint: save when combined_score strictly improves ────────
-            # combined_score is a continuous variable; any improvement in
-            # correctness, PRM quality, SymPy, or format moves it.
-            if cur_combined > best_combined + 1e-4:
-                reason = f"combined {cur_combined:.4f} > {best_combined:.4f}"
-                best_combined  = cur_combined
+            # ── Checkpoint: save when final-answer accuracy strictly improves ──
+            if cur_fa_acc > best_accuracy + 1e-4:
+                reason = f"final_answer_accuracy {cur_fa_acc:.4f} > {best_accuracy:.4f}"
+                best_accuracy  = cur_fa_acc
+                best_combined  = max(best_combined, cur_combined)
                 best_prm_mean  = max(best_prm_mean, cur_prm_mean)
-                best_accuracy  = best_combined
                 best_path = out_dir / "best_policy"
                 model.save_pretrained(str(best_path))
                 tokenizer.save_pretrained(str(best_path))
@@ -2120,8 +2401,8 @@ def main() -> None:
     logger.info("=" * 70)
     logger.info("GRPO training complete.")
     logger.info(
-        "Best training-objective score : %.4f  "
-        "(0.50×correct + 0.40×process[0.60×prm_final+0.40×prm_mean] + 0.10×fmt)",
+        "Best eval combined_score      : %.4f  "
+        "(checkpoint metric: final_answer_accuracy — binary correct/wrong)",
         best_combined,
     )
     logger.info("Best PRM component mean       : %.3f", best_prm_mean)
