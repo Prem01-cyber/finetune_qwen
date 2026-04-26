@@ -406,17 +406,17 @@ def _infer(
     use_chat_template=False  → plain text-completion prompt (for raw base models).
     use_chat_template=True   → chat template via create_solver_messages() (for fine-tuned).
     """
-    if use_chat_template and tok.chat_template is not None:
+    if use_chat_template:
         messages = create_solver_messages(question)
         try:
             prompt = tok.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
         except Exception:
-            # Fallback: chat template broken — use plain prompt
             prompt = _make_plain_prompt(question)
+            use_chat_template = False
     else:
-        # Plain base model: use a text-completion prompt that primes Step N: format
+        # Plain base model: text-completion prompt primed with "Step 1:"
         prompt = _make_plain_prompt(question)
 
     enc = tok(
@@ -428,11 +428,28 @@ def _infer(
     prompt_len = enc["input_ids"].shape[1]
 
     greedy = temperature < 1e-4
+
+    # For base (non-instruct) models, suppress chat-specific EOS tokens like
+    # <|im_end|> so the model doesn't stop at the very first token.
+    eos_ids: List[int] = []
+    if tok.eos_token_id is not None:
+        eos_ids.append(tok.eos_token_id)
+    if not use_chat_template:
+        # Keep only the true end-of-text token; skip any chat stop tokens
+        for special_name in ("<|im_end|>", "<|endoftext|>"):
+            sid = tok.convert_tokens_to_ids(special_name)
+            if isinstance(sid, int) and sid != tok.unk_token_id:
+                if special_name == "<|endoftext|>":
+                    if sid not in eos_ids:
+                        eos_ids.append(sid)
+                # <|im_end|> fires at chat boundaries — skip it for base model
+    eos_ids = eos_ids or [tok.eos_token_id]
+
     gen_kw: Dict[str, Any] = {
         "max_new_tokens": max_new_tokens,
         "do_sample": not greedy,
         "pad_token_id": tok.pad_token_id or tok.eos_token_id,
-        "eos_token_id": tok.eos_token_id,
+        "eos_token_id": eos_ids,
         "use_cache": True,
     }
     if not greedy:
@@ -447,8 +464,8 @@ def _infer(
     gen_ids = out[0, prompt_len:]
     text = tok.decode(gen_ids, skip_special_tokens=True).strip()
 
-    # For plain-prompt inference, re-attach "Step 1:" so the step parser can find it
-    if not (use_chat_template and tok.chat_template is not None):
+    # Re-attach "Step 1:" so the step parser sees it (was in the prompt, not the output)
+    if not use_chat_template:
         text = "Step 1: " + text
 
     return text, elapsed
@@ -1178,16 +1195,13 @@ def main() -> None:
     else:
         model_a, tok_a = _load_hf_base_model(BASE_MODEL_HF, device, label_a)
         model_a_path = BASE_MODEL_HF
-        # Raw base model: no instruct fine-tuning → use plain text-completion prompt
-        use_chat_a = tok_a.chat_template is not None
-        if not use_chat_a:
-            logger.info(
-                "  Base model has no chat_template — using plain text-completion prompt"
-            )
-        else:
-            logger.info(
-                "  Base model has a chat_template — using it (override with --base-checkpoint)"
-            )
+        # Raw base model: even if the tokenizer ships with a chat_template, the
+        # base weights were never instruction-tuned, so the chat format causes
+        # immediate EOS.  Always use plain text-completion prompting here.
+        use_chat_a = False
+        logger.info(
+            "  Base model (no instruct tuning) — using plain text-completion prompt"
+        )
 
     model_b, tok_b = _load_model(finetuned_path, device, label_b)
     model_b_path = str(finetuned_path)
