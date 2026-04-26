@@ -268,7 +268,7 @@ def _format_ok(text: str) -> bool:
 # Model loading
 # ---------------------------------------------------------------------------
 
-BASE_MODEL_HF = "Qwen/Qwen2.5-Math-1.5B-Instruct"
+BASE_MODEL_HF = "Qwen/Qwen2.5-1.5B"          # plain base model, no instruct/math fine-tuning
 
 
 def _resolve_base_model_name(checkpoint_path: Path) -> str:
@@ -353,7 +353,7 @@ def _load_hf_base_model(
     device: torch.device,
     label: str,
 ) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
-    """Load the raw HuggingFace base model (no adapter)."""
+    """Load the raw HuggingFace base model (no adapter, no instruct fine-tuning)."""
     logger.info("Loading %s from HuggingFace hub: %s …", label, hf_name)
     tok = AutoTokenizer.from_pretrained(hf_name, trust_remote_code=True)
     if tok.pad_token is None:
@@ -364,7 +364,7 @@ def _load_hf_base_model(
         hf_name,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
-        device_map={"": device},
+        device_map={"": "cuda:0"} if device.type == "cuda" else None,
         trust_remote_code=True,
     )
     model.eval()
@@ -377,6 +377,20 @@ def _load_hf_base_model(
 # Single-sample inference (greedy or sampled)
 # ---------------------------------------------------------------------------
 
+def _make_plain_prompt(question: str) -> str:
+    """
+    Plain-text continuation prompt for raw (non-instruct) base models.
+    Primes the model to produce numbered steps and a Final Answer line so
+    we can score it with the same step parser as the fine-tuned model.
+    """
+    return (
+        "Solve the following math problem by showing your work step by step.\n\n"
+        f"Problem: {question}\n\n"
+        "Solution:\n"
+        "Step 1:"
+    )
+
+
 def _infer(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
@@ -384,12 +398,27 @@ def _infer(
     max_new_tokens: int,
     temperature: float,
     device: torch.device,
+    use_chat_template: bool = True,
 ) -> Tuple[str, float]:
-    """Run inference for one question. Returns (decoded_text, elapsed_seconds)."""
-    messages = create_solver_messages(question)
-    prompt = tok.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    """
+    Run inference for one question. Returns (decoded_text, elapsed_seconds).
+
+    use_chat_template=False  → plain text-completion prompt (for raw base models).
+    use_chat_template=True   → chat template via create_solver_messages() (for fine-tuned).
+    """
+    if use_chat_template and tok.chat_template is not None:
+        messages = create_solver_messages(question)
+        try:
+            prompt = tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            # Fallback: chat template broken — use plain prompt
+            prompt = _make_plain_prompt(question)
+    else:
+        # Plain base model: use a text-completion prompt that primes Step N: format
+        prompt = _make_plain_prompt(question)
+
     enc = tok(
         prompt,
         return_tensors="pt",
@@ -417,6 +446,11 @@ def _infer(
 
     gen_ids = out[0, prompt_len:]
     text = tok.decode(gen_ids, skip_special_tokens=True).strip()
+
+    # For plain-prompt inference, re-attach "Step 1:" so the step parser can find it
+    if not (use_chat_template and tok.chat_template is not None):
+        text = "Step 1: " + text
+
     return text, elapsed
 
 
@@ -1114,7 +1148,7 @@ def main() -> None:
     if args.base_checkpoint:
         label_a = args.base_label or args.base_checkpoint.name
     else:
-        label_a = args.base_label or "Qwen2.5-Math-1.5B (base)"
+        label_a = args.base_label or "Qwen2.5-1.5B (base)"
 
     # Infer RL label from checkpoint path
     if args.finetuned_label:
@@ -1139,9 +1173,21 @@ def main() -> None:
     if args.base_checkpoint:
         model_a, tok_a = _load_model(args.base_checkpoint, device, label_a)
         model_a_path = str(args.base_checkpoint)
+        # Loaded from a checkpoint — assume it has a working chat template
+        use_chat_a = True
     else:
         model_a, tok_a = _load_hf_base_model(BASE_MODEL_HF, device, label_a)
         model_a_path = BASE_MODEL_HF
+        # Raw base model: no instruct fine-tuning → use plain text-completion prompt
+        use_chat_a = tok_a.chat_template is not None
+        if not use_chat_a:
+            logger.info(
+                "  Base model has no chat_template — using plain text-completion prompt"
+            )
+        else:
+            logger.info(
+                "  Base model has a chat_template — using it (override with --base-checkpoint)"
+            )
 
     model_b, tok_b = _load_model(finetuned_path, device, label_b)
     model_b_path = str(finetuned_path)
@@ -1166,13 +1212,15 @@ def main() -> None:
         gold_final = row["gold_final"]
 
         sol_a, t_a = _infer(model_a, tok_a, question,
-                             args.max_new_tokens, args.temperature, device)
+                             args.max_new_tokens, args.temperature, device,
+                             use_chat_template=use_chat_a)
         sol_b, t_b = _infer(model_b, tok_b, question,
-                             args.max_new_tokens, args.temperature, device)
+                             args.max_new_tokens, args.temperature, device,
+                             use_chat_template=True)
 
-        ref_sol = row.get("reference_solution", "")
-        score_a = _score(sol_a, gold_final, ref_sol)
-        score_b = _score(sol_b, gold_final, ref_sol)
+        ref_sol  = row.get("reference_solution", "")
+        score_a  = _score(sol_a, gold_final, ref_sol)
+        score_b  = _score(sol_b, gold_final, ref_sol)
 
         score_a["elapsed_s"] = round(t_a, 2)
         score_b["elapsed_s"] = round(t_b, 2)
