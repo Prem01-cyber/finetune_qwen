@@ -352,7 +352,7 @@ def _write_markdown(out_dir: Path, summ_a: Dict, summ_b: Dict, meta: Dict) -> Pa
         f"**Date:** {meta['timestamp']}  ",
         f"**Dataset:** {meta['data_path']}  ",
         f"**Samples:** {meta['n_samples']}  ",
-        f"**Decode mode:** {'greedy' if meta['temperature'] == 0 else f'sampling T={meta[\"temperature\"]}'}  ",
+        f"**Decode mode:** {('greedy' if meta['temperature'] == 0 else 'sampling T=' + str(meta['temperature']))}  ",
         f"",
         f"## Summary",
         f"",
