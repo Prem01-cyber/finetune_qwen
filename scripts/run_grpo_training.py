@@ -2586,26 +2586,48 @@ def main() -> None:
         )
         # CSV: one row per iteration, flushed immediately so you can
         # `tail -f logs/grpo/<run>/metrics.csv` or open it in Excel mid-run.
+        # `iter_metrics.update(eval_res)` overwrites step_accuracy/lccp on eval iters.
+        # We capture the is_eval flag here for clarity.
+        _is_eval_iter = "combined_score" in iter_metrics
         _append_metrics_csv({
-            "iteration":      iter_metrics["iteration"],
-            "timestamp":      datetime.now().isoformat(timespec="seconds"),
-            "loss":           iter_metrics.get("loss", 0.0),
-            "mean_reward":    iter_metrics.get("mean_reward", 0.0),
-            "std_reward":     iter_metrics.get("std_reward", 0.0),
-            "batch_accuracy": iter_metrics.get("batch_accuracy", 0.0),
-            "n_groups":       iter_metrics.get("n_groups", 0),
-            "skipped_groups": iter_metrics.get("skipped_groups", 0),
-            "learning_rate":  iter_metrics.get("learning_rate", 0.0),
-            "iter_time_s":    iter_metrics.get("iter_time_s", 0.0),
-            # Training-objective eval (primary; same formula as GRPO reward)
-            "gsm8k_combined":   iter_metrics.get("combined_score",        ""),
-            "gsm8k_correct_rt": iter_metrics.get("correct_rate",          ""),
-            "gsm8k_prm":        iter_metrics.get("prm_mean",              ""),
-            "gsm8k_sympy":      iter_metrics.get("sympy_mean",            ""),
-            "gsm8k_format":     iter_metrics.get("format_mean",           ""),
-            "gsm8k_n_scored":   iter_metrics.get("n_scored",              ""),
-            # Debug (not used for checkpointing)
-            "gsm8k_final_ans":  iter_metrics.get("final_answer_accuracy", ""),
+            "iteration":        iter_metrics["iteration"],
+            "timestamp":        datetime.now().isoformat(timespec="seconds"),
+            # ── Per-iteration training signal ───────────────────────────────
+            "loss":             iter_metrics.get("loss", 0.0),
+            "mean_reward":      iter_metrics.get("mean_reward", 0.0),
+            "std_reward":       iter_metrics.get("std_reward", 0.0),
+            "batch_accuracy":   iter_metrics.get("batch_accuracy", 0.0),
+            "grounded_acc":     iter_metrics.get("grounded_accuracy", 0.0),
+            "gt_match_rate":    iter_metrics.get("gt_match_rate", 0.0),
+            # step_accuracy / lccp: training value on non-eval iters,
+            # eval value on eval iters (update() overwrites them).
+            "step_accuracy":    iter_metrics.get("step_accuracy", 0.0),
+            "lccp":             iter_metrics.get("lccp", 0.0),
+            "n_groups":         iter_metrics.get("n_groups", 0),
+            "skipped_groups":   iter_metrics.get("skipped_groups", 0),
+            "n_sp_groups":      iter_metrics.get("n_self_play_groups", 0),
+            "sp_ratio":         iter_metrics.get("effective_sp_ratio", 0.0),
+            "sp_suspended":     iter_metrics.get("selfplay_suspended", 0),
+            "training_phase":   iter_metrics.get("training_phase", ""),
+            "learning_rate":    iter_metrics.get("learning_rate", 0.0),
+            "iter_time_s":      iter_metrics.get("iter_time_s", 0.0),
+            # ── Question-generation quality ─────────────────────────────────
+            "q_reward":         iter_metrics.get("mean_question_reward", ""),
+            "q_valid_rate":     iter_metrics.get("q_gen_valid_rate",     ""),
+            "q_novelty":        iter_metrics.get("q_novelty",            ""),
+            "q_solvability":    iter_metrics.get("q_solvability",        ""),
+            # ── Chain scoring calibration ───────────────────────────────────
+            "chain_prm_corr":   iter_metrics.get("chain_prm_correlation", ""),
+            "chain_scoring_on": iter_metrics.get("chain_scoring_active",  ""),
+            # ── Eval checkpoint metrics (every eval_every iters) ────────────
+            "eval_combined":    iter_metrics.get("combined_score",          "") if _is_eval_iter else "",
+            "eval_correct_rt":  iter_metrics.get("correct_rate",            "") if _is_eval_iter else "",
+            "eval_prm":         iter_metrics.get("prm_mean",                "") if _is_eval_iter else "",
+            "eval_step_acc":    iter_metrics.get("step_accuracy",           "") if _is_eval_iter else "",
+            "eval_lccp":        iter_metrics.get("lccp",                    "") if _is_eval_iter else "",
+            "eval_format":      iter_metrics.get("format_mean",             "") if _is_eval_iter else "",
+            "eval_n_scored":    iter_metrics.get("n_scored",                "") if _is_eval_iter else "",
+            "eval_final_ans":   iter_metrics.get("final_answer_accuracy",   "") if _is_eval_iter else "",
         })
 
     logger.info("=" * 70)

@@ -2,15 +2,15 @@
 # =============================================================================
 # launch_grpo_combined.sh  —  GRPO training on NuminaMath-CoT + OpenMathInstruct-2
 #
-# Host profile (same as launch_grpo.sh):
-#   GPU    : 1× A100 PCIe, 80 GB HBM2e, 1583 GB/s, PCIe 4.0 x16
+# Host profile:
+#   GPU    : 1× A100 SXM4 / PCIe, 80 GB HBM2e, 1583 GB/s
 #   CPU    : AMD EPYC 7V13 64-core (96 vCPU available)
 #   RAM    : 221.7 GB
 #
-# Dataset vs launch_grpo.sh:
-#   • Replaces GSM8K/AQuA with NuminaMath-CoT + OpenMathInstruct-2
+# Dataset:
+#   • NuminaMath-CoT + OpenMathInstruct-2 (combined_train.jsonl)
 #   • 14 distinct skill_ids → ZPD CurriculumManager gets real per-topic signal
-#   • Clean \\boxed{} / numeric answers → gt_match_rate stays ≥ 60%
+#   • Clean \\boxed{} / numeric answers → gt_match_rate stays ≥ 55%
 #   • Difficulty tiers 1–3 per problem → sparse-reward regime at tiers 2-3
 #   • 20K+ diverse problems → prevents reward-hacking via memorisation
 #
@@ -25,82 +25,105 @@
 #       eager              (stock HF, slowest)
 #
 #   This script installs flash-attn if missing before training begins.
-#   Impact on this run (K=8, T≈500, 28 layers, bf16):
-#     - Attention activation memory: ~1.3 GB saved per backward pass
+#   Impact on this run (K=10, T≈600, 28 layers, bf16):
+#     - Attention activation memory: ~1.5 GB saved per backward pass
 #     - Rollout speed: ~1.5× faster .generate() for long contexts
 #     - Gradient checkpointing automatically DISABLED when Flash is active
-#       (Flash already provides O(T) memory — double-checkpointing wastes time)
 #
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #   HF + Flash-Attn 2 fragment the allocator during generation.
 #   Expandable segments recover 2-4 GB peak VRAM over a long run.
 #
-# ── Why these hyperparameter changes vs launch_grpo.sh ─────────────────────
+# ── Hyperparameter rationale (v2, refined from grpo_20260425_151304 run) ────
 #
-#   --learning-rate 3e-6        Reduced from 5e-6. Combined dataset is harder
-#                               than GSM8K alone; smaller LR prevents over-
-#                               shooting in early iters.
+# OBSERVED in prior run (GSM8K, K=8, N=16, 20 iters):
+#   • mean_reward ~0.85-0.92 from iter 1 → model already near GSM8K ceiling (78%)
+#   • 25-56% of groups skipped per iter (K=8 too small → zero variance on easy Qs)
+#   • gt_match stayed flat; no meaningful policy improvement after iter 10
+#   • SDPA fallback (no flash-attn) → ~2× slower than needed
 #
-#   --warmup-iters 10           More warmup (was 8). New distribution needs a
-#                               longer gentle ramp before hitting peak LR.
+# KEY CHANGES this run:
 #
-#   --kl-coef 0.06              Slightly tighter KL (was 0.04). Harder problems
-#                               increase policy variance; anchor prevents drift.
+#   --group-size 10             Increased from 8. More rollouts per question
+#                               → better reward variance estimate → fewer
+#                               zero-variance skipped groups. Expected: skip
+#                               rate drops from ~40% to ~20% on harder combined
+#                               data.
 #
-#   --selfplay-ramp-iters 25    Slower self-play ramp (was 18). Let the model
-#                               stabilise on grounded harder problems before
-#                               the self-play ratio climbs.
+#   --questions-per-iter 20     Increased from 16. More diverse gradient signal
+#                               per iteration. Combined with K=10: 200 rollouts
+#                               vs prior 128 → ~56% more signal per iter.
+#                               VRAM stays safe at K_q=2, K=10, N=20.
 #
-#   --selfplay-grounded-thresh 0.58   Higher gate (was 0.55). Ensures the
-#                               grounded policy is truly solid before self-play
-#                               pulls training budget away from it.
+#   --difficulty-alpha 4.5      Sharper ZPD sampling (was 4.0). With 3 difficulty
+#                               tiers and a model that started strong on simple
+#                               problems, we need a stronger bias toward tier-2/3
+#                               problems (30-70% win-rate zone) to generate
+#                               non-trivial gradient signal.
+#
+#   --num-iterations 80         More iterations (was 60). Combined dataset is
+#                               harder — curriculum needs more steps to climb from
+#                               ~55% to 70%+ eval accuracy.
+#
+#   --eval-every 5              Unchanged. Eval every 5 iters gives 16 checkpoints
+#                               (plus iter 0) over 80 iters.
+#
+#   --eval-max-samples 200      Increased from 150. Larger sample → tighter CI
+#                               on eval combined_score; avoids spurious saves.
+#
+#   --selfplay-gt-thresh 0.50   Lowered from 0.52. Combined dataset problems are
+#                               harder → natural gt_match is lower; a gate of 0.52
+#                               would delay self-play entry too long.
+#
+#   --selfplay-ramp-iters 30    Slower ramp (was 25). More grounded-only iters
+#                               before the self-play ratio climbs, ensuring the
+#                               policy is solid on harder combined problems.
+#
+#   --kl-coef 0.06              Tighter KL anchor (was 0.04 in GSM8K run).
+#                               Harder problems increase policy variance; anchor
+#                               prevents drift from the SFT checkpoint.
 #
 #   --grounded-floor 0.52       Raised (was 0.50). Tighter recovery trigger;
-#                               prevents the gt_match collapse seen in AQuA run.
+#                               prevents gt_match collapse seen in prior runs.
 #
 #   --self-play-ratio 0.60      Reduced from 0.70. Harder dataset needs more
-#                               grounded signal; 60% sp keeps question-learning
-#                               while not starving answer learning.
+#                               grounded signal in the mix.
 #
-#   --difficulty-alpha 4.0      Sharper difficulty-weighted sampling (was 3.0).
-#                               With 3 difficulty tiers the model needs stronger
-#                               bias toward 30-70% win-rate problems to get
-#                               non-trivial RL signal.
+#   --warmup-iters 10           Longer LR warmup (was 8). New distribution needs
+#                               a gentler ramp before peak LR.
+#
+#   --min-warmup 10             Longer GROUNDED_ONLY minimum phase (was 8).
+#                               Ensures at least 10 iters of grounded-only before
+#                               any self-play can activate.
+#
+#   --learning-rate 3e-6        Unchanged. Right-sized for harder combined data.
+#
+#   --max-new-tokens 1200       Increased from 1000. NuminaMath competition
+#                               problems often need longer chain-of-thought.
 #
 #   --math-mix-ratio 0.0        DISABLED — the combined dataset already contains
-#   --math-mix-ratio-late 0.0   competition-level problems (numina_competition,
-#   --math-ramp-start 999       openmath_competition). A separate MATH mix would
-#                               double-count them.
-#
-#   --num-iterations 60         More iterations (was 30/50). Harder curriculum
-#                               needs more steps to show measurable improvement.
-#
-#   --max-new-tokens 1000       Slightly longer (was 800). NuminaMath problems
-#                               often require more reasoning steps.
-#
-#   --min-warmup 8              Longer minimum GROUNDED_ONLY phase (was 6).
+#   --math-mix-ratio-late 0.0   competition-level problems.
+#   --math-ramp-start 999
 #
 # ── Expected reward trajectory ──────────────────────────────────────────────
 #
-#   Iters  1-10  (GROUNDED_ONLY): mean_reward 0.50→0.70, gt_match ≥ 55%
-#   Iters 11-25  (SELFPLAY_RAMP): mean_reward 0.70→0.82, sp_ratio 0%→40%
-#   Iters 26-60  (SELFPLAY_RAMP): mean_reward 0.82→0.88, sp_ratio 40%→60%
-#   Eval accuracy on combined_val: expect 55-65% (harder than GSM8K's 78-80%)
+#   Iters  1-10  (GROUNDED_ONLY): mean_reward 0.55→0.75, gt_match ≥ 50%
+#   Iters 11-30  (SELFPLAY_RAMP): mean_reward 0.75→0.85, sp_ratio 0%→40%
+#   Iters 31-80  (SELFPLAY_RAMP): mean_reward 0.85→0.90, sp_ratio 40%→60%
+#   Eval accuracy on combined_val: expect 62-72% at iter 80
+#     (harder than GSM8K — prior run peaked at 80% final-ans on GSM8K)
 #
-#   Wall-time with Flash-Attn 2 active (A100-80GB, K_q=2, K=8, N=16):
+#   Wall-time (A100-80GB, K=10, N=20):
 #     Model + PRM load             :  ~2 min
-#     Initial eval (150 samples)   :  ~4-5 min  (512 tok cap, periodic cache flush)
-#     Train iter (Flash active)    :  ~90 s   (was ~120 s — ~25% faster)
-#     Eval checkpoint × 12         :  ~4 min each = 48 min
-#     60 iterations × 90 s        :  ~90 min
-#     Total                        :  ~2.5-3 h  (was ~4 h without Flash)
+#     Initial eval (200 samples)   :  ~4 min
+#     Train iter (Flash active)    :  ~130 s  (K=10 vs K=8 → ~15% longer)
+#     Train iter (SDPA fallback)   :  ~180 s
+#     Eval checkpoint × 16         :  ~4 min each = 64 min
+#     80 iterations × 130 s        :  ~173 min
+#     Total (Flash active)         :  ~4.1 h
+#     Total (SDPA fallback)        :  ~5.5 h
 #
-#   --eval-max-new-tokens 512 (not 1000):
-#     Competition math gold answers average 700-900 chars (~250-350 tokens).
-#     Capping eval generation at 512 tokens is sufficient for the model to
-#     produce a final answer without burning extra time on unsolvable tails.
-#
-# ── Smoke test (~10 min) ─────────────────────────────────────────────────────
+# ── Smoke test (~15 min) ─────────────────────────────────────────────────────
 #
 #   bash launch_grpo_combined.sh \
 #     --num-iterations 4 \
@@ -110,7 +133,6 @@
 #     --eval-max-samples 20 \
 #     --skip-initial-eval \
 #     --save-every 0 --keep-last 0 \
-#     --math-mix-ratio 0 \
 #     --output-dir checkpoints/smoke_combined
 #
 # =============================================================================
@@ -212,9 +234,9 @@ echo "[launch] base_model   = $BASE_MODEL"
 echo "[launch] train_data   = $TRAIN_DATA  ($(wc -l < "$TRAIN_DATA") rows)"
 echo "[launch] eval_data    = $EVAL_DATA"
 echo "[launch] log_file     = $LOG_FILE"
-echo "[launch] architecture = two-phase self-play (K_q=2, K=8)"
+echo "[launch] architecture = two-phase self-play (K_q=2, K=10, N=20)"
 echo "[launch] dataset      = NuminaMath-CoT + OpenMathInstruct-2 (14 skill_ids)"
-echo "[launch] wall-time    ≈ 2.5 h  Flash active  /  4 h  SDPA fallback"
+echo "[launch] wall-time    ≈ 4.1 h  Flash active  /  5.5 h  SDPA fallback"
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 python -u scripts/run_grpo_training.py \
@@ -223,13 +245,13 @@ python -u scripts/run_grpo_training.py \
     --gsm8k-data            "$TRAIN_DATA" \
     --eval-data-path        "$EVAL_DATA" \
     \
-    --num-iterations        60 \
-    --group-size            8 \
+    --num-iterations        80 \
+    --group-size            10 \
     --q-group-size          2 \
-    --questions-per-iter    16 \
+    --questions-per-iter    20 \
     \
     --learning-rate         3e-6 \
-    --max-new-tokens        1000 \
+    --max-new-tokens        1200 \
     --temperature           0.8 \
     --max-grad-norm         0.5 \
     --clip-eps              0.2 \
@@ -237,7 +259,7 @@ python -u scripts/run_grpo_training.py \
     --warmup-iters          10 \
     --min-lr-ratio          0.1 \
     \
-    --difficulty-alpha      4.0 \
+    --difficulty-alpha      4.5 \
     --self-play-ratio       0.60 \
     \
     --math-mix-ratio        0.0 \
@@ -246,22 +268,22 @@ python -u scripts/run_grpo_training.py \
     --math-max-difficulty   3 \
     \
     --overlong-filter \
-    --min-warmup            8 \
-    --selfplay-gt-thresh    0.52 \
+    --min-warmup            10 \
+    --selfplay-gt-thresh    0.50 \
     --selfplay-grounded-thresh 0.58 \
     --selfplay-step-thresh  0.63 \
-    --selfplay-ramp-iters   25 \
+    --selfplay-ramp-iters   30 \
     --grounded-floor        0.52 \
     \
     --extractor-model       Qwen/Qwen2.5-0.5B-Instruct \
     --extraction-cache      "$EXTRACTION_CACHE" \
     \
     --eval-every            5 \
-    --eval-max-samples      150 \
-    --eval-max-new-tokens   512 \
+    --eval-max-samples      200 \
+    --eval-max-new-tokens   1200 \
     --eval-pass-at-k        0 \
     --save-every            5 \
-    --keep-last             3 \
+    --keep-last             4 \
     \
     --use-prm \
     --prm-model             Qwen/Qwen2.5-Math-PRM-7B \
