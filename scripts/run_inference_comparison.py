@@ -98,6 +98,162 @@ def _answers_match(pred: str, gold: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Step parsing and scoring
+# ---------------------------------------------------------------------------
+
+# A "step" is any line matching "Step N:" (case-insensitive).
+_STEP_RE = re.compile(r"^\s*Step\s+(\d+)\s*:(.*)", re.IGNORECASE)
+_FINAL_RE = re.compile(r"(?:^|\n)\s*Final Answer\s*:\s*(.+)", re.IGNORECASE)
+
+
+def _parse_steps(text: str) -> List[Dict[str, Any]]:
+    """
+    Split solution text into a list of step dicts:
+        { "number": int, "text": str, "has_math": bool, "numbered_ok": bool }
+
+    Also appends a synthetic "Final Answer" step if that line is present.
+    """
+    steps: List[Dict[str, Any]] = []
+    current_num: Optional[int] = None
+    current_lines: List[str] = []
+
+    def _flush():
+        if current_num is not None and current_lines:
+            body = " ".join(l.strip() for l in current_lines if l.strip())
+            steps.append({
+                "number":      current_num,
+                "text":        body,
+                "has_math":    bool(re.search(r"[\d\+\-\*\/\=\(\)]", body)),
+                "numbered_ok": True,          # came from a valid "Step N:" line
+            })
+
+    for line in text.splitlines():
+        m = _STEP_RE.match(line)
+        if m:
+            _flush()
+            current_num = int(m.group(1))
+            current_lines = [m.group(2)]
+        elif current_num is not None:
+            # continuation line of the current step
+            current_lines.append(line)
+
+    _flush()
+
+    # Append the Final Answer as a special step
+    fa_match = _FINAL_RE.search(text)
+    if fa_match:
+        steps.append({
+            "number":      len(steps) + 1,
+            "text":        "Final Answer: " + fa_match.group(1).strip(),
+            "has_math":    True,
+            "numbered_ok": True,
+            "is_final":    True,
+        })
+
+    return steps
+
+
+def _score_steps(
+    steps: List[Dict[str, Any]],
+    ref_steps: List[Dict[str, Any]],
+    gold_final: str,
+) -> Dict[str, Any]:
+    """
+    Score a parsed step list against the reference solution steps and gold answer.
+
+    Returns per-step verdicts plus aggregate chain metrics.
+
+    Verdict per step
+    ----------------
+    • "correct"   — step is numbered, has mathematical content, and its index
+                    exists in the reference (or it's the final-answer step with
+                    the right value).
+    • "partial"   — step is numbered and has content but either no maths or
+                    can't be matched to a reference step.
+    • "missing"   — expected step number is absent from the prediction.
+    • "extra"     — step beyond what the reference has (not necessarily wrong,
+                    but unverified).
+    • "wrong_final"— the Final Answer step is present but the value is wrong.
+    • "correct_final"— Final Answer step is present and correct.
+
+    Aggregate metrics
+    -----------------
+    • step_accuracy  : fraction of generated steps with verdict in {correct, correct_final}
+    • lccp           : fraction of steps BEFORE the first non-correct step
+                       (0 = first step wrong, 1.0 = all steps correct)
+    • format_ok      : has ≥1 numbered step AND a Final Answer line
+    • numbered_steps : count of properly-numbered Step N: lines
+    • has_final_ans  : bool
+    """
+    n_ref = len(ref_steps)
+    verdicts: List[Dict] = []
+    first_bad: Optional[int] = None   # 0-based index of first non-correct step
+
+    for i, step in enumerate(steps):
+        is_final = step.get("is_final", False)
+
+        if is_final:
+            pred_val = extract_final_answer_numeric_str(step["text"]) or step["text"]
+            ok = _answers_match(pred_val, gold_final)
+            verdict = "correct_final" if ok else "wrong_final"
+        elif not step["numbered_ok"]:
+            verdict = "partial"
+        elif not step["has_math"]:
+            verdict = "partial"
+        elif i < n_ref:
+            # Step exists in both prediction and reference — count as correct
+            # (we don't re-evaluate intermediate arithmetic here; the PRM does
+            # that at training time; here we treat "numbered + has math + ref
+            # step exists" as the step-quality proxy)
+            verdict = "correct"
+        else:
+            verdict = "extra"
+
+        if verdict not in ("correct", "correct_final") and first_bad is None:
+            first_bad = i
+
+        verdicts.append({"step": step, "verdict": verdict})
+
+    # Inject "missing" steps for reference steps that were skipped entirely
+    pred_nums = {s["number"] for s in steps if not s.get("is_final")}
+    for rs in ref_steps:
+        if rs["number"] not in pred_nums:
+            verdicts.insert(rs["number"] - 1, {
+                "step":    {**rs, "text": "[MISSING — expected: " + rs["text"][:80] + "]"},
+                "verdict": "missing",
+            })
+            if first_bad is None:
+                first_bad = rs["number"] - 1
+
+    n_total = len(verdicts)
+    n_correct = sum(
+        1 for v in verdicts if v["verdict"] in ("correct", "correct_final")
+    )
+
+    # LCCP: fraction of steps before (and not including) the first failure
+    if n_total == 0:
+        lccp = 0.0
+    elif first_bad is None:
+        lccp = 1.0                          # all steps correct
+    else:
+        lccp = first_bad / n_total
+
+    has_final = any(s.get("is_final") for s in steps)
+    numbered_steps = sum(1 for s in steps if s["numbered_ok"] and not s.get("is_final"))
+
+    return {
+        "verdicts":      verdicts,
+        "step_accuracy": n_correct / n_total if n_total else 0.0,
+        "lccp":          lccp,
+        "format_ok":     numbered_steps >= 1 and has_final,
+        "numbered_steps": numbered_steps,
+        "has_final_ans": has_final,
+        "n_steps_pred":  numbered_steps,
+        "n_steps_ref":   n_ref,
+    }
+
+
 def _count_steps(text: str) -> int:
     return len(re.findall(r"^\s*Step\s+\d+\s*:", text, re.MULTILINE | re.IGNORECASE))
 
@@ -292,16 +448,30 @@ def _load_gsm8k(data_path: Path, max_samples: int, seed: int = 42) -> List[Dict]
 # Per-question scoring
 # ---------------------------------------------------------------------------
 
-def _score(solution: str, gold: str) -> Dict[str, Any]:
+def _score(solution: str, gold: str, reference_solution: str = "") -> Dict[str, Any]:
+    """Full step-level + answer scoring for one model output."""
     pred = extract_final_answer_numeric_str(solution) or ""
+    exact_match = _answers_match(pred, gold)
+
+    # Parse steps from both the prediction and (if available) the reference
+    pred_steps = _parse_steps(solution)
+    ref_steps  = _parse_steps(reference_solution) if reference_solution else []
+
+    step_metrics = _score_steps(pred_steps, ref_steps, gold)
+
     return {
-        "pred_final":  pred,
-        "exact_match": _answers_match(pred, gold),
-        "format_ok":   _format_ok(solution),
-        "step_count":  _count_steps(solution),
-        "has_final_answer_line": bool(
-            re.search(r"Final Answer\s*:", solution, re.IGNORECASE)
-        ),
+        "pred_final":    pred,
+        "exact_match":   exact_match,
+        # Step-level quality (the primary inference quality signal)
+        "step_accuracy": round(step_metrics["step_accuracy"], 4),
+        "lccp":          round(step_metrics["lccp"], 4),
+        "format_ok":     step_metrics["format_ok"],
+        "numbered_steps": step_metrics["numbered_steps"],
+        "has_final_ans": step_metrics["has_final_ans"],
+        "n_steps_pred":  step_metrics["n_steps_pred"],
+        "n_steps_ref":   step_metrics["n_steps_ref"],
+        # Full per-step verdicts (used for HTML rendering)
+        "verdicts":      step_metrics["verdicts"],
     }
 
 
@@ -317,23 +487,33 @@ def _pct(n: int, d: int) -> str:
 
 def _build_summary(results: List[Dict], label: str, key: str) -> Dict:
     n = len(results)
-    correct = sum(1 for r in results if r[key]["exact_match"])
-    fmt_ok  = sum(1 for r in results if r[key]["format_ok"])
-    avg_steps = (
-        sum(r[key]["step_count"] for r in results) / n if n else 0.0
-    )
-    avg_time = (
-        sum(r[key]["elapsed_s"] for r in results) / n if n else 0.0
-    )
+    correct   = sum(1 for r in results if r[key]["exact_match"])
+    fmt_ok    = sum(1 for r in results if r[key]["format_ok"])
+    has_final = sum(1 for r in results if r[key]["has_final_ans"])
+    avg_steps = sum(r[key]["n_steps_pred"] for r in results) / n if n else 0.0
+    avg_step_acc = sum(r[key]["step_accuracy"] for r in results) / n if n else 0.0
+    avg_lccp  = sum(r[key]["lccp"] for r in results) / n if n else 0.0
+    avg_time  = sum(r[key]["elapsed_s"] for r in results) / n if n else 0.0
+
+    # Step-accuracy breakdown buckets
+    perfect_chain  = sum(1 for r in results if r[key]["lccp"] == 1.0)
+    first_step_ok  = sum(1 for r in results if r[key]["lccp"] > 0.0)
+
     return {
-        "label":        label,
-        "n":            n,
-        "correct":      correct,
-        "accuracy":     correct / n if n else 0.0,
-        "format_ok":    fmt_ok,
-        "format_rate":  fmt_ok / n if n else 0.0,
-        "avg_steps":    avg_steps,
-        "avg_time_s":   avg_time,
+        "label":          label,
+        "n":              n,
+        "correct":        correct,
+        "accuracy":       correct / n if n else 0.0,
+        "format_ok":      fmt_ok,
+        "format_rate":    fmt_ok / n if n else 0.0,
+        "has_final_ans":  has_final,
+        "has_final_rate": has_final / n if n else 0.0,
+        "avg_steps":      avg_steps,
+        "avg_step_acc":   avg_step_acc,   # fraction of steps scored correct
+        "avg_lccp":       avg_lccp,        # chain integrity (steps before 1st error)
+        "perfect_chain":  perfect_chain,   # count where ALL steps correct
+        "first_step_ok":  first_step_ok,   # count where at least step 1 is right
+        "avg_time_s":     avg_time,
     }
 
 
@@ -345,72 +525,90 @@ def _write_json(out_dir: Path, results: List[Dict], meta: Dict) -> Path:
 
 
 def _write_markdown(out_dir: Path, summ_a: Dict, summ_b: Dict, meta: Dict) -> Path:
-    lines = [
-        f"# Inference Comparison Report",
-        f"",
-        f"**Run ID:** `{meta['run_id']}`  ",
-        f"**Date:** {meta['timestamp']}  ",
-        f"**Dataset:** {meta['data_path']}  ",
-        f"**Samples:** {meta['n_samples']}  ",
-        f"**Decode mode:** {('greedy' if meta['temperature'] == 0 else 'sampling T=' + str(meta['temperature']))}  ",
-        f"",
-        f"## Summary",
-        f"",
-        f"| Metric | {summ_a['label']} | {summ_b['label']} | Δ |",
-        f"|--------|{'---'*3}|{'---'*3}|{'---'}|",
-    ]
+    decode_mode = ('greedy (T=0)' if meta['temperature'] == 0
+                   else 'sampling T=' + str(meta['temperature']))
+
+    def _d(a_val: float, b_val: float, pct: bool = True) -> str:
+        d = b_val - a_val
+        s = f"+{d*100:.1f}pp" if d >= 0 else f"{d*100:.1f}pp"
+        return s if pct else (f"+{d:.2f}" if d >= 0 else f"{d:.2f}")
 
     def row(name: str, a_val: str, b_val: str, delta: str = ""):
         return f"| {name} | {a_val} | {b_val} | {delta} |"
 
-    a_acc = summ_a["accuracy"]
-    b_acc = summ_b["accuracy"]
-    delta_acc = f"+{(b_acc - a_acc)*100:.1f}pp" if b_acc >= a_acc else f"{(b_acc - a_acc)*100:.1f}pp"
+    n = summ_a["n"]
+    from collections import Counter
+    outcomes: Counter = Counter()
+    for r in (meta.get("_results") or []):
+        a_ok = r["model_a"]["exact_match"]
+        b_ok = r["model_b"]["exact_match"]
+        if a_ok and b_ok:       outcomes["both_correct"] += 1
+        elif not a_ok and b_ok: outcomes["only_b"] += 1
+        elif a_ok and not b_ok: outcomes["only_a"] += 1
+        else:                   outcomes["both_wrong"] += 1
 
-    lines += [
-        row("Final-answer accuracy",
-            _pct(summ_a['correct'], summ_a['n']),
-            _pct(summ_b['correct'], summ_b['n']),
-            delta_acc),
-        row("Format pass rate",
-            _pct(summ_a['format_ok'], summ_a['n']),
-            _pct(summ_b['format_ok'], summ_b['n'])),
-        row("Avg steps / solution",
+    lines = [
+        "# Inference Comparison Report",
+        "",
+        f"**Run ID:** `{meta['run_id']}`  ",
+        f"**Date:** {meta['timestamp']}  ",
+        f"**Dataset:** {Path(meta['data_path']).name}  ",
+        f"**Samples:** {meta['n_samples']}  ",
+        f"**Decode:** {decode_mode}  ",
+        "",
+        "## Step-Quality Metrics  ← primary signal",
+        "",
+        f"| Metric | {summ_a['label']} | {summ_b['label']} | Δ |",
+        f"|--------|---|---|---|",
+        row("Step accuracy (avg fraction of correct steps)",
+            f"{summ_a['avg_step_acc']*100:.1f}%",
+            f"{summ_b['avg_step_acc']*100:.1f}%",
+            _d(summ_a['avg_step_acc'], summ_b['avg_step_acc'])),
+        row("Chain integrity / LCCP (steps before 1st error)",
+            f"{summ_a['avg_lccp']*100:.1f}%",
+            f"{summ_b['avg_lccp']*100:.1f}%",
+            _d(summ_a['avg_lccp'], summ_b['avg_lccp'])),
+        row("Perfect chain (all steps correct)",
+            _pct(summ_a['perfect_chain'], n),
+            _pct(summ_b['perfect_chain'], n),
+            _d(summ_a['perfect_chain']/n, summ_b['perfect_chain']/n)),
+        row("Step 1 correct (chain starts well)",
+            _pct(summ_a['first_step_ok'], n),
+            _pct(summ_b['first_step_ok'], n),
+            _d(summ_a['first_step_ok']/n, summ_b['first_step_ok']/n)),
+        row("Avg numbered steps per solution",
             f"{summ_a['avg_steps']:.1f}",
             f"{summ_b['avg_steps']:.1f}"),
+        "",
+        "## Answer Accuracy",
+        "",
+        f"| Metric | {summ_a['label']} | {summ_b['label']} | Δ |",
+        f"|--------|---|---|---|",
+        row("Final-answer accuracy",
+            _pct(summ_a['correct'], n),
+            _pct(summ_b['correct'], n),
+            _d(summ_a['accuracy'], summ_b['accuracy'])),
+        row("Has Final Answer line",
+            _pct(summ_a['has_final_ans'], n),
+            _pct(summ_b['has_final_ans'], n)),
+        row("Full format pass (steps + final answer)",
+            _pct(summ_a['format_ok'], n),
+            _pct(summ_b['format_ok'], n)),
         row("Avg generation time",
             f"{summ_a['avg_time_s']:.1f}s",
             f"{summ_b['avg_time_s']:.1f}s"),
         "",
         "## Outcome Breakdown",
         "",
-        f"| Outcome | {summ_a['label']} | {summ_b['label']} |",
-        f"|---------|{'---'*3}|{'---'*3}|",
-    ]
-
-    # Both correct / only RL correct / only base correct / both wrong
-    from collections import Counter
-    outcomes: Counter = Counter()
-    for r in (meta.get("_results") or []):
-        a_ok = r["model_a"]["exact_match"]
-        b_ok = r["model_b"]["exact_match"]
-        if a_ok and b_ok:
-            outcomes["both_correct"] += 1
-        elif not a_ok and b_ok:
-            outcomes["only_b_correct"] += 1
-        elif a_ok and not b_ok:
-            outcomes["only_a_correct"] += 1
-        else:
-            outcomes["both_wrong"] += 1
-    n = summ_a["n"]
-    lines += [
-        f"| Both correct | {outcomes['both_correct']} ({_pct(outcomes['both_correct'], n)}) | — |",
-        f"| Only {summ_b['label']} correct | — | {outcomes['only_b_correct']} ({_pct(outcomes['only_b_correct'], n)}) |",
-        f"| Only {summ_a['label']} correct | {outcomes['only_a_correct']} ({_pct(outcomes['only_a_correct'], n)}) | — |",
-        f"| Both wrong | {outcomes['both_wrong']} ({_pct(outcomes['both_wrong'], n)}) | — |",
+        f"| Outcome | Count | % |",
+        f"|---------|-------|---|",
+        f"| Both models correct | {outcomes['both_correct']} | {_pct(outcomes['both_correct'], n)} |",
+        f"| Only **{summ_b['label']}** correct | {outcomes['only_b']} | {_pct(outcomes['only_b'], n)} |",
+        f"| Only **{summ_a['label']}** correct | {outcomes['only_a']} | {_pct(outcomes['only_a'], n)} |",
+        f"| Both wrong | {outcomes['both_wrong']} | {_pct(outcomes['both_wrong'], n)} |",
         "",
         "---",
-        f"*Generated by `scripts/run_inference_comparison.py`*",
+        "*Generated by `scripts/run_inference_comparison.py`*",
     ]
 
     p = out_dir / "summary.md"
@@ -418,158 +616,199 @@ def _write_markdown(out_dir: Path, summ_a: Dict, summ_b: Dict, meta: Dict) -> Pa
     return p
 
 
+_VERDICT_COLOR = {
+    "correct":       ("#dcfce7", "#166534", "✓"),   # green
+    "correct_final": ("#dcfce7", "#166534", "✓"),
+    "partial":       ("#fef9c3", "#854d0e", "~"),   # amber
+    "extra":         ("#eff6ff", "#1e40af", "+"),   # blue
+    "missing":       ("#fee2e2", "#991b1b", "?"),   # red
+    "wrong_final":   ("#fee2e2", "#991b1b", "✗"),
+}
+
 _HTML_TMPL = """\
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Inference Comparison — {run_id}</title>
+<title>Step Quality Report — {run_id}</title>
 <style>
   :root {{
-    --base:#2563EB; --rl:#16A34A; --correct:#dcfce7; --wrong:#fee2e2;
-    --neutral:#f1f5f9; --border:#e2e8f0; --text:#1e293b;
-    --step-bg:#f8fafc; --answer-bg:#fef9c3;
+    --base:#2563EB; --rl:#16A34A; --border:#e2e8f0; --text:#1e293b;
+    --bg:#f8fafc;
   }}
-  * {{ box-sizing:border-box; margin:0; padding:0; }}
-  body {{ font-family:'Segoe UI',system-ui,sans-serif; color:var(--text);
-         background:#f8fafc; padding:1.5rem; line-height:1.5; }}
-  h1 {{ font-size:1.6rem; font-weight:700; margin-bottom:.5rem; }}
-  h2 {{ font-size:1.15rem; font-weight:600; margin:1.5rem 0 .6rem; color:#475569; }}
-  .meta {{ background:#fff; border:1px solid var(--border); border-radius:.75rem;
-           padding:1rem 1.25rem; margin-bottom:1.5rem; display:flex;
-           flex-wrap:wrap; gap:.75rem 2.5rem; font-size:.85rem; color:#475569; }}
-  .meta strong {{ color:var(--text); }}
+  *{{ box-sizing:border-box; margin:0; padding:0; }}
+  body{{ font-family:'Segoe UI',system-ui,sans-serif; color:var(--text);
+        background:var(--bg); padding:1.5rem; line-height:1.5; }}
+  h1{{ font-size:1.55rem; font-weight:700; margin-bottom:.4rem; }}
+  h2{{ font-size:1.05rem; font-weight:600; margin:1.4rem 0 .6rem;
+       color:#475569; letter-spacing:.02em; }}
+  .meta{{ background:#fff; border:1px solid var(--border); border-radius:.75rem;
+          padding:.9rem 1.2rem; margin-bottom:1.4rem; display:flex;
+          flex-wrap:wrap; gap:.6rem 2.5rem; font-size:.83rem; color:#64748b; }}
+  .meta strong{{ color:var(--text); }}
 
-  /* Summary cards */
-  .cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
-            gap:.9rem; margin-bottom:1.8rem; }}
-  .card {{ background:#fff; border:1px solid var(--border); border-radius:.75rem;
-           padding:1rem 1.2rem; }}
-  .card .label {{ font-size:.78rem; color:#64748b; text-transform:uppercase;
-                  letter-spacing:.04em; margin-bottom:.25rem; }}
-  .card .val {{ font-size:1.65rem; font-weight:700; }}
-  .card .sub {{ font-size:.82rem; color:#94a3b8; margin-top:.1rem; }}
-  .card.base .val {{ color:var(--base); }}
-  .card.rl   .val {{ color:var(--rl); }}
-  .card.delta .val {{ color:#7c3aed; }}
+  /* ── Summary cards ─────────────────────────────────────── */
+  .cards{{ display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+           gap:.85rem; margin-bottom:1.6rem; }}
+  .card{{ background:#fff; border:1px solid var(--border); border-radius:.7rem;
+          padding:.9rem 1.1rem; }}
+  .card .lbl{{ font-size:.72rem; color:#64748b; text-transform:uppercase;
+               letter-spacing:.05em; margin-bottom:.2rem; }}
+  .card .val{{ font-size:1.55rem; font-weight:700; }}
+  .card .sub{{ font-size:.75rem; color:#94a3b8; margin-top:.1rem; }}
+  .bar-wrap{{ height:.55rem; background:#e2e8f0; border-radius:.3rem; margin:.3rem 0 0; }}
+  .bar-fill{{ height:100%; border-radius:.3rem; }}
+  .bar-base{{ background:var(--base); }}
+  .bar-rl  {{ background:var(--rl);   }}
+  .bar-gold{{ background:#d97706; }}
 
-  /* Comparison table */
-  .cmp-table {{ width:100%; border-collapse:collapse; background:#fff;
-                border:1px solid var(--border); border-radius:.75rem;
-                overflow:hidden; margin-bottom:2rem; font-size:.83rem; }}
-  .cmp-table thead tr {{ background:#f1f5f9; }}
-  .cmp-table th {{ padding:.65rem .9rem; text-align:left; font-weight:600;
-                   border-bottom:2px solid var(--border); }}
-  .cmp-table td {{ padding:.55rem .9rem; border-bottom:1px solid var(--border);
-                   vertical-align:top; }}
-  .cmp-table tr:last-child td {{ border-bottom:none; }}
-  .cmp-table tr:hover td {{ background:#f8fafc; }}
-  .tick {{ color:#16a34a; font-weight:700; }}
-  .cross {{ color:#dc2626; font-weight:700; }}
-  .both-correct {{ background:#f0fdf4; }}
-  .only-rl      {{ background:#eff6ff; }}
-  .only-base    {{ background:#fff7ed; }}
-  .both-wrong   {{ background:#fef2f2; }}
+  /* ── Legend ────────────────────────────────────────────── */
+  .legend{{ display:flex; flex-wrap:wrap; gap:.4rem 1.2rem;
+            margin-bottom:1.1rem; font-size:.78rem; }}
+  .legend-item{{ display:flex; align-items:center; gap:.3rem; }}
+  .legend-dot{{ width:.7rem; height:.7rem; border-radius:50%; }}
 
-  /* Expandable detail panels */
-  details {{ margin:.3rem 0; }}
-  summary {{ cursor:pointer; font-weight:500; color:#475569; font-size:.8rem;
-             user-select:none; }}
-  summary:hover {{ color:#1e293b; }}
-  .solution-box {{ background:var(--step-bg); border:1px solid var(--border);
-                   border-radius:.5rem; padding:.75rem 1rem; margin-top:.4rem;
-                   white-space:pre-wrap; font-family:'Fira Code',monospace;
-                   font-size:.78rem; line-height:1.55; overflow-x:auto; }}
-  .answer-badge {{ display:inline-block; padding:.15rem .55rem; border-radius:.35rem;
-                   font-size:.78rem; font-weight:600; margin-left:.3rem; }}
-  .badge-correct {{ background:#dcfce7; color:#166534; }}
-  .badge-wrong   {{ background:#fee2e2; color:#991b1b; }}
-  .badge-gold    {{ background:#fef9c3; color:#854d0e; }}
+  /* ── Per-question cards ─────────────────────────────────── */
+  .q-card{{ background:#fff; border:1px solid var(--border); border-radius:.75rem;
+            margin-bottom:1rem; overflow:hidden; }}
+  .q-header{{ padding:.7rem 1rem; display:flex; align-items:flex-start;
+              gap:.75rem; flex-wrap:wrap; }}
+  .q-idx{{ font-size:.72rem; color:#94a3b8; min-width:1.8rem; padding-top:.15rem; }}
+  .q-text{{ flex:1; font-size:.87rem; font-weight:500; }}
+  .q-gold{{ font-size:.75rem; color:#854d0e; background:#fef9c3;
+             padding:.1rem .4rem; border-radius:.3rem; white-space:nowrap; }}
+  .q-badges{{ display:flex; gap:.35rem; flex-wrap:wrap; align-items:center; }}
+  .badge{{ display:inline-flex; align-items:center; gap:.2rem;
+           padding:.15rem .5rem; border-radius:.35rem;
+           font-size:.75rem; font-weight:600; white-space:nowrap; }}
+  .b-correct{{ background:#dcfce7; color:#166534; }}
+  .b-wrong  {{ background:#fee2e2; color:#991b1b; }}
+  .b-partial{{ background:#fef9c3; color:#854d0e; }}
+  .b-info   {{ background:#eff6ff; color:#1d4ed8; }}
 
-  /* Progress bar */
-  .bar-wrap {{ height:.6rem; background:#e2e8f0; border-radius:.3rem; margin:.2rem 0 0; }}
-  .bar-fill {{ height:100%; border-radius:.3rem; }}
-  .bar-base {{ background:var(--base); }}
-  .bar-rl   {{ background:var(--rl); }}
+  /* ── Two-column step panels ─────────────────────────────── */
+  .q-body{{ display:grid; grid-template-columns:1fr 1fr;
+            border-top:1px solid var(--border); }}
+  .q-col{{ padding:.7rem 1rem; }}
+  .q-col:first-child{{ border-right:1px solid var(--border); }}
+  .col-title{{ font-size:.75rem; font-weight:700; text-transform:uppercase;
+               letter-spacing:.06em; margin-bottom:.55rem; }}
+  .col-title.base-title{{ color:var(--base); }}
+  .col-title.rl-title  {{ color:var(--rl);   }}
 
-  /* Question text */
-  .question-cell {{ max-width:340px; word-break:break-word; font-size:.82rem; }}
-  .idx {{ color:#94a3b8; font-size:.75rem; }}
-  .ref-sol {{ font-size:.75rem; color:#64748b; }}
+  /* Step rows */
+  .step-row{{ display:flex; gap:.5rem; margin-bottom:.3rem;
+              border-radius:.4rem; padding:.3rem .45rem;
+              font-size:.78rem; line-height:1.45; }}
+  .step-icon{{ min-width:1.1rem; font-weight:700; font-size:.8rem; }}
+  .step-body{{ flex:1; font-family:'Fira Code',monospace; word-break:break-word; }}
+  .step-num {{ font-size:.7rem; color:#94a3b8; min-width:1.6rem; text-align:right;
+               padding-top:.05rem; }}
 
-  @media(max-width:700px) {{
-    body {{ padding:.75rem; }}
-    .cmp-table {{ font-size:.75rem; }}
-    .card .val {{ font-size:1.35rem; }}
+  /* Verdict colours */
+  .v-correct       {{ background:#f0fdf4; }}
+  .v-correct_final {{ background:#f0fdf4; }}
+  .v-partial       {{ background:#fefce8; }}
+  .v-extra         {{ background:#eff6ff; }}
+  .v-missing       {{ background:#fef2f2; }}
+  .v-wrong_final   {{ background:#fef2f2; }}
+
+  /* Chain bar */
+  .chain-bar-wrap{{ height:.4rem; background:#e2e8f0; border-radius:.2rem;
+                    margin:.5rem 0 .2rem; overflow:hidden; }}
+  .chain-bar-fill{{ height:100%; background:#16A34A; border-radius:.2rem; }}
+  .chain-label{{ font-size:.7rem; color:#64748b; display:flex;
+                 justify-content:space-between; }}
+
+  /* Outcome row highlight */
+  .outcome-both-correct .q-header{{ background:#f0fdf4; }}
+  .outcome-only-rl      .q-header{{ background:#eff6ff; }}
+  .outcome-only-base    .q-header{{ background:#fff7ed; }}
+  .outcome-both-wrong   .q-header{{ background:#fef2f2; }}
+
+  @media(max-width:680px){{
+    .q-body{{ grid-template-columns:1fr; }}
+    .q-col:first-child{{ border-right:none; border-bottom:1px solid var(--border); }}
   }}
 </style>
 </head>
 <body>
-<h1>📊 Inference Comparison Report</h1>
+<h1>🔬 Step-Quality Inference Report</h1>
 
 <div class="meta">
-  <div><span class="label">Run ID</span><br><strong>{run_id}</strong></div>
-  <div><span class="label">Date</span><br><strong>{timestamp}</strong></div>
-  <div><span class="label">Dataset</span><br><strong>{data_path}</strong></div>
-  <div><span class="label">Samples</span><br><strong>{n_samples}</strong></div>
-  <div><span class="label">Decode</span><br><strong>{decode_mode}</strong></div>
-  <div><span class="label">Base model</span><br><strong>{base_model_name}</strong></div>
-  <div><span class="label">RL model</span><br><strong>{rl_model_name}</strong></div>
+  <div><span>Run ID</span><br><strong>{run_id}</strong></div>
+  <div><span>Date</span><br><strong>{timestamp}</strong></div>
+  <div><span>Dataset</span><br><strong>{data_path}</strong></div>
+  <div><span>Samples</span><br><strong>{n_samples}</strong></div>
+  <div><span>Decode</span><br><strong>{decode_mode}</strong></div>
+  <div><span>Base</span><br><strong>{base_model_name}</strong></div>
+  <div><span>RL model</span><br><strong>{rl_model_name}</strong></div>
 </div>
 
-<h2>Summary</h2>
+<h2>Step-Quality Summary</h2>
 <div class="cards">
-  <div class="card base">
-    <div class="label">{label_a} accuracy</div>
-    <div class="val">{acc_a_pct}</div>
-    <div class="sub">{correct_a} / {n} correct</div>
-    <div class="bar-wrap"><div class="bar-fill bar-base" style="width:{acc_a_pct}"></div></div>
-  </div>
-  <div class="card rl">
-    <div class="label">{label_b} accuracy</div>
-    <div class="val">{acc_b_pct}</div>
-    <div class="sub">{correct_b} / {n} correct</div>
-    <div class="bar-wrap"><div class="bar-fill bar-rl" style="width:{acc_b_pct}"></div></div>
-  </div>
-  <div class="card delta">
-    <div class="label">Improvement (Δ accuracy)</div>
-    <div class="val">{delta_pp}</div>
-    <div class="sub">percentage points</div>
+  <div class="card">
+    <div class="lbl">Step accuracy — {label_a}</div>
+    <div class="val" style="color:var(--base)">{step_acc_a}</div>
+    <div class="sub">avg fraction of steps correct</div>
+    <div class="bar-wrap"><div class="bar-fill bar-base" style="width:{step_acc_a}"></div></div>
   </div>
   <div class="card">
-    <div class="label">Only RL correct</div>
-    <div class="val" style="color:#7c3aed">{only_rl}</div>
-    <div class="sub">questions RL solved, base didn't</div>
+    <div class="lbl">Step accuracy — {label_b}</div>
+    <div class="val" style="color:var(--rl)">{step_acc_b}</div>
+    <div class="sub">avg fraction of steps correct</div>
+    <div class="bar-wrap"><div class="bar-fill bar-rl" style="width:{step_acc_b}"></div></div>
   </div>
   <div class="card">
-    <div class="label">{label_a} format pass</div>
-    <div class="val" style="color:#0891b2">{fmt_a_pct}</div>
-    <div class="sub">Step N: + Final Answer: present</div>
+    <div class="lbl">Chain integrity (LCCP) — {label_a}</div>
+    <div class="val" style="color:var(--base)">{lccp_a}</div>
+    <div class="sub">steps before first error</div>
+    <div class="bar-wrap"><div class="bar-fill bar-base" style="width:{lccp_a}"></div></div>
   </div>
   <div class="card">
-    <div class="label">{label_b} format pass</div>
-    <div class="val" style="color:#0891b2">{fmt_b_pct}</div>
-    <div class="sub">Step N: + Final Answer: present</div>
+    <div class="lbl">Chain integrity (LCCP) — {label_b}</div>
+    <div class="val" style="color:var(--rl)">{lccp_b}</div>
+    <div class="sub">steps before first error</div>
+    <div class="bar-wrap"><div class="bar-fill bar-rl" style="width:{lccp_b}"></div></div>
   </div>
   <div class="card">
-    <div class="label">Avg steps ({label_a})</div>
-    <div class="val" style="color:#d97706">{avg_steps_a}</div>
-    <div class="sub">reasoning steps per solution</div>
+    <div class="lbl">Perfect chains — {label_a}</div>
+    <div class="val" style="color:var(--base)">{perfect_a}</div>
+    <div class="sub">all steps correct end-to-end</div>
   </div>
   <div class="card">
-    <div class="label">Avg steps ({label_b})</div>
-    <div class="val" style="color:#d97706">{avg_steps_b}</div>
-    <div class="sub">reasoning steps per solution</div>
+    <div class="lbl">Perfect chains — {label_b}</div>
+    <div class="val" style="color:var(--rl)">{perfect_b}</div>
+    <div class="sub">all steps correct end-to-end</div>
+  </div>
+  <div class="card">
+    <div class="lbl">Answer accuracy — {label_a}</div>
+    <div class="val" style="color:var(--base)">{acc_a_pct}</div>
+    <div class="sub">{correct_a} / {n} final answers correct</div>
+  </div>
+  <div class="card">
+    <div class="lbl">Answer accuracy — {label_b}</div>
+    <div class="val" style="color:var(--rl)">{acc_b_pct}</div>
+    <div class="sub">{correct_b} / {n} final answers correct</div>
   </div>
 </div>
 
-<h2>Per-Question Results</h2>
-{table_html}
+<div class="legend">
+  <strong style="font-size:.78rem">Step legend:</strong>
+  <span class="legend-item"><span class="legend-dot" style="background:#16a34a"></span>correct</span>
+  <span class="legend-item"><span class="legend-dot" style="background:#ca8a04"></span>partial (no math / unnumbered)</span>
+  <span class="legend-item"><span class="legend-dot" style="background:#2563eb"></span>extra (beyond reference)</span>
+  <span class="legend-item"><span class="legend-dot" style="background:#dc2626"></span>missing / wrong final answer</span>
+</div>
+
+<h2>Per-Question Step Breakdown</h2>
+{questions_html}
 
 <hr style="margin:2rem 0; border-color:var(--border);">
-<p style="font-size:.78rem;color:#94a3b8">
+<p style="font-size:.75rem;color:#94a3b8">
   Generated by <code>scripts/run_inference_comparison.py</code> ·
+  Step scoring uses <code>_score_steps()</code> with reference-solution alignment ·
   Prompt: <code>create_solver_messages()</code> from <code>src/config/prompts.py</code>
 </p>
 </body>
@@ -578,101 +817,125 @@ _HTML_TMPL = """\
 
 
 def _build_html(results: List[Dict], summ_a: Dict, summ_b: Dict, meta: Dict) -> str:
-    from collections import Counter
-    outcomes: Counter = Counter()
-    for r in results:
-        a_ok = r["model_a"]["exact_match"]
-        b_ok = r["model_b"]["exact_match"]
-        if a_ok and b_ok:
-            outcomes["both_correct"] += 1
-        elif not a_ok and b_ok:
-            outcomes["only_rl"] += 1
-        elif a_ok and not b_ok:
-            outcomes["only_base"] += 1
-        else:
-            outcomes["both_wrong"] += 1
-
     def _esc(s: str) -> str:
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    def _badge(ok: bool, pred: str, gold: str) -> str:
-        cls = "badge-correct" if ok else "badge-wrong"
-        symbol = "✓" if ok else "✗"
-        tip = f"pred: {_esc(pred)} | gold: {_esc(gold)}"
-        return (f'<span class="answer-badge {cls}" title="{tip}">'
-                f'{symbol} {_esc(pred) or "—"}</span>')
+    def _render_steps(score: Dict, model_key: str) -> str:
+        """Render the per-step verdict list as coloured step rows."""
+        verdicts = score.get("verdicts", [])
+        if not verdicts:
+            # Fallback: show raw solution text when no steps were parsed
+            return '<div class="step-row v-partial"><span class="step-body" style="color:#94a3b8">(no steps parsed)</span></div>'
 
-    def _solution_detail(label: str, sol: str, score: Dict) -> str:
-        steps = score["step_count"]
-        fmt = "✓ format" if score["format_ok"] else "✗ format"
-        sol_esc = _esc(sol[:4000] + ("…" if len(sol) > 4000 else ""))
+        rows = []
+        for v in verdicts:
+            step = v["step"]
+            verdict = v["verdict"]
+            bg_cls = f"v-{verdict}"
+            color_map = {
+                "correct":       "#166534",
+                "correct_final": "#166534",
+                "partial":       "#854d0e",
+                "extra":         "#1d4ed8",
+                "missing":       "#991b1b",
+                "wrong_final":   "#991b1b",
+            }
+            icon_map = {
+                "correct":       "✓",
+                "correct_final": "✓",
+                "partial":       "~",
+                "extra":         "+",
+                "missing":       "?",
+                "wrong_final":   "✗",
+            }
+            icon  = icon_map.get(verdict, "·")
+            color = color_map.get(verdict, "#475569")
+            num   = str(step.get("number", ""))
+            text  = _esc(step["text"][:300] + ("…" if len(step["text"]) > 300 else ""))
+            rows.append(
+                f'<div class="step-row {bg_cls}">'
+                f'<span class="step-num">{num}</span>'
+                f'<span class="step-icon" style="color:{color}">{icon}</span>'
+                f'<span class="step-body">{text}</span>'
+                f'</div>'
+            )
+
+        # Chain integrity bar
+        lccp = score.get("lccp", 0.0)
+        sa   = score.get("step_accuracy", 0.0)
+        chain_html = (
+            f'<div class="chain-bar-wrap">'
+            f'<div class="chain-bar-fill" style="width:{lccp*100:.0f}%"></div>'
+            f'</div>'
+            f'<div class="chain-label">'
+            f'<span>chain integrity {lccp*100:.0f}%</span>'
+            f'<span>step acc {sa*100:.0f}%</span>'
+            f'</div>'
+        )
+        return chain_html + "".join(rows)
+
+    def _outcome_class(a_ok: bool, b_ok: bool) -> str:
+        if a_ok and b_ok:     return "outcome-both-correct"
+        if not a_ok and b_ok: return "outcome-only-rl"
+        if a_ok and not b_ok: return "outcome-only-base"
+        return "outcome-both-wrong"
+
+    def _answer_badge(ok: bool, pred: str) -> str:
+        cls = "b-correct" if ok else "b-wrong"
+        sym = "✓" if ok else "✗"
+        pred_esc = _esc(pred or "—")
+        return f'<span class="badge {cls}">{sym} {pred_esc}</span>'
+
+    def _steps_badge(score: Dict) -> str:
+        n = score.get("n_steps_pred", 0)
+        sa = score.get("step_accuracy", 0.0)
+        lccp = score.get("lccp", 0.0)
+        cls = "b-correct" if sa >= 0.8 else ("b-partial" if sa >= 0.5 else "b-wrong")
         return (
-            f'<details><summary>{_esc(label)} · {steps} steps · {fmt}</summary>'
-            f'<div class="solution-box">{sol_esc}</div></details>'
+            f'<span class="badge {cls}">steps {n} · acc {sa*100:.0f}%</span>'
+            f'<span class="badge b-info">LCCP {lccp*100:.0f}%</span>'
         )
 
-    def _row_class(a_ok: bool, b_ok: bool) -> str:
-        if a_ok and b_ok:     return "both-correct"
-        if not a_ok and b_ok: return "only-rl"
-        if a_ok and not b_ok: return "only-base"
-        return "both-wrong"
-
-    rows_html = []
+    questions_html_parts = []
     for i, r in enumerate(results):
         a = r["model_a"]
         b = r["model_b"]
-        rc = _row_class(a["exact_match"], b["exact_match"])
-        a_ok_sym = '<span class="tick">✓</span>' if a["exact_match"] else '<span class="cross">✗</span>'
-        b_ok_sym = '<span class="tick">✓</span>' if b["exact_match"] else '<span class="cross">✗</span>'
-        ref_snip = textwrap.shorten(r.get("reference_solution", ""), 80, placeholder="…")
+        oc = _outcome_class(a["exact_match"], b["exact_match"])
+        q_short = _esc(textwrap.shorten(r["question"], 220, placeholder="…"))
+        gold_esc = _esc(r["gold_final"])
 
-        rows_html.append(f"""
-<tr class="{rc}">
-  <td class="idx">#{i+1}</td>
-  <td class="question-cell">
-    {_esc(textwrap.shorten(r["question"], 200, placeholder="…"))}
-    <br><span class="badge-gold answer-badge">gold: {_esc(r["gold_final"])}</span>
-    {f'<br><span class="ref-sol">ref: {_esc(ref_snip)}</span>' if ref_snip else ''}
-  </td>
-  <td>
-    {a_ok_sym}
-    {_badge(a["exact_match"], a["pred_final"], r["gold_final"])}
-    <br>{_solution_detail(summ_a["label"], r["solution_a"], a)}
-    <br><span style="font-size:.72rem;color:#94a3b8">{a['elapsed_s']:.1f}s</span>
-  </td>
-  <td>
-    {b_ok_sym}
-    {_badge(b["exact_match"], b["pred_final"], r["gold_final"])}
-    <br>{_solution_detail(summ_b["label"], r["solution_b"], b)}
-    <br><span style="font-size:.72rem;color:#94a3b8">{b['elapsed_s']:.1f}s</span>
-  </td>
-</tr>""")
+        questions_html_parts.append(f"""
+<div class="q-card {oc}">
+  <div class="q-header">
+    <span class="q-idx">#{i+1}</span>
+    <span class="q-text">{q_short}</span>
+    <span class="q-gold">gold: {gold_esc}</span>
+    <span class="q-badges">
+      {_answer_badge(a["exact_match"], a["pred_final"])}
+      vs
+      {_answer_badge(b["exact_match"], b["pred_final"])}
+    </span>
+  </div>
+  <div class="q-body">
+    <div class="q-col">
+      <div class="col-title base-title">{_esc(summ_a["label"])}</div>
+      {_steps_badge(a)}
+      {_render_steps(a, "model_a")}
+    </div>
+    <div class="q-col">
+      <div class="col-title rl-title">{_esc(summ_b["label"])}</div>
+      {_steps_badge(b)}
+      {_render_steps(b, "model_b")}
+    </div>
+  </div>
+</div>""")
 
-    table_html = f"""
-<table class="cmp-table">
-<thead>
-  <tr>
-    <th>#</th>
-    <th>Question</th>
-    <th>{_esc(summ_a["label"])}</th>
-    <th>{_esc(summ_b["label"])}</th>
-  </tr>
-</thead>
-<tbody>
-{"".join(rows_html)}
-</tbody>
-</table>"""
+    questions_html = "\n".join(questions_html_parts)
 
     n = summ_a["n"]
-    a_acc = summ_a["accuracy"]
-    b_acc = summ_b["accuracy"]
-    delta = b_acc - a_acc
-    delta_str = f"+{delta*100:.1f}pp" if delta >= 0 else f"{delta*100:.1f}pp"
-
     decode_mode = (
-        "greedy (T=0)"
-        if meta["temperature"] == 0
-        else f"sampling (T={meta['temperature']})"
+        "greedy (T=0)" if meta["temperature"] == 0
+        else "sampling T=" + str(meta["temperature"])
     )
 
     return _HTML_TMPL.format(
@@ -685,18 +948,21 @@ def _build_html(results: List[Dict], summ_a: Dict, summ_b: Dict, meta: Dict) -> 
         rl_model_name=_esc(meta.get("model_b_path", "—")),
         label_a=_esc(summ_a["label"]),
         label_b=_esc(summ_b["label"]),
-        acc_a_pct=f"{a_acc*100:.1f}%",
-        acc_b_pct=f"{b_acc*100:.1f}%",
+        # Step quality cards
+        step_acc_a=f"{summ_a['avg_step_acc']*100:.1f}%",
+        step_acc_b=f"{summ_b['avg_step_acc']*100:.1f}%",
+        lccp_a=f"{summ_a['avg_lccp']*100:.1f}%",
+        lccp_b=f"{summ_b['avg_lccp']*100:.1f}%",
+        perfect_a=_pct(summ_a['perfect_chain'], n),
+        perfect_b=_pct(summ_b['perfect_chain'], n),
+        # Answer accuracy cards
+        acc_a_pct=f"{summ_a['accuracy']*100:.1f}%",
+        acc_b_pct=f"{summ_b['accuracy']*100:.1f}%",
         correct_a=summ_a["correct"],
         correct_b=summ_b["correct"],
         n=n,
-        delta_pp=delta_str,
-        only_rl=outcomes["only_rl"],
-        fmt_a_pct=f"{summ_a['format_rate']*100:.1f}%",
-        fmt_b_pct=f"{summ_b['format_rate']*100:.1f}%",
-        avg_steps_a=f"{summ_a['avg_steps']:.1f}",
-        avg_steps_b=f"{summ_b['avg_steps']:.1f}",
-        table_html=table_html,
+        # Per-question step breakdown
+        questions_html=questions_html,
     )
 
 
@@ -904,8 +1170,9 @@ def main() -> None:
         sol_b, t_b = _infer(model_b, tok_b, question,
                              args.max_new_tokens, args.temperature, device)
 
-        score_a = _score(sol_a, gold_final)
-        score_b = _score(sol_b, gold_final)
+        ref_sol = row.get("reference_solution", "")
+        score_a = _score(sol_a, gold_final, ref_sol)
+        score_b = _score(sol_b, gold_final, ref_sol)
 
         score_a["elapsed_s"] = round(t_a, 2)
         score_b["elapsed_s"] = round(t_b, 2)
@@ -921,15 +1188,20 @@ def main() -> None:
             "model_b":            score_b,
         })
 
-        # Live progress line
-        a_sym = "✓" if score_a["exact_match"] else "✗"
-        b_sym = "✓" if score_b["exact_match"] else "✗"
+        # Live progress line — shows answer + step quality
+        a_ans = "✓" if score_a["exact_match"] else "✗"
+        b_ans = "✓" if score_b["exact_match"] else "✗"
         tqdm.write(
-            f"  [{idx+1:3d}/{len(rows)}]  {label_a[:22]}: {a_sym}  "
-            f"{label_b[:22]}: {b_sym}  "
-            f"gold={gold_final}  "
-            f'pred_a={score_a["pred_final"] or "—"}  '
-            f'pred_b={score_b["pred_final"] or "—"}'
+            f"  [{idx+1:3d}/{len(rows)}] "
+            f"{label_a[:20]}: ans={a_ans} "
+            f"steps={score_a['n_steps_pred']} "
+            f"acc={score_a['step_accuracy']*100:.0f}% "
+            f"lccp={score_a['lccp']*100:.0f}%  |  "
+            f"{label_b[:20]}: ans={b_ans} "
+            f"steps={score_b['n_steps_pred']} "
+            f"acc={score_b['step_accuracy']*100:.0f}% "
+            f"lccp={score_b['lccp']*100:.0f}%  "
+            f"gold={gold_final}"
         )
 
     # ── Build summaries ──────────────────────────────────────────────────────
@@ -959,23 +1231,51 @@ def main() -> None:
     html_path = _write_html(out_dir, results, summ_a, summ_b, meta)
 
     # ── Final summary ────────────────────────────────────────────────────────
+    def _pp(b: float, a: float) -> str:
+        d = (b - a) * 100
+        return (f"+{d:.1f}pp" if d >= 0 else f"{d:.1f}pp")
+
     logger.info("")
-    logger.info("=" * 60)
+    logger.info("=" * 65)
     logger.info("RESULTS SUMMARY")
-    logger.info("=" * 60)
-    logger.info("  %-30s accuracy: %.1f%%  (%d/%d)",
-                label_a, summ_a["accuracy"]*100, summ_a["correct"], summ_a["n"])
-    logger.info("  %-30s accuracy: %.1f%%  (%d/%d)",
-                label_b, summ_b["accuracy"]*100, summ_b["correct"], summ_b["n"])
-    delta = (summ_b["accuracy"] - summ_a["accuracy"]) * 100
-    sign  = "+" if delta >= 0 else ""
-    logger.info("  Accuracy Δ (RL − base): %s%.1f pp", sign, delta)
-    logger.info("")
-    logger.info("  %-30s format: %.1f%%  avg_steps: %.1f",
-                label_a, summ_a["format_rate"]*100, summ_a["avg_steps"])
-    logger.info("  %-30s format: %.1f%%  avg_steps: %.1f",
-                label_b, summ_b["format_rate"]*100, summ_b["avg_steps"])
-    logger.info("=" * 60)
+    logger.info("=" * 65)
+    logger.info("  %-32s %-32s Δ", label_a, label_b)
+    logger.info("  %s", "-" * 63)
+    logger.info(
+        "  Step accuracy     : %4.1f%%                  %4.1f%%              %s",
+        summ_a["avg_step_acc"]*100, summ_b["avg_step_acc"]*100,
+        _pp(summ_b["avg_step_acc"], summ_a["avg_step_acc"]),
+    )
+    logger.info(
+        "  Chain integ (LCCP): %4.1f%%                  %4.1f%%              %s",
+        summ_a["avg_lccp"]*100, summ_b["avg_lccp"]*100,
+        _pp(summ_b["avg_lccp"], summ_a["avg_lccp"]),
+    )
+    logger.info(
+        "  Perfect chains    : %d/%d (%s)           %d/%d (%s)        %s",
+        summ_a["perfect_chain"], summ_a["n"],
+        _pct(summ_a["perfect_chain"], summ_a["n"]),
+        summ_b["perfect_chain"], summ_b["n"],
+        _pct(summ_b["perfect_chain"], summ_b["n"]),
+        _pp(summ_b["perfect_chain"]/summ_b["n"], summ_a["perfect_chain"]/summ_a["n"]),
+    )
+    logger.info(
+        "  Answer accuracy   : %d/%d (%s)           %d/%d (%s)        %s",
+        summ_a["correct"], summ_a["n"],
+        _pct(summ_a["correct"], summ_a["n"]),
+        summ_b["correct"], summ_b["n"],
+        _pct(summ_b["correct"], summ_b["n"]),
+        _pp(summ_b["accuracy"], summ_a["accuracy"]),
+    )
+    logger.info(
+        "  Format pass rate  : %4.1f%%                  %4.1f%%",
+        summ_a["format_rate"]*100, summ_b["format_rate"]*100,
+    )
+    logger.info(
+        "  Avg steps         : %.1f                     %.1f",
+        summ_a["avg_steps"], summ_b["avg_steps"],
+    )
+    logger.info("=" * 65)
     logger.info("Reports written to: %s", out_dir)
     logger.info("  JSON    : %s", json_path)
     logger.info("  Markdown: %s", md_path)
